@@ -21,6 +21,7 @@ internal static class Program
         usage: RocksDb.Managed.Soak <command> [options]
           run --dir DIR [--duration 72h] [--seed N] [--smoke]
               [--mean-run S] [--min-run S] [--max-run S] [--native-every N] [--corrupt-every N] [--keep-history N]
+              [--max-history-mb N (default 1536; also applies when resuming)]
               [--faults Kill=30,Graceful=8,PowerLoss=12,TornOp=7,TornSeq=7,FsyncTrigger=8,RecoveryKill=8,Pause=6,IoError=8]
               [--writers N] [--keys-per-writer N]
               [--lazyfs-bin PATH | --lazyfs-fifo PATH [--lazyfs-fifo-completed PATH]]
@@ -102,7 +103,7 @@ internal static class Program
         if (File.Exists(paths.RunJson))
         {
             cfg = RunConfig.Load(paths.RunJson);
-            Console.WriteLine($"resuming the run in {paths.Root} (seed {cfg.Seed}); only --duration applies");
+            Console.WriteLine($"resuming the run in {paths.Root} (seed {cfg.Seed}); only --duration and --max-history-mb apply");
         }
         else
         {
@@ -149,6 +150,11 @@ internal static class Program
             if (cfg.UsesLazyFs && cfg.FaultWeights.GetValueOrDefault(nameof(FaultKind.LazyFsClear)) == 0)
                 cfg.FaultWeights[nameof(FaultKind.LazyFsClear)] = 30;
             paths.CreateDirectories();
+            cfg.Save(paths.RunJson);
+        }
+        if (o.TryGetValue("max-history-mb", out string? mh))
+        {
+            cfg.MaxHistoryMb = int.Parse(mh, CultureInfo.InvariantCulture);
             cfg.Save(paths.RunJson);
         }
         paths.CreateDirectories();

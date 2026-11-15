@@ -198,8 +198,9 @@ last 20 info LOG files, `keep_log_file_num = 20`, typically 1..50 MB each). The 
 throughput (every write, sync and transfer, and one in eight reads, is recorded): about 50..450 MB per minute of RUN
 time, depending on the machine. Only the last `--keep-history` cycles (default 20, about 40 s each on average, but up
 to `--max-run`) are kept, so plan for about 2..10 GB in the run directory, with peaks of a few GB more when long
-cycles are among the kept ones, plus the failure copies (each about the DB size plus one history). On a machine with
-little disk, lower `--keep-history` or `--max-run`. The fault file
+cycles are among the kept ones, plus the failure copies (each about the DB size plus one history). Each kept history is at most
+about `--max-history-mb` (1.5 GB by default). On a machine with little disk or memory, lower `--keep-history` or
+`--max-history-mb`. The fault file
 system's graveyard (`tmp/graveyard-<pid>`: deleted files kept for a simulated power loss) drops files once a
 directory fsync makes their deletion durable, and the supervisor removes the graveyards and checkpoints of earlier
 workers before each cycle. Memory: about 300 MB
@@ -223,7 +224,9 @@ same command again resumes the run from the last folded cycle (`run.json` and `m
 `--duration` applies, counted from the restart).
 
 Options: `--seed N`, `--mean-run S`, `--min-run S`, `--max-run S`, `--native-every N`, `--corrupt-every N`,
-`--keep-history N`, `--writers N`, `--keys-per-writer N`, and `--faults Kill=30,PowerLoss=12,...` (weights; 0 disables
+`--keep-history N`, `--max-history-mb N` (default 1536: the RUN phase ends early, with its fault, once the cycle's
+history reaches this size; the verifier holds a history in memory at about 4x its size on disk; also applies when
+resuming), `--writers N`, `--keys-per-writer N`, and `--faults Kill=30,PowerLoss=12,...` (weights; 0 disables
 a fault).
 
 ## Results
@@ -420,6 +423,10 @@ supervisor, run `fusermount3 -uz <dir>/db` yourself and check `pgrep lazyfs`.
   one by one and returned at the first failure without releasing the accounting of the others, so the next attempt
   waited for those background jobs forever (every `Resume` was Busy, and closing the DB hung). Found by the new
   check above; fixed, with the regression test `ErrorHandlerTests.RetryFlushRecoveryThatFailsPartwayIsRetried`.
+- Harness: a 321 s cycle on a fast machine wrote a 2 GB history, and the verifier, which read it with
+  `File.ReadAllBytes`, crashed (files over 2 GB are not supported). The reader now streams the file, and the RUN phase
+  ends early once a cycle's history reaches `--max-history-mb`, because the verifier needed 8 GB of memory for that
+  history. Re-verifying the preserved state of that cycle passed every check.
 - Usage: optimistic transactions with `ValidateParallel` lose plain (non-transactional) writes to the same keys that
   land between validation and commit, as upstream does (see "The workload" above).
 
