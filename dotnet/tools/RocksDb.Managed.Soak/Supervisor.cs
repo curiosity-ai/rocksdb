@@ -441,14 +441,45 @@ internal sealed class Supervisor
 
     private bool Wait(TimeSpan t, ChildProcess w)
     {
-        // Returns false if the worker exited by itself while waiting.
+        // Returns false if the worker exited by itself while waiting. Ends early (true) once the running cycle's history
+        // reached the budget (RunConfig.MaxHistoryMb): the fault then happens sooner, and the verifier, which holds the
+        // whole history in memory, stays within the machine's memory.
         var sw = Stopwatch.StartNew();
+        long nextCheck = 0;
         while (sw.Elapsed < t && !_stopRequested)
         {
             if (w.HasExited) return false;
+            if (sw.ElapsedMilliseconds >= nextCheck)
+            {
+                nextCheck = sw.ElapsedMilliseconds + 1000;
+                if (HistoryBudgetReached()) break;
+            }
             Thread.Sleep(50);
         }
         return !w.HasExited;
+    }
+
+    /// <summary>The cycle whose RUN phase is in progress (its history is checked against the budget), or -1.</summary>
+    private int _runningCycle = -1;
+    private bool _historyBudgetLogged;
+
+    private bool HistoryBudgetReached()
+    {
+        if (_cfg.MaxHistoryMb <= 0 || _runningCycle < 0) return false;
+        long bytes = 0;
+        foreach (string p in _paths.HistoryParts(_runningCycle))
+        {
+            try { bytes += new FileInfo(p).Length; }
+            catch (IOException) { }
+        }
+        if (bytes < (long)_cfg.MaxHistoryMb << 20) return false;
+        if (!_historyBudgetLogged)
+        {
+            _historyBudgetLogged = true;
+            Bump(_status.Notes, "run-ended-at-history-budget");
+            Log($"cycle {_runningCycle}: history reached {bytes >> 20} MB (--max-history-mb {_cfg.MaxHistoryMb}): ending the RUN phase early");
+        }
+        return true;
     }
 
     private string Unexpected(ChildProcess w, int? code) =>
@@ -476,9 +507,28 @@ internal sealed class Supervisor
     /// <summary>Runs the worker and ends it with the cycle's fault. Returns a failure description or null.</summary>
     private string? RunPhase(CyclePlan plan)
     {
+        _runningCycle = plan.Cycle;
+        _historyBudgetLogged = false;
+        try
+        {
+            return RunPhaseCore(plan);
+        }
+        finally
+        {
+            _runningCycle = -1;
+        }
+    }
+
+    private string? RunPhaseCore(CyclePlan plan)
+    {
         RemoveDeadWorkerScratch();
         var r = new Random((int)(Keys.Mix(plan.CycleSeed ^ 0xFA) & 0x7FFFFFFF));
-        using ChildProcess w = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", "0"], _paths.LogFile(plan.Cycle, "worker"));
+        // A cycle redone after the run was resumed (stopped or failed after its RUN phase) has the history of the earlier
+        // attempt, whose writes are in the DB: the worker continues it as the next part (reading the earlier parts for
+        // the versions they used), like a worker started after a crash during recovery.
+        int firstPart = _paths.HistoryParts(plan.Cycle).Count;
+        if (firstPart > 0) Log($"cycle {plan.Cycle}: continuing the history of an earlier attempt ({firstPart} part(s))");
+        using ChildProcess w = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", firstPart.ToString(System.Globalization.CultureInfo.InvariantCulture)], _paths.LogFile(plan.Cycle, "worker"));
         if (!w.Opened.Wait(TimeSpan.FromMinutes(5)))
         {
             w.Kill();
@@ -529,7 +579,7 @@ internal sealed class Supervisor
                 w.Kill();
                 w.WaitAsync(TimeSpan.FromSeconds(60)).Wait();
                 double delay = r.NextDouble() * (_lastOpenMs * 1.5 + 100);
-                using ChildProcess w2 = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", "1"], _paths.LogFile(plan.Cycle, "worker-recovery"));
+                using ChildProcess w2 = ChildProcess.Start(["worker", "--run-dir", _paths.Root, "--part", (firstPart + 1).ToString(System.Globalization.CultureInfo.InvariantCulture)], _paths.LogFile(plan.Cycle, "worker-recovery"));
                 Thread.Sleep(TimeSpan.FromMilliseconds(delay));
                 bool opened = w2.Opened.IsCompleted;
                 if (w2.HasExited) return "the recovering worker exited by itself:\n" + w2.Tail;
@@ -543,7 +593,7 @@ internal sealed class Supervisor
             {
                 var sw = Stopwatch.StartNew();
                 int pauses = 0;
-                while (sw.Elapsed < run && !_stopRequested)
+                while (sw.Elapsed < run && !_stopRequested && !HistoryBudgetReached())
                 {
                     if (!Wait(TimeSpan.FromMilliseconds(r.Next(300, 3000)), w)) return Unexpected(w, w.WaitAsync(TimeSpan.FromSeconds(10)).Result);
                     w.Signal(ChildProcess.SigStop);

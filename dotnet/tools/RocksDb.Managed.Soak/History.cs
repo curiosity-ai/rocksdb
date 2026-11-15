@@ -174,24 +174,48 @@ internal static class HistoryReader
     /// <summary>Reads the parts of a cycle's history as one sequence (parts are written one after the other).</summary>
     public static List<HistoryRecord> ReadParts(IEnumerable<string> paths)
     {
-        var list = new List<HistoryRecord>();
-        foreach (string p in paths) Read(p, list);
+        string[] existing = paths.Where(File.Exists).ToArray();
+        // Sized from the files (at most one record per 48 bytes), so a multi-GB history is not copied while the list grows.
+        long bytes = 0;
+        foreach (string p in existing) bytes += new FileInfo(p).Length;
+        var list = new List<HistoryRecord>((int)Math.Min(bytes / HistoryRecord.Size, Array.MaxLength));
+        foreach (string p in existing) Read(p, list);
         return list;
     }
 
+    /// <summary>
+    /// Streams one history file into <paramref name="list"/>. A long cycle on a fast machine writes more than 2 GB of
+    /// history, beyond what File.ReadAllBytes (and one array) can hold, so the file is read through a buffer.
+    /// </summary>
     private static void Read(string path, List<HistoryRecord> list)
     {
-        if (!File.Exists(path)) return;
-        byte[] data = File.ReadAllBytes(path);
-        int pos = 0;
-        while (pos + HistoryRecord.Size <= data.Length)
+        const int BufferSize = 4 << 20;
+        byte[] buf = new byte[BufferSize];
+        int start = 0, end = 0; // unparsed bytes are buf[start..end)
+        using var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1, FileOptions.SequentialScan);
+        while (true)
         {
-            HistoryRecord r = HistoryRecord.Decode(data.AsSpan(pos), out int extraLen);
-            if (extraLen < 0 || pos + HistoryRecord.Size + extraLen > data.Length) break;
-            if (extraLen > 0) r.Extra = data.AsSpan(pos + HistoryRecord.Size, extraLen).ToArray();
-            r.Index = list.Count;
-            list.Add(r);
-            pos += HistoryRecord.Size + extraLen;
+            // Parse every complete record in the buffer.
+            while (end - start >= HistoryRecord.Size)
+            {
+                HistoryRecord r = HistoryRecord.Decode(buf.AsSpan(start), out int extraLen);
+                if (extraLen < 0 || extraLen > BufferSize - HistoryRecord.Size) return; // garbage: a torn tail
+                if (end - start < HistoryRecord.Size + extraLen) break; // the record continues in the next read
+                if (extraLen > 0) r.Extra = buf.AsSpan(start + HistoryRecord.Size, extraLen).ToArray();
+                r.Index = list.Count;
+                list.Add(r);
+                start += HistoryRecord.Size + extraLen;
+            }
+            // Keep the partial record, then refill.
+            if (start > 0)
+            {
+                Buffer.BlockCopy(buf, start, buf, 0, end - start);
+                end -= start;
+                start = 0;
+            }
+            int n = f.Read(buf, end, BufferSize - end);
+            if (n == 0) return; // end of file; a partial record left over is a torn last record
+            end += n;
         }
     }
 }

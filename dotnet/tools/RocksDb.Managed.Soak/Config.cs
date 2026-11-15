@@ -132,6 +132,12 @@ internal sealed class RunConfig
     public int CorruptEvery { get; set; } = 3;
     /// <summary>Histories of the last N successful cycles are kept (for export-history).</summary>
     public int KeepHistory { get; set; } = 20;
+    /// <summary>
+    /// The RUN phase ends early (with the cycle's fault) once the cycle's history reaches this size. The verifier holds
+    /// a cycle's whole history in memory (about 4x its size on disk), and a long cycle on a fast machine can write
+    /// several GB. 0 = no limit.
+    /// </summary>
+    public int MaxHistoryMb { get; set; } = 1536;
     /// <summary>A FIFO of a user-mounted LazyFS (the DB directory must be on that mount), or null.</summary>
     public string? LazyFsFifo { get; set; }
     /// <summary>The completion FIFO of that LazyFS (fifo_path_completed), or null.</summary>

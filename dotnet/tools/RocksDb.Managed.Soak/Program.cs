@@ -21,6 +21,7 @@ internal static class Program
         usage: RocksDb.Managed.Soak <command> [options]
           run --dir DIR [--duration 72h] [--seed N] [--smoke]
               [--mean-run S] [--min-run S] [--max-run S] [--native-every N] [--corrupt-every N] [--keep-history N]
+              [--max-history-mb N (default 1536; also applies when resuming)]
               [--faults Kill=30,Graceful=8,PowerLoss=12,TornOp=7,TornSeq=7,FsyncTrigger=8,RecoveryKill=8,Pause=6,IoError=8]
               [--writers N] [--keys-per-writer N]
               [--lazyfs-bin PATH | --lazyfs-fifo PATH [--lazyfs-fifo-completed PATH]]
@@ -96,13 +97,27 @@ internal static class Program
     private static int RunCommand(Dictionary<string, string> o)
     {
         var paths = new RunPaths(o["dir"]);
+        // One supervisor per run directory: a second one would run workers on the same DB (its LOCK makes them fail)
+        // and overwrite the model and the cycle plan of the first. The lock is held until the process exits.
+        Directory.CreateDirectory(paths.Root);
+        FileStream runLock;
+        try
+        {
+            runLock = new FileStream(Path.Combine(paths.Root, "supervisor.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException)
+        {
+            Console.Error.WriteLine($"another supervisor is running in {paths.Root} (supervisor.lock is held); stop it first");
+            return 2;
+        }
+        using FileStream heldLock = runLock; // released when the supervisor returns
         bool smoke = o.ContainsKey("smoke");
         TimeSpan duration = ParseDuration(o.GetValueOrDefault("duration", smoke ? "2m" : "72h"));
         RunConfig cfg;
         if (File.Exists(paths.RunJson))
         {
             cfg = RunConfig.Load(paths.RunJson);
-            Console.WriteLine($"resuming the run in {paths.Root} (seed {cfg.Seed}); only --duration applies");
+            Console.WriteLine($"resuming the run in {paths.Root} (seed {cfg.Seed}); only --duration and --max-history-mb apply");
         }
         else
         {
@@ -149,6 +164,11 @@ internal static class Program
             if (cfg.UsesLazyFs && cfg.FaultWeights.GetValueOrDefault(nameof(FaultKind.LazyFsClear)) == 0)
                 cfg.FaultWeights[nameof(FaultKind.LazyFsClear)] = 30;
             paths.CreateDirectories();
+            cfg.Save(paths.RunJson);
+        }
+        if (o.TryGetValue("max-history-mb", out string? mh))
+        {
+            cfg.MaxHistoryMb = int.Parse(mh, CultureInfo.InvariantCulture);
             cfg.Save(paths.RunJson);
         }
         paths.CreateDirectories();
