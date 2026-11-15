@@ -111,7 +111,10 @@ internal sealed class Worker
         // merge-batch transfers on the same accounts. With ValidateParallel (upstream's default) the check runs before
         // the write group and only excludes other optimistic transactions: a plain write landing between the check and
         // the write is lost, upstream as well, so that policy cannot be mixed with plain writes to the same keys.
-        _occ = await OptimisticTransactionDatabase.OpenAsync(_paths.Db, DbSetup.DbOptions(_plan.Options, _fs),
+        DbOptions dbOptions = DbSetup.DbOptions(_plan.Options, _fs);
+        // Every background error with its reason and severity, for the supervisor's I/O error verdict.
+        dbOptions.Listeners.Add(new BackgroundErrorLogger());
+        _occ = await OptimisticTransactionDatabase.OpenAsync(_paths.Db, dbOptions,
                 new OptimisticTransactionDbOptions { ValidatePolicy = OccValidationPolicy.ValidateSerial }, cfs)
             .ConfigureAwait(false);
         _db = _occ.Database;
@@ -868,5 +871,19 @@ internal sealed class Worker
         foreach (ColumnFamily cf in _db.ColumnFamilies)
             if (cf.Name.StartsWith(Keys.ScratchPrefix, StringComparison.Ordinal) && !cf.IsDropped) scratch.Add(cf);
         for (int i = 0; i < scratch.Count - 2; i++) _db.DropColumnFamily(scratch[i]);
+    }
+}
+
+/// <summary>
+/// Logs "BGERROR reason=R severity=S" for every background error the DB reports. The supervisor uses it to tell a NoSpace
+/// error that upstream classifies as fatal (reason MemTable: creating a WAL or writing out the old one's buffer during a
+/// memtable switch) from one that must recover.
+/// </summary>
+internal sealed class BackgroundErrorLogger : EventListener
+{
+    public override void OnBackgroundError(BackgroundErrorEventArgs e)
+    {
+        if (e.Error is { } err)
+            Console.WriteLine($"{DateTime.UtcNow:HH:mm:ss.fff} BGERROR reason={e.Reason} severity={err.Severity} {err.Message}");
     }
 }
