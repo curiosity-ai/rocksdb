@@ -517,6 +517,7 @@ internal sealed class IteratorCore
         return ValueTask.CompletedTask;
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask RecordAfterSlowAsync(ValueTask pending, Ticker step, Ticker found, long startTimestamp, bool seek)
     {
         await pending.ConfigureAwait(false);
