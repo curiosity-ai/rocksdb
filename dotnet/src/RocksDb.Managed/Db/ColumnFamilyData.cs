@@ -364,6 +364,16 @@ internal sealed class ColumnFamilyData
     public ulong LogNumber { get; set; }
     public bool Dropped { get; set; }
     /// <summary>
+    /// The DB was closed: the super version was released for good (no new one is installed), so a reference can no longer
+    /// be taken. Set by close before it releases the super version; read without the mutex.
+    /// </summary>
+    public bool Closed
+    {
+        get => Volatile.Read(ref _closed);
+        set => Volatile.Write(ref _closed, value);
+    }
+    private bool _closed;
+    /// <summary>
     /// Non-atomic flush jobs scheduled or running on this column family. Like upstream, several flushes of one column
     /// family may run at once, each on memtables the others did not pick; their results are committed in memtable order
     /// (<see cref="FlushCommitInProgress"/>). (Atomic flushes are counted by the DB, they are installed in memtable order

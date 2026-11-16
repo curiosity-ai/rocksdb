@@ -241,6 +241,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
             SuperVersion sv = cfd.Super;
             if (sv.TryRef()) return sv;
             if (cfd.Dropped) ThrowDropped(cfd);
+            // The DB was closed meanwhile (an operation racing the close): its super version is gone and is not replaced,
+            // so retrying would spin forever.
+            if (cfd.Closed) ThrowDisposed();
             Thread.SpinWait(1);
         }
     }
@@ -1212,6 +1215,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// </summary>
     private void ReleaseColumnFamilyMemTables(ColumnFamilyData cfd)
     {
+        cfd.Closed = true; // before the super version is released: see GetReferencedSuperVersion
         SuperVersion? sv = cfd.SuperOrNull();
         cfd.LocalSuperVersions.Reset(this);
         if (sv is not null && sv.Unref()) CleanupSuperVersion(sv);

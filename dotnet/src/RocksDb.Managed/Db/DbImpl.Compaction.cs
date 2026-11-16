@@ -1368,6 +1368,7 @@ internal sealed partial class DbImpl
         if (flushNeeded) await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ManualCompaction, synchronous, cancellationToken).ConfigureAwait(false);
 
         bool exclusive = options.ExclusiveManualCompaction;
+        TestHooks.Invoke("DBImpl::CompactRange:AfterFlush");
         if (exclusive) await BeginExclusiveManualAsync(synchronous, cancellationToken).ConfigureAwait(false);
         try
         {

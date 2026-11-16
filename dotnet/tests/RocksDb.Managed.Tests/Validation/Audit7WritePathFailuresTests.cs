@@ -20,13 +20,27 @@ public sealed class Audit7WritePathFailuresTests
     [TestCleanup]
     public void Cleanup() => TestHooks.ClearAll();
 
-    private static DbOptions SweepOptions(IFileSystem fs, bool autoResume)
+    /// <summary>The write modes of DBImpl::WriteImpl the sweep runs in.</summary>
+    public enum SweepMode
+    {
+        Default,
+        Pipelined,
+        Unordered,
+        TwoWriteQueues,
+    }
+
+    private static DbOptions SweepOptions(IFileSystem fs, bool autoResume, SweepMode mode)
     {
         DbOptions o = NewOptions(fs);
         o.MaxBgErrorResumeCount = autoResume ? 3 : 0;
         o.BgErrorResumeRetryInterval = 1000;
+        o.EnablePipelinedWrite = mode == SweepMode.Pipelined;
+        o.UnorderedWrite = mode == SweepMode.Unordered;
+        o.TwoWriteQueues = mode == SweepMode.TwoWriteQueues;
         return o;
     }
+
+    private const int SweepThreads = 3;
 
     private static ColumnFamilyOptions SweepCfOptions() => new()
     {
@@ -44,11 +58,11 @@ public sealed class Audit7WritePathFailuresTests
     /// <paramref name="failAt"/> (counted from after the open), resuming after every failed write
     /// (DBImpl::Resume) and closing at the end. Returns the operations in order.
     /// </summary>
-    private static List<Op> RunSweepWorkload(FaultInjectionFileSystem fs, long failAt, InjectedFaultKind kind, bool autoResume, int seed)
+    private static List<Op> RunSweepWorkload(FaultInjectionFileSystem fs, long failAt, InjectedFaultKind kind, bool autoResume, int seed,
+        SweepMode mode)
     {
-        var ops = new List<Op>();
-        var rnd = new Random(seed);
-        RocksDatabase db = RocksDatabase.Open(DbPath, SweepOptions(fs, autoResume), SweepCfOptions());
+        RocksDatabase db = RocksDatabase.Open(DbPath, SweepOptions(fs, autoResume, mode), SweepCfOptions());
+        var perThread = new List<Op>[SweepThreads];
         try
         {
             if (failAt > 0)
@@ -57,11 +71,39 @@ public sealed class Audit7WritePathFailuresTests
                 fs.TransientFailure = true;
                 fs.CrashAtOperation = fs.Operations + failAt;
             }
-            for (int i = 0; i < 400; i++)
+            // Writers on disjoint keys (key % SweepThreads == thread), so each key's operations are ordered.
+            var threads = new Task[SweepThreads];
+            for (int t = 0; t < SweepThreads; t++)
             {
-                int key = rnd.Next(40);
+                int thread = t;
+                threads[t] = Task.Factory.StartNew(() => perThread[thread] = RunSweepWriter(db, thread, autoResume, seed * 31 + thread),
+                    TaskCreationOptions.LongRunning);
+            }
+            Task.WaitAll(threads);
+            try { db.CompactRange(); }
+            catch (RocksDbException) { TryResume(db, autoResume); }
+        }
+        finally
+        {
+            try { db.Dispose(); }
+            catch (RocksDbException) { }
+        }
+        var ops = new List<Op>();
+        foreach (List<Op> l in perThread) ops.AddRange(l);
+        return ops;
+    }
+
+    private static List<Op> RunSweepWriter(RocksDatabase db, int thread, bool autoResume, int seed)
+    {
+        var ops = new List<Op>();
+        var rnd = new Random(seed);
+        {
+            for (int i = 0; i < 150; i++)
+            {
+                int key = rnd.Next(14) * SweepThreads + thread;
                 bool delete = rnd.Next(10) == 0;
-                string? value = delete ? null : "v" + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + new string('x', 100);
+                string? value = delete ? null : "v" + thread.ToString(System.Globalization.CultureInfo.InvariantCulture) + "-"
+                    + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + new string('x', 100);
                 var wo = new WriteOptions { Sync = rnd.Next(8) == 0 };
                 bool acked;
                 try
@@ -81,19 +123,12 @@ public sealed class Audit7WritePathFailuresTests
                     _ = db.Get(Key(key));
                     TryResume(db, autoResume);
                 }
-                if (i % 97 == 96)
+                if (thread == 0 && i % 47 == 46)
                 {
                     try { db.Flush(); }
                     catch (RocksDbException) { TryResume(db, autoResume); }
                 }
             }
-            try { db.CompactRange(); }
-            catch (RocksDbException) { TryResume(db, autoResume); }
-        }
-        finally
-        {
-            try { db.Dispose(); }
-            catch (RocksDbException) { }
         }
         return ops;
     }
@@ -130,9 +165,9 @@ public sealed class Audit7WritePathFailuresTests
     /// (a failed write's outcome is indeterminate, DB::Write in db.h); a key whose last acknowledged operation is a
     /// delete stays deleted unless a later failed put reappears.
     /// </summary>
-    private static void VerifyAfterReopen(FaultInjectionFileSystem fs, List<Op> ops, string context)
+    private static void VerifyAfterReopen(FaultInjectionFileSystem fs, List<Op> ops, string context, SweepMode mode)
     {
-        using RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { FileSystem = fs }, SweepCfOptions());
+        using RocksDatabase db = RocksDatabase.Open(DbPath, SweepOptions(fs, autoResume: false, mode), SweepCfOptions());
         var keys = new HashSet<int>();
         foreach (Op op in ops) keys.Add(op.Key);
         foreach (int key in keys)
@@ -162,12 +197,18 @@ public sealed class Audit7WritePathFailuresTests
     /// nothing hangs. ErrorHandler::SetBGError, DBImpl::ResumeImpl, VersionSet::ProcessManifestWrites.
     /// </summary>
     [TestMethod]
-    [DataRow(0, false)] // IOError
-    [DataRow(1, false)] // Retryable
-    [DataRow(1, true)]
-    [DataRow(3, false)] // NoSpace
-    [DataRow(2, true)] // FileScope
-    public void TransientIoErrorAtAnyOperationLosesNoAcknowledgedWrite(int kindValue, bool autoResume)
+    [DataRow(0, false, SweepMode.Default)] // IOError
+    [DataRow(1, false, SweepMode.Default)] // Retryable
+    [DataRow(1, true, SweepMode.Default)]
+    [DataRow(3, false, SweepMode.Default)] // NoSpace
+    [DataRow(2, true, SweepMode.Default)] // FileScope
+    [DataRow(0, false, SweepMode.Pipelined)]
+    [DataRow(1, true, SweepMode.Pipelined)]
+    [DataRow(0, false, SweepMode.Unordered)]
+    [DataRow(1, true, SweepMode.Unordered)]
+    [DataRow(0, false, SweepMode.TwoWriteQueues)]
+    [DataRow(1, true, SweepMode.TwoWriteQueues)]
+    public void TransientIoErrorAtAnyOperationLosesNoAcknowledgedWrite(int kindValue, bool autoResume, SweepMode mode)
     {
         var kind = (InjectedFaultKind)kindValue;
         int seed = Environment.GetEnvironmentVariable("AUDIT7_SEED") is { } s ? int.Parse(s, System.Globalization.CultureInfo.InvariantCulture)
@@ -178,7 +219,7 @@ public sealed class Audit7WritePathFailuresTests
         var dry = new FaultInjectionFileSystem(NewFs());
         long before = dry.Operations;
         dry.OpLog = new System.Collections.Concurrent.ConcurrentQueue<string>();
-        RunSweepWorkload(dry, 0, kind, autoResume, seed);
+        RunSweepWorkload(dry, 0, kind, autoResume, seed, mode);
         long total = dry.Operations - before;
         Assert.IsTrue(total > 100, "workload too small: " + total);
         // Operations other than WAL / info LOG appends and flushes (table files, MANIFEST, CURRENT, directories,
@@ -199,8 +240,8 @@ public sealed class Audit7WritePathFailuresTests
         {
             long failAt = iteration % 2 == 0 && rare.Count > 0 ? rare[pick.Next(rare.Count)] : 1 + pick.NextInt64(total);
             var fs = new FaultInjectionFileSystem(NewFs());
-            string context = "seed=" + seed + " kind=" + kind + " auto=" + autoResume + " failAt=" + failAt;
-            Task<List<Op>> run = Task.Run(() => RunSweepWorkload(fs, failAt, kind, autoResume, seed + iteration));
+            string context = "seed=" + seed + " kind=" + kind + " auto=" + autoResume + " mode=" + mode + " failAt=" + failAt;
+            Task<List<Op>> run = Task.Run(() => RunSweepWorkload(fs, failAt, kind, autoResume, seed + iteration, mode));
             Assert.IsTrue(run.Wait(Timeout), context + ": the workload hung");
             int failedHere = 0;
             foreach (Op op in run.Result) if (!op.Acked) failedHere++;
@@ -211,7 +252,7 @@ public sealed class Audit7WritePathFailuresTests
                 where.Append(at).Append(" (").Append(failedHere).Append(" failed) | ");
             }
             fs.Restart();
-            VerifyAfterReopen(fs, run.Result, context + " at " + fs.CrashedAt);
+            VerifyAfterReopen(fs, run.Result, context + " at " + fs.CrashedAt, mode);
             Assert.AreEqual(0, fs.OpenFiles, context + ": file handles left open");
         }
         Console.WriteLine("ops=" + total + " faults hit=" + hit + " failed writes=" + failedWrites + " at: " + where);
@@ -395,7 +436,15 @@ public sealed class Audit7WritePathFailuresTests
             await Task.Delay(rnd.Next(0, 5));
             gate.Set();
             Assert.IsTrue(close.Wait(Timeout), "seed=" + seed + " round " + round + ": close hung");
-            Assert.IsTrue(Task.WaitAll(tasks.ToArray(), Timeout), "seed=" + seed + " round " + round + ": a call racing the close hung");
+            if (!Task.WaitAll(tasks.ToArray(), Timeout))
+            {
+                var hung = new List<string>();
+                for (int t = 0; t < tasks.Count; t++)
+                {
+                    if (!tasks[t].IsCompleted) hung.Add(t < Writers ? "writer " + t : t < Writers + 2 ? "CompactRange " + t : "Flush");
+                }
+                Assert.Fail("seed=" + seed + " round " + round + ": calls racing the close hung: " + string.Join(", ", hung));
+            }
             Assert.IsTrue(unexpected.IsEmpty, "seed=" + seed + ": " + string.Join("\n", unexpected));
             int committed = 0, disposed = 0;
             foreach (Outcome o in outcomes)
@@ -735,5 +784,37 @@ public sealed class Audit7WritePathFailuresTests
         for (int i = 0; i < 200; i++) CollectionAssert.AreEqual(Value(i, i % 2 == 0 ? 1 : 0), reopened.Get(Key(i)), "after reopen " + i);
         reopened.WaitForCompact();
         CollectionAssert.AreEqual(LiveSst(reopened).ToList(), SstOnDisk(fs).ToList(), "files left after the reopen");
+    }
+    /// <summary>
+    /// A CompactRange that passed its closed-DB check just before the close (here: with nothing to flush, held right
+    /// after the flush step) must fail once the close released the column family's super version. It used to spin
+    /// forever in GetReferencedSuperVersion (TryRef of a super version that is never replaced), burning a core.
+    /// Managed contract (native: calling into a DB that is being deleted is undefined behavior): ObjectDisposed.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task CompactRangeRacingTheCloseDoesNotSpin(bool synchronous)
+    {
+        MemoryFileSystem fs = NewFs();
+        RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        db.Put(B("a"), B("1"));
+        db.Flush();
+        using var reached = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        int hits = 0;
+        TestHooks.Set("DBImpl::CompactRange:AfterFlush", () =>
+        {
+            if (Interlocked.Increment(ref hits) != 1) return;
+            reached.Set();
+            release.Wait(Timeout);
+        });
+        Task compact = synchronous ? Task.Run(db.CompactRange) : Task.Run(async () => await db.CompactRangeAsync());
+        Assert.IsTrue(reached.Wait(Timeout));
+        await db.DisposeAsync();
+        release.Set();
+        Assert.IsTrue(((IAsyncResult)compact).AsyncWaitHandle.WaitOne(Timeout), "CompactRange spins after the close");
+        Exception? e = compact.Exception?.InnerException;
+        Assert.IsTrue(e is ObjectDisposedException or RocksDbException { Code: StatusCode.ShutdownInProgress }, e?.ToString() ?? "no error");
     }
 }
