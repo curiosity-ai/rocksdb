@@ -17,6 +17,8 @@ public enum InplaceUpdateStatus
 /// inplace_callback (ColumnFamilyOptions, used with <see cref="ColumnFamilyOptions.InplaceUpdateSupport"/>): combines the
 /// existing value of a key with the value of a Put (the "delta"). Port of the upstream function pointer
 /// <c>UpdateStatus (*)(char* existing_value, uint32_t* existing_value_size, Slice delta_value, std::string* merged_value)</c>.
+/// It is called while the write inserts into the memtable and should not throw: an exception fails the write and stops
+/// further writes (a fatal background error, like a failed memtable insert upstream); reopen the DB to continue.
 /// </summary>
 /// <param name="existingValue">
 /// The current value in the memtable (writable; modify it in place for <see cref="InplaceUpdateStatus.UpdatedInplace"/>),

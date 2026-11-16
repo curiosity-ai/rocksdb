@@ -31,6 +31,12 @@ public interface IFilterBitsReader
 }
 
 /// <summary>CONTRACT (owned by stream C). Port of rocksdb::FilterPolicy (bloom / ribbon).</summary>
+/// <remarks>
+/// A filter block is found by <see cref="CompatibilityName"/>: tables written with another policy are read without a
+/// filter. Readers are trusted like upstream (a false negative loses keys). A builder that throws fails the flush or
+/// compaction with a fatal background error (no table is installed); a reader factory that throws fails the call that
+/// opens the table (DB open, or the read).
+/// </remarks>
 public abstract class FilterPolicy
 {
     /// <summary>Name persisted in table properties (e.g. "rocksdb.BuiltinBloomFilter").</summary>

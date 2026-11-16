@@ -25,6 +25,12 @@ internal enum ComparatorKind : byte
 /// Implementations must be thread-safe (they are shared by every reader and writer) and must define a
 /// total order. <see cref="FindShortestSeparator"/> / <see cref="FindShortSuccessor"/> results are persisted
 /// in SST index blocks, so a comparator's implementation of those must never change once data was written.
+/// Implementations should not throw (upstream's contract has no failure path). If one does: a read (Get, MultiGet,
+/// iterator, manual compaction picking) fails with that exception and the DB stays usable; a write fails and the DB
+/// stops accepting writes (a fatal background error, like a failed memtable insert upstream); a flush or compaction
+/// fails with a fatal background error (IOError) without installing its output. Reopening the DB recovers the data.
+/// An order that changes after keys were written is detected by flushes and compactions (Corruption "Compaction sees
+/// out-of-order keys.").
 /// </remarks>
 public abstract class Comparator
 {

@@ -23,6 +23,7 @@ public sealed class GetMergeOperandsOptions
     /// <summary>
     /// continue_cb: called after reading each merge operand (newest to oldest, excluding a base value); returning false
     /// ends the lookup at that operand, so only a suffix of the operands (the newest ones) is returned. Null = read all.
+    /// An exception it throws ends the lookup and propagates to the caller.
     /// </summary>
     public MergeOperandContinueCallback? ContinueCallback { get; init; }
 }

@@ -17,6 +17,11 @@ namespace RocksDb.Managed;
 /// (1) <c>key.starts_with(Transform(key))</c>, (2) if <c>InDomain(k)</c> and <c>Compare(k1, k2) &lt;= 0</c> with both in
 /// domain then <c>Compare(Transform(k1), Transform(k2)) &lt;= 0</c>, (3) <c>InDomain(Transform(k))</c> for keys in domain.
 /// </para>
+/// <para>
+/// Implementations should not throw. If one does, a read fails with that exception (the DB stays usable), a write whose
+/// memtable insert calls it (memtable prefix bloom) fails and stops further writes (fatal background error), and a flush
+/// or compaction building a prefix filter fails with a fatal background error; reopening the DB recovers the data.
+/// </para>
 /// </summary>
 public abstract class SliceTransform
 {
