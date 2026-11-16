@@ -523,6 +523,8 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     private static string StatusKind(string message) =>
         message.StartsWith("Corruption", StringComparison.Ordinal) ? "Corruption"
         : message.StartsWith("NotFound", StringComparison.Ordinal) || message.StartsWith("Not found", StringComparison.Ordinal) ? "NotFound"
+        : message.StartsWith("Invalid argument", StringComparison.Ordinal) ? "InvalidArgument"
+        : message.StartsWith("Not implemented", StringComparison.Ordinal) ? "NotSupported"
         : message.StartsWith("IO error", StringComparison.Ordinal) ? "IOError" : message;
 
     /// <summary>DB::GetUpdatesSince(1) (db/transaction_log_impl.cc): the batch sequences read, then the final status.</summary>
@@ -878,9 +880,58 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
             }
             lines.Add(mode + ": native=" + ns + " " + nk + " | managed=" + ms + " " + mk + " " + mmsg);
             same &= ns == ms && nk == mk;
+            // DB::OpenForReadOnly replays the WALs too (DBImplReadOnly, nothing written).
+            string ro = ReadOnlyOpenBoth(src, mode, out bool roSame);
+            lines.Add(mode + " read-only: " + ro);
+            same &= roSame;
         }
         foreach (string l in lines) Console.WriteLine(l);
         Assert.IsTrue(same, scenario + ":\n" + string.Join("\n", lines));
+    }
+
+    private static string ReadKeysNative(RocksDbSharp.RocksDb db)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < FuzzKeys; i++) sb.Append(db.Get(FK(i)) == "v" + i ? '1' : db.Get(FK(i)) is null ? '0' : 'X');
+        return sb.ToString();
+    }
+
+    private static string ReadKeysManaged(RocksDatabase db)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < FuzzKeys; i++)
+        {
+            byte[]? v = db.Get(Encoding.UTF8.GetBytes(FK(i)));
+            sb.Append(v is null ? '0' : Encoding.UTF8.GetString(v) == "v" + i ? '1' : 'X');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Opens <paramref name="src"/> read-only with both engines (the directory is not modified).</summary>
+    private static string ReadOnlyOpenBoth(string src, WalRecoveryMode mode, out bool same)
+    {
+        string native, managed;
+        try
+        {
+            using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.OpenReadOnly(new RocksDbSharp.DbOptions().SetWalRecoveryMode((RocksDbSharp.Recovery)(int)mode),
+                src, false);
+            native = "OK " + ReadKeysNative(db);
+        }
+        catch (RocksDbSharp.RocksDbException e)
+        {
+            native = StatusKind(e.Message);
+        }
+        try
+        {
+            using RocksDatabase db = RocksDatabase.OpenReadOnly(src, new DbOptions { WalRecoveryMode = mode });
+            managed = "OK " + ReadKeysManaged(db);
+        }
+        catch (RocksDbException e)
+        {
+            managed = e.Code.ToString();
+        }
+        same = native == managed;
+        return "native=" + native + " | managed=" + managed;
     }
 
     /// <summary>Like <see cref="NativeDbWithTwoWals"/>, written with recycle_log_file_num = 2 (recyclable WAL records).</summary>
@@ -906,5 +957,226 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
             for (int i = 0; i < 8; i++, k++) db.Put(FK(k), "v" + k);
         }
         return path;
+    }
+
+    // ---- WriteBatch from untrusted bytes ---------------------------------------------------------------------------
+
+    private static byte[] BaseBatchRep()
+    {
+        using var b = new Db.WriteBatch();
+        b.Put(Encoding.UTF8.GetBytes("k0"), Encoding.UTF8.GetBytes("v0"));
+        b.Delete(Encoding.UTF8.GetBytes("k1"));
+        b.Put(Encoding.UTF8.GetBytes("k2"), Encoding.UTF8.GetBytes("v2"));
+        b.SingleDelete(Encoding.UTF8.GetBytes("k3"));
+        b.DeleteRange(Encoding.UTF8.GetBytes("r0"), Encoding.UTF8.GetBytes("r9"));
+        b.PutLogData(Encoding.UTF8.GetBytes("blob"));
+        b.Put(Encoding.UTF8.GetBytes("k4"), Encoding.UTF8.GetBytes("v4"));
+        b.Put(Encoding.UTF8.GetBytes("k5"), Encoding.UTF8.GetBytes("v5"));
+        return b.Data.ToArray();
+    }
+
+    /// <summary>Whether a record of <paramref name="rep"/>, up to the first malformed one, is a (column family) TimedPut tag.</summary>
+    private static bool HasTimedPutRecord(byte[] rep)
+    {
+        int pos = 12;
+        while (pos < rep.Length)
+        {
+            var tag = (Db.EntryType)rep[pos];
+            if (tag is Db.EntryType.ValuePreferredSeqno or Db.EntryType.ColumnFamilyValuePreferredSeqno) return true;
+            int at = pos;
+            try
+            {
+                var r = new Db.WriteBatchReader(rep.AsSpan(at), wholeBatch: false, count: 0);
+                if (!r.TryReadNext(out _)) return false;
+                pos = at + (rep.Length - at - r.RemainingBytes);
+            }
+            catch (RocksDbException)
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static readonly string[] s_batchKeys = ["k0", "k2", "k4", "k5", "z"];
+
+    private static string NativeApply(string dir, byte[] rep)
+    {
+        using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), dir);
+        string status;
+        try
+        {
+            using var b = new RocksDbSharp.WriteBatch(rep);
+            db.Write(b);
+            status = "OK";
+        }
+        catch (RocksDbSharp.RocksDbException e)
+        {
+            status = StatusKind(e.Message);
+        }
+        string after;
+        try
+        {
+            db.Put("z", "1");
+            after = "OK";
+        }
+        catch (RocksDbSharp.RocksDbException e)
+        {
+            after = StatusKind(e.Message);
+        }
+        var sb = new StringBuilder(status + " then put " + after + " keys ");
+        foreach (string k in s_batchKeys)
+        {
+            try
+            {
+                sb.Append(db.Get(k) is null ? '0' : '1');
+            }
+            catch (RocksDbSharp.RocksDbException e)
+            {
+                sb.Append('[').Append(StatusKind(e.Message)).Append(']');
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static string ManagedApply(string dir, byte[] rep)
+    {
+        using RocksDatabase db = RocksDatabase.Open(dir, new DbOptions { CreateIfMissing = true });
+        string status;
+        try
+        {
+            using var b = new Db.WriteBatch(rep);
+            db.Write(b);
+            status = "OK";
+        }
+        catch (RocksDbException e)
+        {
+            status = e.Code.ToString();
+        }
+        string after;
+        try
+        {
+            db.Put(Encoding.UTF8.GetBytes("z"), Encoding.UTF8.GetBytes("1"));
+            after = "OK";
+        }
+        catch (RocksDbException e)
+        {
+            after = e.Code.ToString();
+        }
+        var sb = new StringBuilder(status + " then put " + after + " keys ");
+        foreach (string k in s_batchKeys)
+        {
+            try
+            {
+                sb.Append(db.Get(Encoding.UTF8.GetBytes(k)) is null ? '0' : '1');
+            }
+            catch (RocksDbException e)
+            {
+                sb.Append('[').Append(e.Code).Append(']');
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// DBImpl::Write with a WriteBatch built from mutated bytes (WriteBatch(rep), WriteBatchInternal::InsertInto ->
+    /// Iterate / ReadRecordFromWriteBatch, "WriteBatch has wrong count", unknown column family ids): native and managed
+    /// return the same status, leave the same keys visible, and accept (or refuse, after a background error) the next
+    /// write the same way. Reps shorter than the 12-byte header are not given to native (it reads the header unchecked).
+    /// Seed: AUDIT7_SEED.
+    /// </summary>
+    [TestMethod]
+    public void MutatedWriteBatchAppliedLikeNative()
+    {
+        int seed = Seed();
+        Console.WriteLine("seed=" + seed);
+        var rnd = new Random(seed);
+        byte[] baseRep = BaseBatchRep();
+        using var dir = new TempDir("a7wb");
+        var diffs = new List<string>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int iter = 0, skipped = 0;
+        for (; iter < 400 && sw.Elapsed < TimeSpan.FromSeconds(15); iter++)
+        {
+            byte[] rep = (byte[])baseRep.Clone();
+            string how;
+            switch (rnd.Next(5))
+            {
+                case 0:
+                {
+                    int at = 12 + rnd.Next(rep.Length - 12);
+                    rep[at] ^= (byte)(1 << rnd.Next(8));
+                    how = "flip@" + at;
+                    break;
+                }
+                case 1:
+                {
+                    int at = 12 + rnd.Next(rep.Length - 12);
+                    rep[at] = (byte)rnd.Next(256);
+                    how = "byte@" + at + "=" + rep[at];
+                    break;
+                }
+                case 2:
+                {
+                    int n = 12 + rnd.Next(rep.Length - 12);
+                    rep = rep[..n];
+                    how = "truncate@" + n;
+                    break;
+                }
+                case 3:
+                {
+                    uint count = (uint)rnd.Next(12);
+                    Util.Coding.EncodeFixed32(rep.AsSpan(8), count);
+                    how = "count=" + count;
+                    break;
+                }
+                default:
+                {
+                    // A column family variant of a Put with a random (mostly unknown) column family id.
+                    byte cf = (byte)rnd.Next(4);
+                    rep = [.. rep, (byte)Db.EntryType.ColumnFamilyValue, cf, 1, (byte)'c', 1, (byte)'v'];
+                    Util.Coding.EncodeFixed32(rep.AsSpan(8), Util.Coding.DecodeFixed32(rep.AsSpan(8)) + 1);
+                    how = "cfput cf=" + cf;
+                    break;
+                }
+            }
+            Util.Coding.EncodeFixed64(rep, 0);
+            string n1 = Path.Combine(dir.Path, "n" + iter), m1 = Path.Combine(dir.Path, "m" + iter);
+            if (HasTimedPutRecord(rep))
+            {
+                // Native aborts the process (std::length_error) on a TimedPut whose value is shorter than its 8-byte write
+                // time: ReadRecordFromWriteBatch -> ParsePackedValueWithWriteTime (db/seqno_to_time_mapping.cc) builds
+                // Slice(value.data(), value.size() - 8). The managed reader returns Corruption "bad WriteBatch TimedPut"
+                // (see WriteBatchMutationFuzzOnlyCorruptionEscapes); such reps are not given to native.
+                skipped++;
+                continue;
+            }
+            string native = NativeApply(n1, rep);
+            string managed = ManagedApply(m1, rep);
+            // Known deviation (stricter than upstream): the managed write path iterates the whole batch before the WAL
+            // write (ValidateColumnFamilies), so a malformed batch is refused without reaching the WAL. Native writes it
+            // to the WAL, fails the memtable insert and stops the DB with that background error
+            // (DBImpl::HandleMemTableInsertFailure), so its next write fails too and the batch's keys stay invisible in
+            // both. Compare everything but the next write in that case. The validation also reads the whole batch before
+            // anything is applied, so with two problems in one batch (a refused entry, e.g. an inverted DeleteRange, then
+            // a malformed record) the managed write reports the malformed record's Corruption where native reports the
+            // first entry's status: both refuse the write; only the code can differ.
+            string[] np = native.Split(' '), mp = managed.Split(' ');
+            if (np[0] != "OK" && mp[0] != "OK" && np[3] == np[0] && mp[3] == "OK" && np[5] == "00000" && mp[5] == "00001")
+            {
+                managed = native;
+            }
+            // A Put tag flipped to kTypeBlobIndex leaves a (bogus) blob index in the memtable. Native 11.12's MemTable
+            // SaveValue answers NotSupported "Encountered unexpected blob index"; main (11.14, which the port follows)
+            // resolves memtable blob indexes for blob direct write (DBImpl::MaybeResolveMemtableBlobValue), so the bogus
+            // index fails to decode: Corruption. Not comparable with the 11.12 package.
+            native = native.Replace("[NotSupported]", "[Corruption]", StringComparison.Ordinal);
+            if (native != managed) diffs.Add("iter=" + iter + " " + how + ": native=" + native + " | managed=" + managed);
+            Directory.Delete(n1, true);
+            Directory.Delete(m1, true);
+        }
+        Console.WriteLine("iterations " + iter + ", not given to native: " + skipped);
+        foreach (string d in diffs.Take(40)) Console.WriteLine(d);
+        Assert.AreEqual(0, diffs.Count, "seed=" + seed + ": " + diffs.Count + " differences, first: " + (diffs.Count > 0 ? diffs[0] : ""));
     }
 }
