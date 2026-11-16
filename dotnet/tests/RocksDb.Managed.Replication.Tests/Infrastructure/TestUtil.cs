@@ -108,6 +108,17 @@ internal static class TestUtil
 
     public static Task WaitUntilAsync(Func<bool> condition, string what) => WaitUntilAsync(condition, Timeout, what);
 
+    /// <summary><see cref="WaitUntilAsync(Func{bool}, string)"/> for a condition that awaits (e.g. a call into a node).</summary>
+    public static async Task WaitUntilAsync(Func<ValueTask<bool>> condition, string what)
+    {
+        var deadline = DateTime.UtcNow + Timeout;
+        while (!await condition())
+        {
+            if (DateTime.UtcNow > deadline) Assert.Fail("timed out waiting for " + what);
+            await Task.Delay(10);
+        }
+    }
+
     /// <summary>Waits (signalled by the replica's write path) until <paramref name="replica"/> reaches <paramref name="sequence"/>.</summary>
     public static async Task WaitForSequenceAsync(RocksDatabase replica, ulong sequence, string what)
     {

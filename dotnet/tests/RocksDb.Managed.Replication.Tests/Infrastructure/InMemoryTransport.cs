@@ -175,24 +175,23 @@ public sealed class InMemoryClusterClient(InMemoryNetwork network, string from, 
 
     private ClusterNodeHost? Target => network.Resolve<ClusterNodeHost>(from, to);
 
-    public Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) =>
-        Task.FromResult(Target?.HandleRequestVote(request));
+    public async Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) =>
+        Target is { } t ? await t.HandleRequestVoteAsync(request, cancellationToken).ConfigureAwait(false) : null;
 
-    public Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) =>
-        Task.FromResult(Target?.HandleHeartbeat(payload));
+    public async Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) =>
+        Target is { } t ? await t.HandleHeartbeatAsync(payload, cancellationToken).ConfigureAwait(false) : null;
 
     public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.GetStatus());
 
-    public Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
-        Task.FromResult(Target?.HandleCheckLogConsistency(latestSeq, termAtLatest));
+    public async Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
+        Target is { } t ? await t.HandleCheckLogConsistencyAsync(latestSeq, termAtLatest, cancellationToken).ConfigureAwait(false) : null;
 
     public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
         InMemoryNetwork.Pump(ct => network.Require<ClusterNodeHost>(from, to).StreamUpdatesAsync(followerId, startSeq, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
 
-    public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
+    public async Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
     {
-        Target?.HandleReportProgress(followerId, appliedThrough, leaderTerm);
-        return Task.CompletedTask;
+        if (Target is { } t) await t.HandleReportProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>

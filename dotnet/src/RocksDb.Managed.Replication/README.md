@@ -280,9 +280,9 @@ checkpoint as catch-up from far behind. It adds terms/votes (`RaftPersistentStat
 side-log (`RaftLogTerms`, `startSeq -> term`), elections, heartbeats carrying `(term, prevLogSeq, prevLogTerm,
 leaderCommit, mode)`, quorum commit restricted to current-term entries (with a leader no-op entry, Raft 5.4.2), and the
 one-way Bootstrap -> Cluster transition (a designated primary leads without election until a quorum is in sync).
-Divergence is detected at stream attach (`CheckFollowerLogConsistency`), per chunk (sequence check) and per heartbeat
-(prev term); since a WAL cannot be truncated, a diverged follower rebuilds from a leader snapshot (`BeginResync` /
-`CompleteResync`). `ClusterNodeHost` implements the follower stream, progress reports, attach check and resync.
+Divergence is detected at stream attach (`CheckFollowerLogConsistencyAsync`), per chunk (sequence check) and per
+heartbeat (prev term); since a WAL cannot be truncated, a diverged follower rebuilds from a leader snapshot
+(`BeginResyncAsync` / `CompleteResyncAsync`). `ClusterNodeHost` implements the follower stream, progress reports, attach check and resync.
 
 Durability: every log entry (client writes, the leader no-op, replicated chunks on followers) is fsync'd before it
 counts - before the leader counts itself towards the commit quorum, before a follower reports or acknowledges it, and
@@ -319,7 +319,8 @@ where noted below. Out of scope as before: pre-vote, membership changes, ReadInd
 | hosts wait fixed 500-1000 ms for "in-flight handlers" before disposing a DB on resync | `DatabaseUsageGate` drain | deterministic |
 | snapshot stream ends without a marker | plan + files + `Complete` marker | a truncated transfer is detected |
 | `RaftConfig`/`AdaptiveCommitDelayController` with defaulted ctor parameters | required ctor args + init properties / options object | no hidden defaults |
-| `IPeerTransport.SendRequestVoteAsync(peer, term, id, seq, term, ct)` | `SendRequestVoteAsync(peer, RequestVotePayload, ct)`; `HandleAppendEntries(HeartbeatPayload)` (positional overload kept) | one payload type per RPC |
+| `IPeerTransport.SendRequestVoteAsync(peer, term, id, seq, term, ct)` | `SendRequestVoteAsync(peer, RequestVotePayload, ct)`; `HandleAppendEntriesAsync(HeartbeatPayload, ct)` | one payload type per RPC |
+| node state under a `lock`; the new leader writes its no-op entry synchronously inside it; RPC handlers are synchronous | an async gate (`SemaphoreSlim`); the no-op is `PutAsync` awaited under it; the handlers are `ValueTask`-returning (`HandleRequestVoteAsync`, ...); `Role` / `CurrentLeaderId` / `IsResyncing` are volatile reads | a write stall (or a sync write queued behind an async write leader) blocked every vote / heartbeat handler thread on the lock: the node stopped answering and the thread pool starved |
 | `ElectionTimer`/heartbeats on `System.Threading.Timer`/`Task.Delay` | `TimeProvider` (`RaftConfig.TimeProvider`) | testable time |
 | signature length prefix in machine byte order | little-endian | identical signatures across architectures |
 | per-batch `EntryTerm` on the Raft stream | chunks merge batches, so a follower also merges the leader's term map at attach | a chunk may span a term boundary |
