@@ -15,7 +15,7 @@ namespace RocksDb.Managed.Tests.Validation;
 public sealed class Audit7WritePathFailuresTests
 {
     private const string DbPath = "/audit7writefail";
-    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
 
     [TestCleanup]
     public void Cleanup() => TestHooks.ClearAll();
@@ -505,5 +505,64 @@ public sealed class Audit7WritePathFailuresTests
         }
         Console.WriteLine("canceled=" + canceledCount);
         Assert.IsTrue(canceledCount > 0, "no write was canceled");
+    }
+    /// <summary>Vetoes every automatic recovery (OnErrorRecoveryBegin) and records the background errors.</summary>
+    private sealed class NoAutoRecoveryListener : EventListener
+    {
+        public readonly System.Collections.Concurrent.ConcurrentQueue<RocksDbException> Errors = new();
+
+        public override void OnBackgroundError(BackgroundErrorEventArgs e)
+        {
+            if (e.Error is { } error) Errors.Enqueue(error);
+        }
+
+        public override void OnErrorRecoveryBegin(ErrorRecoveryBeginEventArgs e) => e.AutoRecovery = false;
+    }
+
+    /// <summary>
+    /// DBImpl::DelayWrite: "Don't wait if there's a background error that is not pending recovery since recovery might
+    /// never be attempted" -- a write waiting for stopped writes gives up with Incomplete(&lt;background error&gt;) when a
+    /// background error is set and no recovery is in progress. Here a compaction fails with an out-of-space error (a soft
+    /// error with paranoid_checks, ErrorSeverityMap) whose automatic recovery a listener vetoed, while the L0 file count
+    /// stops writes.
+    /// </summary>
+    [TestMethod]
+    public async Task StalledWriteGivesUpOnBackgroundErrorWithoutRecovery()
+    {
+        var fs = new FaultInjectionFileSystem(NewFs());
+        var listener = new NoAutoRecoveryListener();
+        DbOptions options = NewOptions(fs);
+        options.Listeners.Add(listener);
+        var cfo = new ColumnFamilyOptions { Level0FileNumCompactionTrigger = 2, Level0SlowdownWritesTrigger = 2, Level0StopWritesTrigger = 2 };
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait(Timeout));
+        RocksDatabase db = RocksDatabase.Open(DbPath, options, cfo);
+        try
+        {
+            // Two L0 files whose key ranges overlap ([a, z] and [m, m]): a real compaction, not a trivial move.
+            db.Put(B("a"), B("1"));
+            db.Put(B("z"), B("1"));
+            db.Flush();
+            db.Put(B("m"), B("1"));
+            db.Flush();
+            // The compaction of the two L0 files fails to write its output: out of space, for as long as the test runs.
+            fs.FailMatching(".sst", FaultOps.Create | FaultOps.Append, int.MaxValue, InjectedFaultKind.NoSpace);
+            gate.Set();
+            Task put = db.PutAsync(B("stalled"), B("1")).AsTask();
+            Task done = await Task.WhenAny(put, Task.Delay(Timeout));
+            Assert.AreSame(put, done, "the stalled write waits although nothing will recover the background error");
+            RocksDbException e = await Assert.ThrowsExactlyAsync<RocksDbException>(() => put);
+            Assert.AreEqual(StatusCode.Incomplete, e.Code);
+            StringAssert.Contains(e.Message, "No space left on device");
+            Assert.IsFalse(listener.Errors.IsEmpty);
+            Assert.AreEqual(ErrorSeverity.SoftError, listener.Errors.First().Severity);
+            Assert.IsNull(GetString(db, "stalled"));
+        }
+        finally
+        {
+            fs.ClearFailMatching();
+            gate.Set();
+            db.Dispose();
+        }
     }
 }

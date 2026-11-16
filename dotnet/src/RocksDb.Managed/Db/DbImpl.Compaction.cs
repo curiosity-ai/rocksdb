@@ -466,6 +466,11 @@ internal sealed partial class DbImpl
                 if (_shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
                 // Close waits for the write queue this leader holds: the write fails like one that queued behind the close.
                 if (_closing) ThrowDisposed();
+                // "Don't wait if there's a background error that is not pending recovery since recovery might never be
+                // attempted": writes still stopped then fail with Incomplete(bg_error.ToString()) (a soft error, e.g. a
+                // compaction out of space whose recovery a listener vetoed; errors that stop the DB are thrown above).
+                if (ErrorHandler.BgError is { } bg && !ErrorHandler.IsRecoveryInProgress)
+                    throw new RocksDbException(StatusCode.Incomplete, "Incomplete: " + bg.Message);
                 wait = _bgSignal.Task;
             }
             if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
