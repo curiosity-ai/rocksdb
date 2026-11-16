@@ -2353,3 +2353,60 @@ complete asynchronously (and out of order), under a deliberately exhausted threa
   completed once, shared across DBs); async moves and scans allocate nothing in Release.
 - Public async surface inventory (300 methods): every one takes a CancellationToken and has a sync counterpart, except
   listed and justified cases; the test fails on any change.
+
+## Audit #9: opening and closing the DB (2026-11-16)
+
+A dedicated review of the open and close sequences against `db_impl_open.cc` (DB::Open, Recover, RecoverLogFiles,
+SetupDBId, WriteOptionsFile, DeleteObsoleteFiles at open), `db_impl.cc` (Close / CloseHelper / ~DBImpl),
+`db_impl_readonly.cc`, `db_impl_secondary.cc` and `destroy_db.cc`, with native 11.12 compared side by side where the C API
+reaches. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit9OpenCloseTests.cs`,
+`tests/RocksDb.Managed.CompatTests/Audit9/`.
+
+### Fixed
+
+- A second Dispose made while a close was running returned at once, before the first close released the LOCK: a thread
+  that disposed and reopened got "lock ... already held by process" (sync and async). Now as `DBImpl::Close` /
+  `~DBImpl` holding `closing_mutex_`: later closes wait for the running one (except a close from OnErrorRecoveryEnd raised
+  by the recovery task the running close waits for); a close that failed before taking over the DB can be retried; the
+  losing writer is returned to the pool; column family handle deletion is notified once. Native: concurrent `delete db`
+  is undefined behaviour, argued from the source.
+- An unexpected exception from the auto-recovery task escaped Close before anything was closed (e.g.
+  `bgerror_resume_retry_interval = ulong.MaxValue` overflowed `TimeSpan`), leaving the LOCK and every file open. The
+  interval is clamped to Task.Delay's maximum, the close tolerates any recovery-task failure (C++ CloseHelper:
+  `CancelErrorRecoveryForShutDown`, then waits for `ReadyForShutdown`), and shutdown-flush I/O errors no longer stop a
+  close (C++ logs "Shutdown flush failed").
+- IDENTITY handling now follows `SetupDBId`: an IDENTITY that does not match the MANIFEST's db id is rewritten, an empty
+  one gets a new id, and a read-only open generates an id without writing. Native (`rocksdb_get_db_identity`): same in
+  all three cases.
+- Opening a missing DB without create_if_missing: InvalidArgument "<db>/CURRENT: does not exist (create_if_missing is
+  false)", native's message.
+- The retry delay of a flush rescheduled to retain user-defined timestamps observes close (upstream also waits 100 ms
+  inside the job; hardening).
+
+### Known deviations recorded by this audit
+
+- A missing column family without create_missing_column_families fails before recovery; native recovers first and
+  leaves a new WAL, MANIFEST and flushed SST behind. Opening while the LOCK is held leaves the running DB's LOG alone
+  (native renames it to LOG.old, its logger is created before LockFile). Opening a missing directory without
+  create_if_missing creates nothing (native creates the directory, LOG and LOCK). A leftover `OPTIONS-*.dbtmp` is deleted
+  at open (native keeps it). A secondary writes no info LOG. A failed OPTIONS persist at open is the raw IOError (native
+  wraps the message, same code).
+- No public `Close()` returning Aborted for unreleased snapshots: Dispose behaves like `~DBImpl` / `rocksdb_close`.
+
+### Verified
+
+- Crash during open: power loss, process kill with a torn last write, and a single transient failure at every mutating
+  file operation of an open (and of the close after it) in 12 scenarios (replay and flush, avoid_flush_during_recovery,
+  flushes during replay, partly flushed column families, create_missing_column_families, WAL recycling, separate
+  wal_dir, track_and_verify_wals_in_manifest, after a process kill, best-efforts recovery, new DB, MANIFEST roll): the DB
+  reopens twice with exactly the durable writes, nothing resurrected, the same DB id, every handle and the LOCK released.
+- Crash during close in 6 scenarios (unflushed memtables, manual_wal_flush, shutdown flush of disableWAL writes,
+  avoid_flush_during_shutdown, a pending compaction, a dropped column family purged at close): synced and flushed writes
+  survive, the state is a prefix of the issued writes, unlogged writes are all or nothing.
+- TransactionDB open crash sweep (WriteCommitted, WritePrepared): committed transactions survive, the prepared one is
+  recovered as prepared.
+- Against native: the files left after open/close sequences (LOG.old rotation, MANIFEST, 2 OPTIONS kept, WALs kept or
+  flushed, SSTs), info log trimming, the last sequence number after every reopen, a fresh db_session_id per open, cleanup
+  of leftover files at open, failed opens (unlisted column family, error_if_exists, LOCK held) leaving the same files.
+- Read-only open and close perform zero mutating file operations; a secondary follows MANIFEST rotations and its close
+  deletes nothing of the primary's; Dispose with an outstanding snapshot, iterator and transaction closes like `~DBImpl`.

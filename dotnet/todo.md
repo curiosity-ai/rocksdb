@@ -453,3 +453,10 @@ Still open from this round:
 - [ ] A throwing `OnWriteEnqueued` callback strands the write queue (design decision; repro ignored)
 - [ ] Sync writers behind an async leader depend on a thread-pool continuation (write-thread design; repro ignored)
 - [ ] `AsyncPrefetchBuffer.TakePending` blocks on a pool continuation without `Prefetch` support (macOS / custom file systems; repro ignored)
+
+## Audit #9 (2026-11-16; docs/validation.md "Audit #9: opening and closing the DB")
+
+- [x] Concurrent second close waits for the first (LOCK released); recovery-task and shutdown-flush failures never stop a close
+- [x] IDENTITY handled as SetupDBId (mismatch rewritten, empty regenerated, read-only writes nothing); create_if_missing message
+- [x] Crash sweeps over every mutating operation of open (12 scenarios) and close (6 scenarios), TransactionDB open sweep; file listings vs native
+- [ ] `OptimisticTransactionDatabase.Open` does not dispose the DB if its constructor throws (only on out-of-memory; unconfirmed)
