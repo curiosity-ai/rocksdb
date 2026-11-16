@@ -1046,6 +1046,8 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
 
     public void Sync()
     {
+        // Like SyncAsync: a closed file fails with InvalidArgument (not ObjectDisposedException from the closed handle).
+        ThrowIfDisposed();
         Flush();
         long perfSync = PerfContext.StartTimer(); // IOSTATS_TIMER_GUARD(fsync_nanos)
         UnixNative.DataSync(_handle, _path);

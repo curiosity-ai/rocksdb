@@ -132,13 +132,13 @@ public sealed class Audit8AsyncBackgroundIoTests
 
     private static T WithDeadline<T>(Task<T> t, string what)
     {
-        if (!t.Wait(Deadline)) Assert.Fail(what + " made no progress within " + Deadline);
-        return t.Result;
+        if (!((IAsyncResult)t).AsyncWaitHandle.WaitOne(Deadline)) Assert.Fail(what + " made no progress within " + Deadline);
+        return t.GetAwaiter().GetResult();
     }
 
     private static void WithDeadline(Task t, string what)
     {
-        if (!t.Wait(Deadline)) Assert.Fail(what + " made no progress within " + Deadline);
+        if (!((IAsyncResult)t).AsyncWaitHandle.WaitOne(Deadline)) Assert.Fail(what + " made no progress within " + Deadline);
         t.GetAwaiter().GetResult();
     }
 
@@ -404,6 +404,40 @@ public sealed class Audit8AsyncBackgroundIoTests
         Assert.IsTrue(elapsed < TimeSpan.FromSeconds(3), "Dispose took " + elapsed);
         using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs));
         Assert.AreEqual("v", GetString(reopened, "k"));
+    }
+
+    /// <summary>
+    /// A compaction (on its LOW thread, or a sync CompactRange on the caller's thread) whose input files have no
+    /// readahead(2) (IRandomAccessFile.Prefetch false: macOS, in-memory and custom file systems) reads them through
+    /// AsyncPrefetchBuffer, which blocks (ManualResetEventSlim) until IRandomAccessFile.ReadAsync of the next chunk
+    /// completes. When that completion runs on the .NET thread pool (here a file system whose ReadAsync yields; on macOS
+    /// LocalFileSystem's RandomAccess.ReadAsync runs the pread on a pool thread) and every pool worker is blocked, the sync
+    /// CompactRange never finishes. Native's FilePrefetchBuffer async_io polls io_uring from the reading thread.
+    /// </summary>
+    [TestMethod]
+    [DoNotParallelize]
+    [Ignore("audit #8 open: compaction input prefetch (AsyncPrefetchBuffer) blocks its compaction thread on a ReadAsync continuation that needs a .NET thread-pool thread")]
+    public void CompactionPrefetchProgressesWithThreadPoolExhausted()
+    {
+        var fs = new YieldingFileSystem(NewFs()); // no readahead(2), ReadAsync continues on the thread pool
+        DbOptions o = NewOptions(fs);
+        o.CompactionReadaheadSize = 64 << 10;
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { DisableAutoCompactions = true });
+        var rnd = new Random(1);
+        for (int f = 0; f < 3; f++)
+        {
+            for (int i = 0; i < 2000; i++)
+            {
+                byte[] v = new byte[400];
+                rnd.NextBytes(v);
+                db.Put(Key(i * 3 + f), v);
+            }
+            db.Flush();
+        }
+        using (new DeadThreadPool())
+        {
+            OnDedicatedThread(db.CompactRange, "CompactRange with the thread pool exhausted");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -837,5 +871,181 @@ public sealed class Audit8AsyncBackgroundIoTests
         {
             TaskScheduler.UnobservedTaskException -= handler;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // 7. OpenAsync / DisposeAsync parity with Open / Dispose.
+
+    /// <summary>
+    /// Pins OpenAsync's failure parity with Open (DBImpl::Open: the LOCK is released when the open fails): a corrupt
+    /// CURRENT fails both with the same code, and after either failure (and after an OpenAsync cancelled while it writes
+    /// its new MANIFEST) the LOCK is free and the DB opens with all acknowledged data.
+    /// </summary>
+    [TestMethod]
+    public void OpenAsyncFailuresMatchOpenAndReleaseTheLock()
+    {
+        var fs = new YieldingFileSystem(NewFs());
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs)))
+        {
+            db.Put(B("k"), B("v"));
+        }
+        // Cancelled while the open writes its OPTIONS file (its MANIFEST writes are not cancellable; the MANIFEST and WAL
+        // are read with the blocking members).
+        foreach ((string op, string file) in new[] { ("AppendAsync", "OPTIONS"), ("SyncAsync", "OPTIONS") })
+        {
+            using CancellationTokenSource cts = CancelAt(fs, op, file);
+            WithDeadline(Task.Run(async () =>
+            {
+                try
+                {
+                    await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), cts.Token);
+                    Assert.Fail("OpenAsync was not cancelled at " + op + " " + file);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }), "cancelled OpenAsync");
+            fs.OnAsync = null;
+            using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs));
+            Assert.AreEqual("v", GetString(reopened, "k"));
+        }
+        // A corrupt CURRENT: same error from both, LOCK released.
+        byte[] current = ReadAll(fs, DbPath + "/CURRENT");
+        WriteAll(fs, DbPath + "/CURRENT", B("MANIFEST-999999\n"));
+        var syncError = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(DbPath, NewOptions(fs)));
+        RocksDbException? asyncError = null;
+        try
+        {
+            WithDeadline(RocksDatabase.OpenAsync(DbPath, NewOptions(fs)).AsTask(), "OpenAsync");
+        }
+        catch (RocksDbException e)
+        {
+            asyncError = e;
+        }
+        Assert.IsNotNull(asyncError);
+        Assert.AreEqual(syncError.Code, asyncError.Code);
+        Assert.AreEqual(syncError.SubCode, asyncError.SubCode);
+        Assert.AreEqual(syncError.Message, asyncError.Message);
+        WriteAll(fs, DbPath + "/CURRENT", current);
+        using (RocksDatabase db = WithDeadline(RocksDatabase.OpenAsync(DbPath, NewOptions(fs)).AsTask(), "OpenAsync"))
+        {
+            Assert.AreEqual("v", GetString(db, "k"));
+        }
+    }
+
+    private static byte[] ReadAll(IFileSystem fs, string path)
+    {
+        using IRandomAccessFile f = fs.OpenRandomAccess(path);
+        byte[] b = new byte[f.Length];
+        Assert.AreEqual(b.Length, f.Read(0, b));
+        return b;
+    }
+
+    private static void WriteAll(IFileSystem fs, string path, byte[] data)
+    {
+        using IWritableFile f = fs.CreateWritable(path, truncate: true);
+        f.Append(data);
+        f.Sync();
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // 8. FileSyncWorkers and the rate limiter.
+
+    /// <summary>
+    /// Pins FileSyncWorkers (LocalFileSystem.OffloadAsyncSync): many concurrent SyncAsync calls on several files and DBs
+    /// each complete exactly once (pooled IValueTaskSource requests, process-wide workers shared by the DBs), a sync of a
+    /// closed file fails like the sync member, and synced PutAsync writes on two DBs sharing the workers are durable.
+    /// </summary>
+    [TestMethod]
+    public void OffloadedAsyncSyncsCompleteOncePerCall()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "audit8-fsync-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var fs = new LocalFileSystem { OffloadAsyncSync = true };
+            int completed = 0;
+            var tasks = new List<Task>();
+            for (int f = 0; f < 8; f++)
+            {
+                string path = Path.Combine(dir, "f" + f);
+                tasks.Add(Task.Run(async () =>
+                {
+                    await using IWritableFile file = fs.CreateWritable(path, truncate: true);
+                    for (int i = 0; i < 100; i++)
+                    {
+                        await file.AppendAsync(new byte[100]);
+                        await file.SyncAsync();
+                        Interlocked.Increment(ref completed);
+                    }
+                }));
+            }
+            WithDeadline(Task.WhenAll(tasks), "offloaded syncs");
+            Assert.AreEqual(800, completed);
+            for (int f = 0; f < 8; f++) Assert.AreEqual(10_000, new FileInfo(Path.Combine(dir, "f" + f)).Length);
+            // A sync of a closed file fails like Sync (InvalidArgument "file already closed").
+            IWritableFile closed = fs.CreateWritable(Path.Combine(dir, "closed"), truncate: true);
+            closed.Dispose();
+            var syncError = Assert.ThrowsExactly<RocksDbException>(closed.Sync);
+            var asyncError = Assert.ThrowsExactly<RocksDbException>(() => closed.SyncAsync().AsTask().GetAwaiter().GetResult());
+            Assert.AreEqual(syncError.Code, asyncError.Code);
+            // Two DBs sharing the process-wide sync workers.
+            WithDeadline(Task.Run(async () =>
+            {
+                var o1 = new DbOptions { CreateIfMissing = true, FileSystem = fs };
+                var o2 = new DbOptions { CreateIfMissing = true, FileSystem = fs };
+                await using RocksDatabase a = await RocksDatabase.OpenAsync(Path.Combine(dir, "a"), o1);
+                await using RocksDatabase b = await RocksDatabase.OpenAsync(Path.Combine(dir, "b"), o2);
+                var writes = new List<Task>();
+                for (int w = 0; w < 4; w++)
+                {
+                    int id = w;
+                    writes.Add(Task.Run(async () =>
+                    {
+                        for (int i = 0; i < 50; i++)
+                        {
+                            await a.PutAsync(new WriteOptions { Sync = true }, Key(id * 100 + i), B("a"));
+                            await b.PutAsync(new WriteOptions { Sync = true }, Key(id * 100 + i), B("b"));
+                        }
+                    }));
+                }
+                await Task.WhenAll(writes);
+            }), "synced PutAsync on two DBs");
+            using (RocksDatabase a = RocksDatabase.Open(Path.Combine(dir, "a"), new DbOptions { FileSystem = fs }))
+            using (RocksDatabase b = RocksDatabase.Open(Path.Combine(dir, "b"), new DbOptions { FileSystem = fs }))
+            {
+                for (int i = 0; i < 400; i += 7)
+                {
+                    int k = i / 100 * 100 + i % 50;
+                    Assert.AreEqual("a", GetString(a, S(Key(k))!));
+                    Assert.AreEqual("b", GetString(b, S(Key(k))!));
+                }
+            }
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Pins GenericRateLimiter waits (util/rate_limiter.cc RequestImpl): an async waiter cancelled while queued ends with
+    /// OperationCanceledException and does not block the queue forever (its remaining bytes are still charged, which
+    /// is the documented behaviour); a sync waiter queued behind it is granted; Dispose releases a pending async waiter.
+    /// </summary>
+    [TestMethod]
+    public void RateLimiterCancelledAsyncWaiterDoesNotStrandOthers()
+    {
+        using var limiter = new GenericRateLimiter(10_000, 10_000, 10, RateLimiterMode.WritesOnly, autoTuned: false, 0); // 100 B per 10 ms
+        limiter.Request(100, IoPriority.Low); // drain the bucket
+        using var cts = new CancellationTokenSource();
+        ValueTask cancelled = limiter.RequestAsync(100, IoPriority.Low, cts.Token);
+        Assert.IsFalse(cancelled.IsCompleted);
+        cts.Cancel();
+        Assert.ThrowsExactly<TaskCanceledException>(() => cancelled.AsTask().GetAwaiter().GetResult());
+        OnDedicatedThread(() => limiter.Request(100, IoPriority.High), "a sync request behind a cancelled one");
+        ValueTask pending = limiter.RequestAsync(100, IoPriority.Low, CancellationToken.None);
+        limiter.Dispose();
+        WithDeadline(pending.AsTask(), "a pending request after Dispose");
     }
 }
