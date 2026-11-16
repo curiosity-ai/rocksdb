@@ -195,4 +195,27 @@ public sealed class RocksArrayPoolTests
         }
         Assert.AreEqual(0, offenders.Count, "use RocksArrayPool<T>.Shared instead of ArrayPool<T>.Shared:\n" + string.Join("\n", offenders));
     }
+
+    /// <summary>
+    /// PooledBufferWriter grows geometrically past 1 GiB. The doubled capacity used to be computed in 32 bits: past
+    /// 1 GiB it overflowed, every later append grew the buffer by just what it needed and copied all of it, and a
+    /// 1.5 GiB WAL record (native RocksDB accepts those) reassembled from 32 KiB fragments never finished.
+    /// </summary>
+    [TestMethod]
+    public void PooledBufferWriterGrowthStaysGeometricPastOneGiB()
+    {
+        const int Fragment = 32 << 10;
+        Assert.AreEqual(512, RocksDb.Managed.Util.PooledBufferWriter.NextCapacity(256, 256, 1));
+        Assert.AreEqual(2 << 20, RocksDb.Managed.Util.PooledBufferWriter.NextCapacity(1 << 20, 1 << 20, Fragment));
+        // The case that overflowed: a full 1 GiB buffer and one more fragment.
+        Assert.AreEqual(Array.MaxLength, RocksDb.Managed.Util.PooledBufferWriter.NextCapacity(1 << 30, 1 << 30, Fragment));
+        Assert.AreEqual(Array.MaxLength, RocksDb.Managed.Util.PooledBufferWriter.NextCapacity(1536 << 20, 1536 << 20, Fragment));
+        // A large single request still gets at least what it asks for.
+        Assert.AreEqual(1500 << 20, RocksDb.Managed.Util.PooledBufferWriter.NextCapacity(0, 0, 1500 << 20));
+        // Beyond what one array can hold the writer fails cleanly instead of overflowing.
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() =>
+            RocksDb.Managed.Util.PooledBufferWriter.NextCapacity(Array.MaxLength, Array.MaxLength - 10, Fragment));
+        Assert.AreEqual(StatusCode.NotSupported, e.Code);
+    }
 }
+

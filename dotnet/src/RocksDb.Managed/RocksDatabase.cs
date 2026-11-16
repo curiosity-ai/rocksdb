@@ -19,6 +19,18 @@ namespace RocksDb.Managed;
 /// </summary>
 public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
 {
+    /// <summary>
+    /// The largest key, in bytes, that a write accepts (1 GiB). Larger keys fail with
+    /// <see cref="StatusCode.InvalidArgument"/> ("key is too large"), and the database stays writable. Deviation:
+    /// upstream RocksDB accepts keys up to 4 GiB (uint32 lengths); the managed port holds a memtable entry in one .NET
+    /// array, which caps an entry at 2 GiB, and a lower round limit leaves room for a maximum key and value together.
+    /// Data written by native RocksDB with larger keys or values can still be read, up to what one array can hold.
+    /// </summary>
+    public const int MaxKeyLength = 1 << 30;
+
+    /// <summary>The largest value, in bytes, that a write accepts (1 GiB); see <see cref="MaxKeyLength"/>.</summary>
+    public const int MaxValueLength = 1 << 30;
+
     private readonly DbImpl _db;
     private readonly ColumnFamily _default;
     private readonly Dictionary<uint, ColumnFamily> _handles = new();

@@ -76,15 +76,31 @@ public sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void Grow(int sizeHint)
     {
-        int needed = _written + Math.Max(sizeHint, 1);
-        int newSize = Math.Max(needed, Math.Max(_buffer.Length * 2, 256));
-        if ((uint)newSize > (uint)Array.MaxLength) newSize = Math.Max(needed, Array.MaxLength);
-        byte[] newBuffer = _pool.Rent(newSize);
+        byte[] newBuffer = _pool.Rent(NextCapacity(_buffer.Length, _written, sizeHint));
         _buffer.AsSpan(0, _written).CopyTo(newBuffer);
         byte[] old = _buffer;
         _buffer = newBuffer;
         if (old.Length > 0) _pool.Return(old);
     }
+
+    /// <summary>
+    /// The capacity to grow to: at least what is needed, doubling the current one so that appends stay amortised O(1),
+    /// capped at <see cref="Array.MaxLength"/>. Computed in 64 bits: past 1 GiB the doubled length overflows an int,
+    /// and taking just what is needed from then on made every small append copy the whole buffer (a 1.5 GiB WAL record
+    /// reassembled from 32 KiB fragments never finished).
+    /// </summary>
+    internal static int NextCapacity(int currentLength, int written, int sizeHint)
+    {
+        long needed = (long)written + Math.Max(sizeHint, 1);
+        if (needed > Array.MaxLength) ThrowTooLarge(needed);
+        long doubled = Math.Max((long)currentLength * 2, 256);
+        return (int)Math.Min(Math.Max(needed, doubled), Array.MaxLength);
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowTooLarge(long needed) =>
+        throw new RocksDbException(StatusCode.NotSupported,
+            "Not implemented: a buffer of " + needed + " bytes exceeds the largest .NET array (" + Array.MaxLength + " bytes)");
 
     private static void ThrowAdvance() => throw new InvalidOperationException("Cannot advance past the end of the buffer.");
 

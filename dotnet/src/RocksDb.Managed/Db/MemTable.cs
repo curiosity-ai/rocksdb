@@ -267,6 +267,9 @@ public sealed unsafe class MemTable : IDisposable
         UpdateFlushState();
     }
 
+    /// <summary>Room left in an arena block for a memtable entry's skip-list node and alignment.</summary>
+    private const int MaxEntryOverhead = 512;
+
     [SkipLocalsInit]
     private bool Insert(ulong sequence, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool concurrent, out int encodedLen,
         bool hasKvProtInfo, ulong kvProtInfo)
@@ -280,7 +283,10 @@ public sealed unsafe class MemTable : IDisposable
         uint internalKeySize = (uint)key.Length + DbFormat.InternalKeyFooterSize;
         uint valSize = (uint)value.Length;
         long len = Coding.VarintLength(internalKeySize) + (long)internalKeySize + Coding.VarintLength(valSize) + valSize + _protectionBytes;
-        if (len > int.MaxValue / 2) ThrowHelper.InvalidArgument("memtable entry too large");
+        // One arena allocation holds the entry plus its skip-list node (up to kMaxHeight pointers) and alignment, and an
+        // arena block is one .NET array. Writes are limited further (RocksDatabase.MaxKeyLength / MaxValueLength); this
+        // bound is what recovery of a WAL written by native RocksDB, which accepts larger entries, can still apply.
+        if (len > Array.MaxLength - MaxEntryOverhead) ThrowHelper.InvalidArgument("memtable entry too large: " + len + " bytes");
         encodedLen = (int)len;
         InlineSkipList<MemTableKeyComparer> table = type == EntryType.RangeDeletion ? _rangeDelTable : _table;
 

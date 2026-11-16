@@ -946,4 +946,63 @@ public sealed class DbBasicTests
             CollectionAssert.AreEqual(new[] { "a", "d", "e", "f", "m" }, keys);
         }
     }
+
+    /// <summary>
+    /// <see cref="RocksDatabase.MaxKeyLength"/> / <see cref="RocksDatabase.MaxValueLength"/> (1 GiB, a deviation from
+    /// upstream's uint32 limits): a larger key or value fails the write with InvalidArgument before anything reaches the
+    /// WAL or the memtable, for every record type, and the database stays writable. Before the limit a 1 GiB value was
+    /// rejected by the memtable after the write had started, as a fatal background error that stopped every later write.
+    /// The over-limit spans are over unmanaged memory that is never touched, so the test costs no real memory.
+    /// </summary>
+    [TestMethod]
+    public unsafe void KeysAndValuesOverTheLimitAreRejectedWithoutStoppingTheDatabase()
+    {
+        nuint size = (nuint)RocksDatabase.MaxValueLength + 1;
+        byte* p = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc(size);
+        try
+        {
+            MemoryFileSystem fs = NewFs();
+            var cf = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator() };
+            using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cf);
+            db.Put(B("before"), B("1"));
+
+            void Rejected(string what, Action write, string message)
+            {
+                RocksDbException e = Assert.ThrowsExactly<RocksDbException>(write, what);
+                Assert.AreEqual(StatusCode.InvalidArgument, e.Code, what + ": " + e);
+                StringAssert.Contains(e.Message, message, what);
+                Assert.IsNull(db.BackgroundError, what + " left a background error: " + db.BackgroundError);
+            }
+
+            Rejected("Put value", () => db.Put(B("k"), new ReadOnlySpan<byte>(p, (int)size)), "value is too large");
+            Rejected("Put key", () => db.Put(new ReadOnlySpan<byte>(p, (int)size), B("v")), "key is too large");
+            Rejected("Merge operand", () => db.Merge(B("k"), new ReadOnlySpan<byte>(p, (int)size)), "value is too large");
+            Rejected("Delete key", () => db.Delete(new ReadOnlySpan<byte>(p, (int)size)), "key is too large");
+            Rejected("DeleteRange end", () => db.DeleteRange(B("a"), new ReadOnlySpan<byte>(p, (int)size)), "value is too large");
+            using (WriteBatch batch = db.CreateWriteBatch())
+            {
+                batch.Put(B("in-batch"), B("x"));
+                Rejected("WriteBatch.Put", () => batch.Put(B("k"), new ReadOnlySpan<byte>(p, (int)size)), "value is too large");
+                Assert.AreEqual(1, batch.Count, "the rejected record must not be in the batch");
+                db.Write(batch);
+            }
+            using (var w = new SstFileWriter(new ColumnFamilyOptions(), fs))
+            {
+                w.Open(DbPath + "/edge.sst");
+                Rejected("SstFileWriter.Put", () => w.Put(B("k"), new ReadOnlySpan<byte>(p, (int)size)), "value is too large");
+            }
+
+            // Writes go on, and nothing of the rejected ones is visible.
+            db.Put(new WriteOptions { Sync = true }, B("after"), B("2"));
+            Assert.AreEqual("1", S(db.Get(B("before"))));
+            Assert.AreEqual("x", S(db.Get(B("in-batch"))));
+            Assert.AreEqual("2", S(db.Get(B("after"))));
+            Assert.IsNull(db.Get(B("k")));
+        }
+        finally
+        {
+            System.Runtime.InteropServices.NativeMemory.Free(p);
+        }
+    }
 }
+

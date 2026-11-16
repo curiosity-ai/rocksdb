@@ -1342,6 +1342,13 @@ Format-level deviations (the output is always readable by native RocksDB):
 - Ribbon filters with `optimize_filters_for_memory` can differ from native by up to 16 bytes.
   Compaction drops them later, so the data is the same.
 
+API limit (deliberate deviation):
+
+- Keys and values written through the port are limited to 1 GiB each (`RocksDatabase.MaxKeyLength`,
+  `RocksDatabase.MaxValueLength`); a larger one fails the write with `InvalidArgument` ("key is too large" /
+  "value is too large") and the database stays writable. Upstream accepts up to 4 GiB. A database written by native
+  RocksDB with larger keys or values still opens and reads, up to what one .NET array holds (about 2 GiB per entry).
+
 Not ported yet (tracked in [todo.md](todo.md)):
 
 - Out of scope (by decision): the encrypted file system (`env_encryption.h`); remote compaction of compactions with

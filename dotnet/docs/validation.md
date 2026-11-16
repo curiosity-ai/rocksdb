@@ -1054,6 +1054,30 @@ Each of these tests passed 20 runs in a row under 8 CPU hogs (net10.0).
 So a native secondary cannot follow a live primary with recycle_log_file_num > 0, whichever engine is the primary. A
 managed secondary can follow either.
 
+### Key and value size limit: 1 GiB (deliberate deviation)
+
+C++ reference: `WriteBatchInternal::Put` / `Merge` / `Delete` / `DeleteRange` / `PutEntity` (`db/write_batch.cc`:
+"key is too large" / "value is too large" past `std::numeric_limits<uint32_t>::max()`), `MemTable::Add`
+(`size_t encoded_len`), `SstFileWriter::Rep::AddImpl`.
+
+- **Upstream:** a key or value may be up to 4 GiB; a memtable entry is one arena allocation of any size.
+- **Port:** writes accept keys and values of at most 1 GiB each (`RocksDatabase.MaxKeyLength` /
+  `MaxValueLength`), checked in `WriteBatch.BeginRecord` (every record type) and `SstFileWriter.AddImpl` before
+  anything is written, and rejected with InvalidArgument; the database stays writable. A memtable entry lives in one
+  arena allocation, which is one .NET array, so an entry is capped at `Array.MaxLength` (just under 2 GiB) minus room
+  for the skip-list node (`MemTable.Insert`); 1 GiB leaves room for a maximum key and value together.
+- **Reading native data:** a database native RocksDB wrote with a larger key or value (up to that 2 GiB entry cap)
+  still opens and reads, from the WAL (recovery) and from SSTs. A larger entry fails cleanly: NotSupported from the
+  record buffer (`PooledBufferWriter.NextCapacity`), or InvalidArgument "memtable entry too large" in recovery.
+- **What it replaced:** the memtable rejected entries over `int.MaxValue / 2` (1 GiB) after the write had started,
+  as a fatal background error that stopped every later write, and a native WAL holding a 1 GiB value could not be
+  opened. `PooledBufferWriter` computed its doubled capacity in 32 bits, which overflowed past 1 GiB and made every
+  later append copy the whole buffer: opening a native WAL with a 1.5 GiB record never finished.
+- **Tests:** `DbBasicTests.KeysAndValuesOverTheLimitAreRejectedWithoutStoppingTheDatabase` (every write path, over
+  never-touched unmanaged memory), `RocksArrayPoolTests.PooledBufferWriterGrowthStaysGeometricPastOneGiB`, and
+  `DbCompatTests.ManagedReadsAValueOverItsWriteLimitThatNativeWrote` (a 1.5 GiB native value in the WAL and in an
+  SST; needs about 8 GB of memory, so it runs only with `HUGE_ENTRIES=1`).
+
 ### GenericRateLimiter statistics test: timing assumption, not a race
 
 `RateLimiterTests.StatisticsAreRecorded` failed once in a full net10.0 run. Under 12 CPU hogs plus allocating threads,
