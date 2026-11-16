@@ -363,7 +363,7 @@ public sealed class Audit7ApiEdgeCasesTests
     }
 
     // ---------------------------------------------------------------------------------------------------------
-    // Probes (batch 2)
+    // Foreign handles, cancellation, read-only instances, iterators outliving the DB
     // ---------------------------------------------------------------------------------------------------------
 
     /// <summary>DropColumnFamily with a handle of another DB must not touch either DB.</summary>
@@ -604,5 +604,132 @@ public sealed class Audit7ApiEdgeCasesTests
             if (c.EndsWith(".sst", StringComparison.Ordinal)) n++;
         }
         return n;
+    }
+    /// <summary>
+    /// Iterator::Refresh after the DB was disposed (upstream: undefined behaviour, the DBImpl is gone). The port spun
+    /// forever in GetReferencedSuperVersion: the close released the column family's super version, TryRef could never
+    /// succeed and the column family was not dropped. Now the refresh throws ObjectDisposedException, sync and async, and
+    /// the iterator is disposed with it (later calls throw ObjectDisposedException instead of reporting an empty
+    /// iterator from a parked stack).
+    /// </summary>
+    [TestMethod]
+    [Timeout(30_000, CooperativeCancellation = true)]
+    public async Task RefreshAfterDbDisposeThrowsInsteadOfSpinning()
+    {
+        MemoryFileSystem fs = NewFs();
+        RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        for (int i = 0; i < 50; i++) db.Put(Key(i), Value(i, 0));
+        Iterator it = db.NewIterator();
+        Iterator it2 = db.NewIterator();
+        it.SeekToFirst();
+        db.Put(Key(100), Value(100, 0));
+        db.Flush(); // a new super version: the refresh must rebuild
+        db.Dispose();
+        Task<Exception?> refresh = Task.Run(() =>
+        {
+            try
+            {
+                it.Refresh();
+                return null;
+            }
+            catch (Exception e)
+            {
+                return e;
+            }
+        });
+        Assert.IsTrue(refresh.Wait(TimeSpan.FromSeconds(10)), "Refresh after Dispose did not return");
+        Assert.IsInstanceOfType<ObjectDisposedException>(refresh.Result);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => it.SeekToFirst());
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = it.Valid);
+        it.Dispose();
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(async () => await it2.RefreshAsync());
+        Assert.ThrowsExactly<ObjectDisposedException>(() => it2.SeekToFirst());
+        it2.Dispose();
+    }
+
+    /// <summary>
+    /// Iterator::Refresh(snapshot) with a snapshot of another DB, after the super version changed: the port released the
+    /// view before rejecting the snapshot, leaving an iterator whose seeks silently found nothing. The snapshot is now
+    /// checked first, so the iterator keeps its view and position. (Upstream does not check the snapshot's owner:
+    /// undefined behaviour.)
+    /// </summary>
+    [TestMethod]
+    public void RefreshWithForeignSnapshotLeavesTheIteratorUsable()
+    {
+        MemoryFileSystem fs = NewFs();
+        fs.CreateDirectoryIfMissing("/other");
+        using RocksDatabase other = RocksDatabase.Open("/other", NewOptions(fs));
+        using Snapshot foreign = other.GetSnapshot();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        for (int i = 0; i < 50; i++) db.Put(Key(i), Value(i, 0));
+        using Iterator it = db.NewIterator();
+        it.Seek(Key(10));
+        db.Put(Key(100), Value(100, 0));
+        db.Flush();
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => it.Refresh(foreign));
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+        Assert.IsTrue(it.Valid);
+        CollectionAssert.AreEqual(Key(10), it.Key.ToArray());
+        int n = 0;
+        for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+        Assert.AreEqual(50, n);
+        it.Refresh();
+        n = 0;
+        for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+        Assert.AreEqual(51, n);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // Stale references to pooled objects (no native counterpart: C++ has no pool; a delete'd WriteBatch or a
+    // destroyed PinnableSlice is gone, and touching it again is undefined behaviour)
+    // ---------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A rented WriteBatch is one object for its renter and every later renter: a Dispose (or Put) through a reference
+    /// kept after the first Dispose acts on whoever rented the object next. Here B's record is silently dropped (B is
+    /// cleared and pooled while B still uses it). Open: the handle itself is the pooled object, so a stale reference
+    /// cannot be told apart from the new renter without pooling only the rep behind a fresh handle (one small object
+    /// per Rent) -- an API / allocation decision.
+    /// </summary>
+    [TestMethod]
+    [Ignore("audit #7 open: a stale Dispose of a pooled WriteBatch after re-rent clears and re-pools the next renter's batch")]
+    public void StaleWriteBatchDisposeAfterReRentDoesNotTouchTheNextRenter()
+    {
+        // The pool is process-wide: the Rent after a Dispose on this thread returns the same object unless another
+        // test thread interleaves (the assertion below checks it).
+        WriteBatch a = WriteBatch.Rent();
+        a.Dispose();
+        WriteBatch b = WriteBatch.Rent();
+        Assert.AreSame(a, b, "the pool handed out another object; the repro needs the same one");
+        b.Put(B("k"), B("v"));
+        a.Dispose(); // stale: must not affect b
+        Assert.AreEqual(1, b.Count);
+        WriteBatch c = WriteBatch.Rent();
+        Assert.AreNotSame(b, c, "b is still in use but was handed out again");
+        c.Dispose();
+        b.Dispose();
+    }
+
+    /// <summary>
+    /// PooledValue: a Dispose through a stale reference after the object was handed out again (GetPooled) returns the
+    /// new holder's buffer to the array pool while the new holder still reads it. Open for the same reason as
+    /// <see cref="StaleWriteBatchDisposeAfterReRentDoesNotTouchTheNextRenter"/>.
+    /// </summary>
+    [TestMethod]
+    [Ignore("audit #7 open: a stale Dispose of a PooledValue after re-rent returns the next holder's buffer")]
+    public void StalePooledValueDisposeAfterReRentDoesNotTouchTheNextHolder()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        db.Put(B("a"), B("first"));
+        db.Put(B("b"), B("second"));
+        PooledValue a = db.GetPooled(B("a"))!;
+        a.Dispose();
+        PooledValue b = db.GetPooled(B("b"))!;
+        Assert.AreSame(a, b, "the pool handed out another object; the repro needs the same one");
+        a.Dispose(); // stale: must not affect b
+        Assert.AreEqual(6, b.Length);
+        Assert.AreEqual("second", S(b.ToArray()));
+        b.Dispose();
     }
 }

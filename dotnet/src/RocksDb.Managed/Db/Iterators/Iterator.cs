@@ -226,20 +226,65 @@ public sealed class Iterator : IDisposable
     /// <exception cref="RocksDbException"><see cref="StatusCode.NotSupported"/> for iterators that cannot be refreshed:
     /// tailing iterators (they follow new writes on their own), iterators of WritePrepared / WriteUnprepared transaction
     /// DBs and transactions, and iterators not created by a DB (e.g. <see cref="SstFileReader"/>).</exception>
-    public void Refresh() => Core.Refresh(null);
+    /// <remarks>If the stack has to be rebuilt and that fails (the database was disposed, a table file cannot be opened,
+    /// the call was canceled), the iterator is disposed and the exception is rethrown: it no longer holds a view to read.
+    /// A snapshot of another DB, or a released one, throws InvalidArgument and leaves the iterator unchanged.</remarks>
+    public void Refresh() => Refresh(null);
 
     /// <summary>
     /// Like <see cref="Refresh()"/>, reading at <paramref name="snapshot"/> (null = the latest state) from now on
     /// (Iterator::Refresh(const Snapshot*)). The snapshot must belong to the iterator's DB and stay alive while the
     /// iterator reads at it.
     /// </summary>
-    public void Refresh(Snapshot? snapshot) => Core.Refresh(snapshot);
+    public void Refresh(Snapshot? snapshot)
+    {
+        IteratorCore core = Core;
+        try
+        {
+            core.Refresh(snapshot);
+        }
+        catch when (core.IsUnbuilt)
+        {
+            // The view was released and the rebuild failed: positioning calls would otherwise run on a parked stack and
+            // report an empty iterator.
+            Dispose();
+            throw;
+        }
+    }
 
     /// <summary>Async <see cref="Refresh()"/>: when the DB's files changed, the new table files are opened with async I/O.</summary>
-    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => Core.RefreshAsync(null, cancellationToken);
+    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => RefreshAsync(null, cancellationToken);
 
     /// <summary>Async <see cref="Refresh(Snapshot?)"/>.</summary>
-    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default) => Core.RefreshAsync(snapshot, cancellationToken);
+    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default)
+    {
+        IteratorCore core = Core;
+        ValueTask t;
+        try
+        {
+            t = core.RefreshAsync(snapshot, cancellationToken);
+        }
+        catch when (core.IsUnbuilt)
+        {
+            Dispose();
+            throw;
+        }
+        return t.IsCompletedSuccessfully ? t : AwaitRebuildAsync(t, core);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask AwaitRebuildAsync(ValueTask pending, IteratorCore core)
+    {
+        try
+        {
+            await pending.ConfigureAwait(false);
+        }
+        catch when (core.IsUnbuilt && ReferenceEquals(_core, core))
+        {
+            Dispose();
+            throw;
+        }
+    }
 
     /// <summary>
     /// Replaces the iterate bounds the iterator was created with (<see cref="ReadOptions.IterateLowerBound"/> inclusive,
@@ -249,7 +294,20 @@ public sealed class Iterator : IDisposable
     /// must stay unchanged while the iterator uses it. Allocation-free, except on column families with a prefix
     /// extractor, where it copies the read options once per call.
     /// </summary>
-    public void SetBounds(ReadOnlyMemory<byte>? lowerBound, ReadOnlyMemory<byte>? upperBound) => Core.SetBounds(lowerBound, upperBound);
+    public void SetBounds(ReadOnlyMemory<byte>? lowerBound, ReadOnlyMemory<byte>? upperBound)
+    {
+        IteratorCore core = Core;
+        try
+        {
+            core.SetBounds(lowerBound, upperBound);
+        }
+        catch when (core.IsUnbuilt)
+        {
+            // A prefix seek iterator rebuilds its stack here (see Refresh).
+            Dispose();
+            throw;
+        }
+    }
 
     // ------------------------------------------------------------------ foreach over a range (ref struct)
 

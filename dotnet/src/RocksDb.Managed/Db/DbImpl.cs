@@ -240,6 +240,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
         {
             SuperVersion sv = cfd.Super;
             if (sv.TryRef()) return sv;
+            // The super version was released by the close (an iterator Refresh or a read racing with Dispose): no new one
+            // will be installed, so waiting would spin forever.
+            if (cfd.Closed) ThrowClosed();
             if (cfd.Dropped) ThrowDropped(cfd);
             Thread.SpinWait(1);
         }
@@ -310,6 +313,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         st?.RecordTick(Ticker.NumberSuperversionReleases);
     }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowClosed() => throw new ObjectDisposedException(nameof(RocksDatabase));
 
     private static void ThrowDropped(ColumnFamilyData cfd) =>
         throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
@@ -1168,6 +1174,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// </summary>
     private void ReleaseColumnFamilyMemTables(ColumnFamilyData cfd)
     {
+        cfd.Closed = true;
         SuperVersion? sv = cfd.SuperOrNull();
         cfd.LocalSuperVersions.Reset(this);
         if (sv is not null && sv.Unref()) CleanupSuperVersion(sv);
