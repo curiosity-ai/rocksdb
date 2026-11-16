@@ -11,11 +11,15 @@ internal sealed class InMemoryManifest : IManifestRecordWriter, IManifestRecordR
     private int _next;
     public int Syncs { get; private set; }
 
+    public void AddRecord(ReadOnlySpan<byte> record) => Records.Add(record.ToArray());
+
     public ValueTask AddRecordAsync(ReadOnlyMemory<byte> record, CancellationToken cancellationToken)
     {
         Records.Add(record.ToArray());
         return ValueTask.CompletedTask;
     }
+
+    public void Sync() => Syncs++;
 
     public ValueTask SyncAsync(CancellationToken cancellationToken)
     {

@@ -160,6 +160,10 @@ public sealed partial class ColumnFamily
     public void DeleteFilesInRange(byte[]? begin, byte[]? end, bool includeEnd) =>
         DeleteFilesInRanges([new KeyRangeOpt(begin, end)], includeEnd);
 
+    /// <summary>Async <see cref="DeleteFilesInRange(byte[], byte[], bool)"/>.</summary>
+    public ValueTask DeleteFilesInRangeAsync(byte[]? begin, byte[]? end, bool includeEnd, CancellationToken cancellationToken = default) =>
+        DeleteFilesInRangesAsync([new KeyRangeOpt(begin, end)], includeEnd, cancellationToken);
+
     /// <summary><see cref="DeleteFilesInRange(byte[], byte[], bool)"/> for several ranges (DeleteFilesInRanges).</summary>
     public void DeleteFilesInRanges(IReadOnlyList<KeyRangeOpt> ranges, bool includeEnd) =>
         _db.DeleteFilesInRangesAsync(_cfd, ToTuples(ranges), includeEnd, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
@@ -223,11 +227,23 @@ public sealed partial class RocksDatabase
     /// <inheritdoc cref="ColumnFamily.PromoteL0"/>
     public void PromoteL0(int targetLevel) => _default.PromoteL0(targetLevel);
 
+    /// <inheritdoc cref="ColumnFamily.PromoteL0Async"/>
+    public ValueTask PromoteL0Async(int targetLevel, CancellationToken cancellationToken = default) =>
+        _default.PromoteL0Async(targetLevel, cancellationToken);
+
     /// <inheritdoc cref="ColumnFamily.ClipColumnFamily"/>
     public void ClipColumnFamily(byte[] beginKey, byte[] endKey) => _default.ClipColumnFamily(beginKey, endKey);
 
+    /// <inheritdoc cref="ColumnFamily.ClipColumnFamilyAsync"/>
+    public ValueTask ClipColumnFamilyAsync(byte[] beginKey, byte[] endKey, CancellationToken cancellationToken = default) =>
+        _default.ClipColumnFamilyAsync(beginKey, endKey, cancellationToken);
+
     /// <inheritdoc cref="ColumnFamily.DeleteFilesInRange"/>
     public void DeleteFilesInRange(byte[]? begin, byte[]? end, bool includeEnd) => _default.DeleteFilesInRange(begin, end, includeEnd);
+
+    /// <inheritdoc cref="ColumnFamily.DeleteFilesInRangeAsync"/>
+    public ValueTask DeleteFilesInRangeAsync(byte[]? begin, byte[]? end, bool includeEnd, CancellationToken cancellationToken = default) =>
+        _default.DeleteFilesInRangeAsync(begin, end, includeEnd, cancellationToken);
 
     /// <inheritdoc cref="ColumnFamily.GetPropertiesOfTablesInRange"/>
     public Dictionary<string, TableProperties> GetPropertiesOfTablesInRange(IReadOnlyList<KeyRange> ranges) =>

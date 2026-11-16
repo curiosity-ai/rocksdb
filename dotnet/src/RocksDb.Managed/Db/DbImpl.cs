@@ -1113,15 +1113,15 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 try
                 {
                     // The size check runs on every close; the content check with verify_manifest_content_on_close.
-                    await Versions.VerifyManifestSizeOnCloseAsync(defaultCfd).ConfigureAwait(false);
-                    if (Options.VerifyManifestContentOnClose) await Versions.VerifyManifestContentOnCloseAsync(defaultCfd).ConfigureAwait(false);
+                    await Versions.VerifyManifestSizeOnCloseAsync(defaultCfd, synchronous).ConfigureAwait(false);
+                    if (Options.VerifyManifestContentOnClose) await Versions.VerifyManifestContentOnCloseAsync(defaultCfd, synchronous).ConfigureAwait(false);
                 }
                 catch (Exception e) when (e is IOException or RocksDbException)
                 {
                     closeError = RocksDbException.FromException(e);
                 }
             }
-            await Versions.DisposeAsync().ConfigureAwait(false);
+            await Versions.CloseAsync(synchronous).ConfigureAwait(false);
             lock (_mutex)
             {
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);

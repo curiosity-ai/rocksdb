@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using RocksDb.Managed.Env;
 
 namespace RocksDb.Managed.Db;
@@ -625,14 +626,14 @@ internal sealed class VersionSet : IAsyncDisposable
                     Wal.LogWriter sizeOf = newLog.Log;
                     var writer = new ManifestWriter(newLog) { FileSizeProvider = () => (ulong)sizeOf.File!.Size };
                     // WriteCurrentStateToManifest (synced at the end).
-                    await Await(writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, cancellationToken), synchronous).ConfigureAwait(false);
+                    await writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, synchronous, cancellationToken).ConfigureAwait(false);
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
-                    await Await(writer.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);
+                    await writer.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, cancellationToken).ConfigureAwait(false);
                     newManifestWritten = true;
                     // The new MANIFEST (snapshot and edits) plus CURRENT ("MANIFEST-nnnnnn\n").
                     editList[0].ManifestBytesWritten = (ulong)newLog.Log.File!.Size + (ulong)FileNames.DescriptorFileName(manifestNumber).Length + 1;
-                    await Await(FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, cancellationToken), synchronous)
+                    await FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, synchronous, cancellationToken)
                         .ConfigureAwait(false);
                     ManifestLogWriter? old = _manifestLog;
                     // ProcessManifestWrites: last_compacted_manifest_file_size_ = new_manifest_file_size (after the
@@ -652,7 +653,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
                     long sizeBefore = _manifestLog!.Log.File!.Size;
-                    await Await(_manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, cancellationToken), synchronous).ConfigureAwait(false);
+                    await _manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, cancellationToken).ConfigureAwait(false);
                     editList[0].ManifestBytesWritten = (ulong)(_manifestLog!.Log.File!.Size - sizeBefore);
                 }
             }
@@ -761,17 +762,6 @@ internal sealed class VersionSet : IAsyncDisposable
                 cfd.Current.Storage.FullHistoryTsLow = tsLow;
             }
         }
-    }
-
-    private static ValueTask Await(ValueTask t, bool synchronous)
-    {
-        // Synchronous callers block here (cold path: MANIFEST I/O) so the enclosing async method completes synchronously.
-        if (synchronous && !t.IsCompleted)
-        {
-            t.AsTask().GetAwaiter().GetResult();
-            return default;
-        }
-        return t;
     }
 
     /// <summary>
@@ -901,14 +891,15 @@ internal sealed class VersionSet : IAsyncDisposable
     /// The size check of VersionSet::Close: the MANIFEST writer is closed and the file's size compared with the bytes
     /// written to it (manifest_file_size_). A different size (or a failed size query) is logged ("MANIFEST verification
     /// on Close") and repaired by writing a new MANIFEST (LogAndApply of an empty edit). The OnIOError listener call
-    /// (FileOperationType::kVerify) is not ported. Called by close before the content check and <see cref="DisposeAsync"/>.
+    /// (FileOperationType::kVerify) is not ported. Called by close before the content check and <see cref="CloseAsync"/>.
+    /// With <paramref name="synchronous"/> all I/O is blocking and the returned task is complete.
     /// </summary>
-    internal async ValueTask VerifyManifestSizeOnCloseAsync(ColumnFamilyData defaultCfd)
+    internal async ValueTask VerifyManifestSizeOnCloseAsync(ColumnFamilyData defaultCfd, bool synchronous)
     {
         string path;
         long expected;
         string? status = null;
-        await _manifestLock.WaitAsync().ConfigureAwait(false);
+        await LockManifestAsync(synchronous).ConfigureAwait(false);
         try
         {
             if (_manifestLog is null) return;
@@ -919,7 +910,8 @@ internal sealed class VersionSet : IAsyncDisposable
             _manifest = null;
             try
             {
-                await log.DisposeAsync().ConfigureAwait(false);
+                if (synchronous) log.Dispose();
+                else await log.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception e) when (e is IOException or RocksDbException)
             {
@@ -948,23 +940,24 @@ internal sealed class VersionSet : IAsyncDisposable
         }
         _db.LogError("MANIFEST verification on Close, filename " + path + ", expected size " + expected.ToString(System.Globalization.CultureInfo.InvariantCulture)
             + " failed with status " + status + " and actual size " + size.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous: false, CancellationToken.None).ConfigureAwait(false);
+        await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>
     /// The content validation of VersionSet::Close (verify_manifest_content_on_close): reads the current MANIFEST back,
     /// checking every record's CRC and VersionEdit encoding. A corrupt MANIFEST is counted
     /// (MANIFEST_VALIDATION_FAILURE_COUNT) and rewritten once (a new compacted MANIFEST via an empty edit), then checked
-    /// again; a second failure throws Corruption. Called by close before <see cref="DisposeAsync"/>.
+    /// again; a second failure throws Corruption. Called by close before <see cref="CloseAsync"/>. With
+    /// <paramref name="synchronous"/> all I/O is blocking and the returned task is complete.
     /// </summary>
-    internal async ValueTask VerifyManifestContentOnCloseAsync(ColumnFamilyData defaultCfd)
+    internal async ValueTask VerifyManifestContentOnCloseAsync(ColumnFamilyData defaultCfd, bool synchronous)
     {
         // Loop up to 2 checks with 1 rewrite attempt in between, so we also verify the rewritten manifest is healthy.
         const int MaxContentChecks = 2;
         for (int check = 0; check < MaxContentChecks; check++)
         {
             string path;
-            await _manifestLock.WaitAsync().ConfigureAwait(false);
+            await LockManifestAsync(synchronous).ConfigureAwait(false);
             try
             {
                 if (ManifestFileNumber == 0) return;
@@ -991,12 +984,16 @@ internal sealed class VersionSet : IAsyncDisposable
             {
                 // First check failed -- rewrite and verify again.
                 _db.LogError("MANIFEST content verification on Close failed, filename " + path + ", rewriting manifest");
-                await _manifestLock.WaitAsync().ConfigureAwait(false);
+                await LockManifestAsync(synchronous).ConfigureAwait(false);
                 try
                 {
                     if (_manifestLog is not null)
                     {
-                        try { await _manifestLog.DisposeAsync().ConfigureAwait(false); }
+                        try
+                        {
+                            if (synchronous) _manifestLog.Dispose();
+                            else await _manifestLog.DisposeAsync().ConfigureAwait(false);
+                        }
                         catch (Exception e) when (e is IOException or RocksDbException) { }
                     }
                     // The next LogAndApply writes a new MANIFEST (ProcessManifestWrites without descriptor_log_).
@@ -1007,7 +1004,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     _manifestLock.Release();
                 }
-                await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous, CancellationToken.None).ConfigureAwait(false);
             }
             else
             {
@@ -1018,12 +1015,30 @@ internal sealed class VersionSet : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    /// <summary>Closes the MANIFEST writer with the synchronous file APIs.</summary>
+    public void Close()
     {
-        await _manifestLock.WaitAsync().ConfigureAwait(false);
+        ValueTask t = CloseAsync(synchronous: true);
+        Debug.Assert(t.IsCompleted, "a synchronous MANIFEST close did not complete synchronously");
+        t.GetAwaiter().GetResult();
+    }
+
+    public ValueTask DisposeAsync() => CloseAsync(synchronous: false);
+
+    /// <summary>
+    /// Closes the MANIFEST writer (VersionSet::Close after the checks). With <paramref name="synchronous"/> the lock is
+    /// taken and the file closed with the blocking APIs and the returned task is complete.
+    /// </summary>
+    internal async ValueTask CloseAsync(bool synchronous)
+    {
+        await LockManifestAsync(synchronous).ConfigureAwait(false);
         try
         {
-            if (_manifestLog is not null) await _manifestLog.DisposeAsync().ConfigureAwait(false);
+            if (_manifestLog is not null)
+            {
+                if (synchronous) _manifestLog.Dispose();
+                else await _manifestLog.DisposeAsync().ConfigureAwait(false);
+            }
             _manifestLog = null;
             _manifest = null;
         }
@@ -1031,5 +1046,12 @@ internal sealed class VersionSet : IAsyncDisposable
         {
             _manifestLock.Release();
         }
+    }
+
+    private ValueTask LockManifestAsync(bool synchronous)
+    {
+        if (!synchronous) return new ValueTask(_manifestLock.WaitAsync());
+        _manifestLock.Wait();
+        return default;
     }
 }

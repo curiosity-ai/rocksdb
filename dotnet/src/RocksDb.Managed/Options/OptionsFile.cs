@@ -115,27 +115,41 @@ public sealed class OptionsFile
     }
 
     /// <summary>Writes the file (synced). The DB writes "OPTIONS-N.dbtmp" first and renames it into place.</summary>
-    public async ValueTask WriteAsync(IFileSystem fs, string path, CancellationToken cancellationToken)
-    {
-        byte[] bytes = Encoding.UTF8.GetBytes(Serialize());
-        IWritableFile file = fs.CreateWritable(path, truncate: true);
-        await using (file.ConfigureAwait(false))
-        {
-            await file.AppendAsync(bytes, cancellationToken).ConfigureAwait(false);
-            await file.SyncAsync(cancellationToken).ConfigureAwait(false);
-        }
-    }
+    public void Write(IFileSystem fs, string path) =>
+        Complete(FileNames.WriteStringToFileAsync(fs, Serialize(), path, synchronous: true, CancellationToken.None));
+
+    /// <inheritdoc cref="Write"/>
+    public ValueTask WriteAsync(IFileSystem fs, string path, CancellationToken cancellationToken) =>
+        FileNames.WriteStringToFileAsync(fs, Serialize(), path, synchronous: false, cancellationToken);
 
     /// <summary>
     /// Writes OPTIONS-<paramref name="fileNumber"/> into <paramref name="dbname"/> via a temp file + rename, like
     /// DBImpl::WriteOptionsFile / RenameTempFileToOptionsFile.
     /// </summary>
-    public async ValueTask WriteToDbDirectoryAsync(IFileSystem fs, string dbname, ulong fileNumber, CancellationToken cancellationToken)
+    public void WriteToDbDirectory(IFileSystem fs, string dbname, ulong fileNumber) =>
+        Complete(WriteToDbDirectoryAsync(fs, dbname, fileNumber, synchronous: true, CancellationToken.None));
+
+    /// <inheritdoc cref="WriteToDbDirectory"/>
+    public ValueTask WriteToDbDirectoryAsync(IFileSystem fs, string dbname, ulong fileNumber, CancellationToken cancellationToken) =>
+        WriteToDbDirectoryAsync(fs, dbname, fileNumber, synchronous: false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="WriteToDbDirectory"/>: with <paramref name="synchronous"/> only the synchronous file APIs are used and
+    /// the returned task is complete.
+    /// </summary>
+    internal async ValueTask WriteToDbDirectoryAsync(IFileSystem fs, string dbname, ulong fileNumber, bool synchronous, CancellationToken cancellationToken)
     {
         string tmp = FileNames.TempOptionsFileName(dbname, fileNumber);
-        await WriteAsync(fs, tmp, cancellationToken).ConfigureAwait(false);
+        await FileNames.WriteStringToFileAsync(fs, Serialize(), tmp, synchronous, cancellationToken).ConfigureAwait(false);
         fs.RenameFile(tmp, FileNames.OptionsFileName(dbname, fileNumber));
         fs.SyncDirectory(dbname);
+    }
+
+    /// <summary>Observes the task of a <c>synchronous: true</c> call, which never awaits anything incomplete.</summary>
+    private static void Complete(ValueTask t)
+    {
+        System.Diagnostics.Debug.Assert(t.IsCompleted, "a synchronous OPTIONS write did not complete synchronously");
+        t.GetAwaiter().GetResult();
     }
 
     // ---- reading ----------------------------------------------------------------------------
