@@ -780,16 +780,22 @@ internal sealed class RangeLockRequest
         }
         catch (OperationCanceledException)
         {
+            bool completed;
             lock (_tree.RequestsMutex)
             {
-                if (_pending)
+                completed = !_pending;
+                if (!completed)
                 {
                     _tree.RemovePending(this);
                     Complete(RangeLockTree.Interrupted);
                 }
                 _tree.CountWait(false);
             }
-            throw;
+            if (!completed) throw;
+            // A release completed the request (retry granted the lock) before the cancellation was handled. The outcome
+            // stands, so that the caller records a granted range; throwing here would leave the range locked in the tree
+            // without the transaction tracking it, and it would never be released.
+            return _completeR;
         }
         lock (_tree.RequestsMutex) _tree.CountWait(timedOut);
         return _completeR;
