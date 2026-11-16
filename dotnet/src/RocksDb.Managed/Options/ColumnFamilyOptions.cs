@@ -535,7 +535,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Enum("last_level_temperature", OptionEnumMaps.Temperature, static o => o.LastLevelTemperature, static (o, v) => o.LastLevelTemperature = v)
         .Enum("default_temperature", OptionEnumMaps.Temperature, static o => o.DefaultTemperature, static (o, v) => o.DefaultTemperature = v)
         .Enum("default_write_temperature", OptionEnumMaps.Temperature, static o => o.DefaultWriteTemperature, static (o, v) => o.DefaultWriteTemperature = v)
-        .UInt32("block_protection_bytes_per_key", static o => o.BlockProtectionBytesPerKey, static (o, v) => o.BlockProtectionBytesPerKey = v)
+        .UInt8("block_protection_bytes_per_key", static o => o.BlockProtectionBytesPerKey, static (o, v) => o.BlockProtectionBytesPerKey = v)
         .Bool("persist_user_defined_timestamps", static o => o.PersistUserDefinedTimestamps, static (o, v) => o.PersistUserDefinedTimestamps = v)
         .Bool("cf_allow_ingest_behind", static o => o.CfAllowIngestBehind, static (o, v) => o.CfAllowIngestBehind = v)
         .Bool("disallow_memtable_writes", static o => o.DisallowMemtableWrites, static (o, v) => o.DisallowMemtableWrites = v)

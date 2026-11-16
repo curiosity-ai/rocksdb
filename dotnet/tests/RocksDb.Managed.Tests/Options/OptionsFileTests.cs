@@ -50,6 +50,7 @@ public sealed class OptionsFileTests
 
         [TableOptions/BlockBasedTable "my cf\#1"]
           format_version=6
+
         """;
 
     [TestMethod]

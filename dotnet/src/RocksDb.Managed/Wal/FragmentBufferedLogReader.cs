@@ -434,8 +434,12 @@ public sealed class FragmentBufferedLogReader : IDisposable
         {
             if (_firstRecordRead && !_recycled)
             {
-                // A recycled log should have started with a recycled record.
-                SetError(BadRecord);
+                // A recycled log should have started with a recycled record. Deliberate deviation, as in LogReader:
+                // upstream reports kBadRecord without consuming the header and reads it again forever; the record cannot
+                // be valid (its CRC covers the type byte), so it is dropped like a checksum mismatch.
+                _dropSize = _bufLen;
+                _bufStart = _bufLen = 0;
+                SetError(BadRecordChecksum);
                 return FragmentReady;
             }
             _recycled = true;

@@ -192,7 +192,9 @@ public sealed class OptionsFile
             string rawLine = nl < 0 ? text[pos..] : text[pos..nl];
             pos = nl < 0 ? text.Length + 1 : nl + 1;
             lineNum++;
-            if (nl < 0 && rawLine.Length == 0) break;
+            // LineFileReader::ReadLine (file/line_file_reader.cc) returns false at EOF for a final line without '\n':
+            // native drops it (an OPTIONS file torn mid-line keeps the statements before it), so this port does too.
+            if (nl < 0) break;
             string line = TrimAndRemoveComment(rawLine, trimOnly: false);
             if (line.Length == 0) continue;
             if (IsSection(line))
@@ -390,12 +392,12 @@ public sealed class OptionsFile
                     {
                         if (kv.Key == "rocksdb_version")
                         {
-                            _file.RocksDbVersion = ParseVersionNumber(kv.Key, kv.Value, 3);
+                            _file.RocksDbVersion = ParseVersionNumber(kv.Key, kv.Value, 3, out _);
                         }
                         else if (kv.Key == "options_file_version")
                         {
-                            _file.OptionsFileVersion = ParseVersionNumber(kv.Key, kv.Value, 2);
-                            if (_file.OptionsFileVersion.Major < 1)
+                            _file.OptionsFileVersion = ParseVersionNumber(kv.Key, kv.Value, 2, out int major);
+                            if (major < 1)
                             {
                                 ThrowHelper.InvalidArgument("A valid options_file_version must be at least 1.");
                             }
@@ -407,8 +409,13 @@ public sealed class OptionsFile
             _section = Section.None;
         }
 
-        /// <summary>Port of RocksDBOptionsParser::ParseVersionNumber.</summary>
-        private static Version ParseVersionNumber(string verName, string verString, int maxCount)
+        /// <summary>
+        /// Port of RocksDBOptionsParser::ParseVersionNumber. Like native, each component accumulates in an int with
+        /// wrap-around ("current_number * 10 + digit"), so a huge component can come out negative: the options file
+        /// version check then sees the wrapped major (<paramref name="major"/>, InvalidArgument when below 1, as native),
+        /// and the returned <see cref="Version"/> (which cannot hold negative parts) gets 0 for such a component.
+        /// </summary>
+        private static Version ParseVersionNumber(string verName, string verString, int maxCount, out int major)
         {
             Span<int> version = stackalloc int[3];
             int index = 0, current = 0, digits = 0;
@@ -426,7 +433,7 @@ public sealed class OptionsFile
                 }
                 else if (c is >= '0' and <= '9')
                 {
-                    current = current * 10 + (c - '0');
+                    current = unchecked(current * 10 + (c - '0'));
                     digits++;
                 }
                 else
@@ -436,6 +443,8 @@ public sealed class OptionsFile
             }
             version[index] = current;
             if (hasDot && digits == 0) ThrowHelper.InvalidArgument("A valid " + verName + " must have at least one digit after each dot.");
+            major = version[0];
+            for (int i = 0; i < maxCount; i++) version[i] = Math.Max(0, version[i]);
             return maxCount == 3 ? new Version(version[0], version[1], version[2]) : new Version(version[0], version[1]);
         }
     }
