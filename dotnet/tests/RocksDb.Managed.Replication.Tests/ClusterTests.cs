@@ -326,6 +326,109 @@ public sealed class ClusterTests
             foreach (ClusterNodeHost h in c.Running) Assert.IsNotNull(h.Db.Get(U(K(i))), K(i) + " lost on " + h.NodeId);
     }
 
+    /// <summary>
+    /// The case <see cref="MajorityRestartedWithoutDatabasesElectsTheMemberWithTheNewerTerm"/> leaves open: two of three
+    /// members die in the middle of a snapshot restore while everyone is still in the term of the member that kept its
+    /// data. Its last log term then equals theirs, which the term map alone cannot settle (the lost last index decides),
+    /// so the cluster stayed leaderless. The restore records where the log ended before dropping it, and the members
+    /// vote against that end as they would against their log.
+    /// </summary>
+    [TestMethod]
+    public async Task MajorityRestartedMidRestoreInTheSameTermElectsTheMemberThatKeptItsData()
+    {
+        bool blocked = false;
+        await using var c = new ClusterHarness(3, null) { ArchiveWals = false };
+        c.WrapClient = (_, _, inner) => new ReplicationBlockingClient(inner, () => Volatile.Read(ref blocked));
+        await c.StartAsync("n1");
+        for (int i = 0; i < 50; i++) await c["n1"].TryWriteAsLeaderAsync(U(K(i)), U(V(i, 0)), CancellationToken.None);
+        await c.StartAsync("n2");
+        await c.StartAsync("n3");
+        await WaitUntilAsync(() => c.Statuses().TrueForAll(s => s.Mode == ClusterMode.Cluster), "cluster mode\n" + c.LogText);
+        ClusterNodeHost leader = await c.WaitForLeaderAsync(null);
+        await WriteCommittedAsync(c, 50, 80);
+        await c.AssertConvergedAsync(leader);
+        string leaderId = leader.NodeId;
+        long term = leader.Node.CurrentTerm;
+        ulong lastSeq = leader.Db.GetLatestSequenceNumber();
+        string[] others = new[] { "n1", "n2", "n3" }.Where(id => id != leaderId).ToArray();
+
+        // The two others start a snapshot restore that cannot finish: each records its log end, closes its database
+        // and keeps asking the leader for a snapshot.
+        Volatile.Write(ref blocked, true);
+        foreach (string id in others) c[id].TriggerResync("test");
+        foreach (string id in others)
+        {
+            await WaitUntilAsync(() => c[id].Node.IsResyncing, "resync of " + id + "\n" + c.LogText);
+            RaftLogEnd? end = new RaftPersistentState(Path.Combine(c.DbPath(id), "raft")).LogEnd;
+            Assert.AreEqual(new RaftLogEnd(lastSeq, term), end, "the log end " + id + " recorded");
+        }
+
+        // All three go down; the restoring two after their restore deleted the old files.
+        foreach (string id in others) await c.StopAsync(id);
+        await c.StopAsync(leaderId);
+        foreach (string id in others)
+            foreach (string f in Directory.GetFiles(c.DbPath(id))) File.Delete(f);
+        Volatile.Write(ref blocked, false);
+
+        await c.StartAsync(leaderId);
+        Task[] starts = others.Select(id => c.StartAsync(id, registerFirst: true)).ToArray();
+        await WaitUntilAsync(() => starts.All(t => t.IsCompleted), TimeSpan.FromSeconds(30),
+            "the members without a database to restore from an elected leader\n" + c.LogText);
+        await Task.WhenAll(starts);
+        ClusterNodeHost next = await c.WaitForLeaderAsync(null);
+        Assert.AreEqual(leaderId, next.NodeId, "only the member that kept its data can lead");
+        Assert.IsTrue(next.Node.CurrentTerm > term);
+        await WriteCommittedAsync(c, 80, 90);
+        await c.AssertConvergedAsync(next);
+        for (int i = 0; i < 90; i++)
+            foreach (ClusterNodeHost h in c.Running) Assert.IsNotNull(h.Db.Get(U(K(i))), K(i) + " lost on " + h.NodeId);
+        foreach (string id in others)
+            Assert.IsNull(new RaftPersistentState(Path.Combine(c.DbPath(id), "raft")).LogEnd, "cleared once " + id + " runs on its restored log");
+    }
+
+    /// <summary>
+    /// The vote of a member without a log once a restore recorded where it ended: Raft's election restriction against
+    /// that end, equal last terms included.
+    /// </summary>
+    [TestMethod]
+    public void VoteWithoutALogComparesAgainstTheRecordedLogEnd()
+    {
+        using var dir = new TempDir("vote-end");
+        var state = new RaftPersistentState(dir.Path);
+        state.SetMode(ClusterMode.Cluster);
+        state.UpdateTermAndVote(7, null);
+        state.RecordTermRange(1, 3);
+        state.RecordTermRange(500, 5);
+        state.RecordTermRange(900, 7);   // adopted from a leader: entries this member never received
+        state.RecordLogEnd(800, 5);      // the log it dropped ended at 800, in term 5
+        static bool Peer(string id) => id is "n1" or "n2" or "n3";
+
+        RequestVoteResult Vote(long term, string id, ulong lastLogSeq, long lastLogTerm) =>
+            RaftClusterNode.HandleRequestVoteWithoutLog(state, Peer, new RequestVotePayload(term, id, lastLogSeq, lastLogTerm));
+
+        Assert.IsFalse(Vote(8, "n1", 799, 5).VoteGranted, "same last term, shorter log");
+        Assert.IsFalse(Vote(8, "n1", 5_000, 4).VoteGranted, "older last term");
+        Assert.IsTrue(Vote(8, "n1", 800, 5).VoteGranted, "same last term, as long");
+        Assert.IsTrue(Vote(9, "n2", 600, 6).VoteGranted, "newer last term (below the adopted map's last term)");
+
+        // Durable, and replaced by the next restore's record.
+        var reloaded = new RaftPersistentState(dir.Path);
+        Assert.AreEqual(new RaftLogEnd(800, 5), reloaded.LogEnd);
+        reloaded.RecordLogEnd(950, 7);
+        Assert.AreEqual(new RaftLogEnd(950, 7), new RaftPersistentState(dir.Path).LogEnd);
+
+        // Cleared: the term-map rule applies again (last term 7, strictly newer needed).
+        reloaded.ClearLogEnd();
+        var cleared = new RaftPersistentState(dir.Path);
+        Assert.IsNull(cleared.LogEnd);
+        Assert.IsFalse(RaftClusterNode.IsUpToDateWithoutLog(7, ulong.MaxValue, cleared));
+        Assert.IsTrue(RaftClusterNode.IsUpToDateWithoutLog(8, 0, cleared));
+
+        // A damaged record is refused rather than read as some other log end.
+        File.WriteAllText(Path.Combine(dir.Path, "raft.logend"), "12x\n5\n");
+        Assert.ThrowsExactly<InvalidDataException>(() => new RaftPersistentState(dir.Path));
+    }
+
     /// <summary>The vote of a member without a usable log (<see cref="RaftClusterNode.HandleRequestVoteWithoutLog"/>).</summary>
     [TestMethod]
     public void VoteWithoutALogNeedsAStrictlyNewerLastLogTerm()
