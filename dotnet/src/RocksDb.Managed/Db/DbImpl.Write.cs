@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Util;
@@ -204,8 +205,10 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            Exception? userCallbackError = w.UserCallbackError;
             WriteThread.Return(w, synchronous);
             stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
+            if (userCallbackError is not null) OnUserWriteCallbackFailed(userCallbackError);
         }
     }
 
@@ -294,8 +297,10 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            Exception? userCallbackError = w.UserCallbackError;
             WriteThread.Return(w, synchronous);
             stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
+            if (userCallbackError is not null) OnUserWriteCallbackFailed(userCallbackError);
         }
     }
 
@@ -365,6 +370,26 @@ internal sealed partial class DbImpl
             throw new InvalidOperationException("transaction writes into a sequence-per-batch DB must give their batch count");
         }
         return hooks.WritePlainAsync(options, batch, synchronous, cancellationToken);
+    }
+
+    /// <summary>
+    /// A <see cref="UserWriteCallback"/> of this write threw (recorded on the writer by WriteThread, see
+    /// Writer.CheckWriteEnqueuedCallback; upstream: undefined behaviour). Called by the writer's own thread once its write
+    /// group completed it and the writer went back to the pool: the DB gets a hard background error that stops writes
+    /// until <see cref="RocksDatabase.Resume"/>, and the caller gets the callback's exception unchanged (whether the write
+    /// itself was committed is not known to the caller). Reason WriteCallback: the reason upstream's WriteStatusCheck gives
+    /// errors of the write itself (MemTable, the other candidate, means a memtable that diverged from the WAL); the
+    /// severity maps would make any status of either reason fatal (reopen only), so the severity is set to hard here,
+    /// which Resume recovers from. Failure path only.
+    /// </summary>
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void OnUserWriteCallbackFailed(Exception e)
+    {
+        var bg = new RocksDbException(StatusCode.Aborted, "Aborted: UserWriteCallback threw " + e.GetType().Name + ": " + e.Message, inner: e);
+        ErrorHandler.SetHardBgError(bg, BackgroundErrorReason.WriteCallback);
+        lock (_mutex) SignalBackgroundWork();
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(e);
     }
 
     private static void ThrowWriteError(Exception e)

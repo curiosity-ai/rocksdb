@@ -161,9 +161,52 @@ internal sealed class WriteThread
         /// </summary>
         public readonly Util.OwnedAsyncBoxSlot<int> LeadBox = new();
 
+        /// <summary>
+        /// The first exception thrown by a <see cref="UserCallback"/> method of this write (OnWriteEnqueued, run by the
+        /// writer's thread, or OnWalWriteFinish, run by its group's leader; the first one wins). Read by the writer's own
+        /// thread once its group completed it (see DbImpl.OnUserWriteCallbackFailed). Null on the normal path.
+        /// </summary>
+        public Exception? UserCallbackError;
+
         /// <summary>CheckPostWalWriteCallback: the writer's WAL record is written.</summary>
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-        public void CheckPostWalWriteCallback() => UserCallback?.OnWalWriteFinish();
+        public void CheckPostWalWriteCallback()
+        {
+            if (UserCallback is { } cb) InvokeWalWriteFinish(cb);
+        }
+
+        /// <summary>
+        /// Deliberate deviation from upstream (write_thread.h CheckWriteEnqueuedCallback / CheckPostWalWriteCallback call
+        /// the user callback without a try/catch; include/rocksdb/user_write_callback.h has void, not noexcept, methods, so
+        /// a throw is undefined behaviour there): an exception thrown by a user callback is recorded on the writer instead
+        /// of leaving the write thread, which would strand the write queue (the writer is linked, possibly leading or in a
+        /// leader's group) or fail the other writers of the group after their WAL record was written. The writer goes
+        /// through its group as usual; its caller then gets the exception and the DB a background error.
+        /// </summary>
+        private void InvokeWalWriteFinish(UserWriteCallback cb)
+        {
+            try
+            {
+                cb.OnWalWriteFinish();
+            }
+            catch (Exception e)
+            {
+                Interlocked.CompareExchange(ref UserCallbackError, e, null);
+            }
+        }
+
+        /// <summary>CheckWriteEnqueuedCallback (see <see cref="InvokeWalWriteFinish"/> for the exception handling).</summary>
+        public void CheckWriteEnqueuedCallback(UserWriteCallback cb)
+        {
+            try
+            {
+                cb.OnWriteEnqueued();
+            }
+            catch (Exception e)
+            {
+                Interlocked.CompareExchange(ref UserCallbackError, e, null);
+            }
+        }
 
         public void Prepare(WriteBatch? batch, WriteOptions? options, bool syncWaiter)
         {
@@ -181,6 +224,7 @@ internal sealed class WriteThread
             Txn = null;
             CallbackFailed = false;
             UserCallback = null;
+            UserCallbackError = null;
             Rearm();
         }
 
@@ -314,8 +358,9 @@ internal sealed class WriteThread
         {
             TestHooks.Invoke("WriteThread::JoinBatchGroup:Wait");
         }
-        // CheckWriteEnqueuedCallback (after LinkOne, before waiting).
-        w.UserCallback?.OnWriteEnqueued();
+        // CheckWriteEnqueuedCallback (after LinkOne, before waiting). A throw is recorded, never propagated: the writer is
+        // linked (or leads), so it must go through the group flow.
+        if (w.UserCallback is { } cb) w.CheckWriteEnqueuedCallback(cb);
         return linkedAsLeader;
     }
 

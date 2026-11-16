@@ -577,7 +577,15 @@ public sealed class Audit8AsyncWritePathTests
     /// the next write group (the first one leads it); then releases the held write. Returns the outcome of each writer
     /// (null when acknowledged) and the held write's.
     /// </summary>
-    private static (Exception?[] Errors, Exception? HeldError) RunGroupBehindHeldLeader(RocksDatabase db, string[] keys, bool[] async, WriteOptions options)
+    private static (Exception?[] Errors, Exception? HeldError) RunGroupBehindHeldLeader(RocksDatabase db, string[] keys, bool[] async, WriteOptions options) =>
+        RunGroupBehindHeldLeader(db, keys, async, options, callbacks: null);
+
+    /// <summary>
+    /// <see cref="RunGroupBehindHeldLeader(RocksDatabase, string[], bool[], WriteOptions)"/>; writer i writes with
+    /// WriteWithCallback(Async) and <paramref name="callbacks"/>[i] when that is not null.
+    /// </summary>
+    private static (Exception?[] Errors, Exception? HeldError) RunGroupBehindHeldLeader(RocksDatabase db, string[] keys, bool[] async, WriteOptions options,
+        UserWriteCallback?[]? callbacks)
     {
         using var queued = new SemaphoreSlim(0);
         using var hold = new HoldAfterWal();
@@ -605,7 +613,7 @@ public sealed class Audit8AsyncWritePathTests
             int n = i;
             if (async[i])
             {
-                Task t = db.PutAsync(options, B(keys[n]), B("v" + n)).AsTask();
+                Task t = WriteOneAsync(db, options, keys[n], "v" + n, callbacks?[n]);
                 // An asynchronous writer resumes on the thread pool, never inline on the thread of the (synchronous)
                 // leader that completed it (RunContinuationsAsynchronously), nor on a held synchronous writer.
                 Task<bool> onPool = t.ContinueWith(static _ => Thread.CurrentThread.IsThreadPoolThread, CancellationToken.None,
@@ -623,7 +631,7 @@ public sealed class Audit8AsyncWritePathTests
             {
                 var thread = new Thread(() =>
                 {
-                    try { db.Put(options, B(keys[n]), B("v" + n)); }
+                    try { WriteOne(db, options, keys[n], "v" + n, callbacks?[n]); }
                     catch (Exception e) { errors[n] = e; }
                 });
                 thread.Start();
@@ -636,6 +644,30 @@ public sealed class Audit8AsyncWritePathTests
         Assert.IsTrue(held.Join(TimeSpan.FromSeconds(20)), "the held write hangs");
         for (int i = 0; i < waits.Count; i++) Assert.IsTrue(waits[i](), keys[i] + " hangs (stranded write group)");
         return (errors, heldError);
+    }
+
+    private static void WriteOne(RocksDatabase db, WriteOptions options, string key, string value, UserWriteCallback? callback)
+    {
+        if (callback is null)
+        {
+            db.Put(options, B(key), B(value));
+            return;
+        }
+        using var batch = new WriteBatch();
+        batch.Put(B(key), B(value));
+        db.WriteWithCallback(options, batch, callback);
+    }
+
+    private static async Task WriteOneAsync(RocksDatabase db, WriteOptions options, string key, string value, UserWriteCallback? callback)
+    {
+        if (callback is null)
+        {
+            await db.PutAsync(options, B(key), B(value));
+            return;
+        }
+        using var batch = new WriteBatch();
+        batch.Put(B(key), B(value));
+        await db.WriteWithCallbackAsync(options, batch, callback);
     }
 
     /// <summary>
@@ -801,40 +833,99 @@ public sealed class Audit8AsyncWritePathTests
 
     // ---- a throwing UserWriteCallback ----------------------------------------------------------------------------
 
-    private sealed class ThrowingEnqueuedCallback : UserWriteCallback
+    /// <summary>The callback's own exception type, so that the test can tell it from anything the engine throws.</summary>
+    private sealed class CallbackFailure(string message) : Exception(message);
+
+    /// <summary>Throws from <see cref="OnWriteEnqueued"/> or from <see cref="OnWalWriteFinish"/>.</summary>
+    private sealed class ThrowingCallback(bool onEnqueued) : UserWriteCallback
     {
-        public override void OnWriteEnqueued() => throw new InvalidOperationException("callback failed");
-        public override void OnWalWriteFinish() { }
+        public override void OnWriteEnqueued()
+        {
+            if (onEnqueued) throw new CallbackFailure("OnWriteEnqueued failed");
+        }
+
+        public override void OnWalWriteFinish()
+        {
+            if (!onEnqueued) throw new CallbackFailure("OnWalWriteFinish failed");
+        }
+    }
+
+    public static IEnumerable<object[]> ThrowingCallbackCases()
+    {
+        foreach (WriteMode mode in new[] { WriteMode.Default, WriteMode.SerialInserts, WriteMode.Pipelined, WriteMode.Unordered, WriteMode.TwoWriteQueues })
+        {
+            foreach (bool onEnqueued in new[] { true, false })
+            {
+                foreach (bool leader in new[] { true, false })
+                {
+                    foreach (bool async in new[] { true, false }) yield return [mode, onEnqueued, leader, async];
+                }
+            }
+        }
     }
 
     /// <summary>
-    /// UserWriteCallback.OnWriteEnqueued runs in JoinBatchGroup after the writer was linked (upstream:
-    /// CheckWriteEnqueuedCallback after LinkOne). The API documents that the callbacks must not throw; when one does, the
-    /// exception leaves the write while its writer is still the write leader (or still linked in the queue), the writer
-    /// goes back to the pool, and every later write of the DB (and its close) waits forever.
+    /// A UserWriteCallback that throws fails safely (upstream: undefined behaviour; write_thread.cc JoinBatchGroup calls
+    /// CheckWriteEnqueuedCallback after LinkOne without a try/catch). The throwing write (sync or async, leading its
+    /// write group or following an asynchronous / synchronous writer of the other kind) gets the callback's exception
+    /// unchanged; the other writer of its group is acknowledged and readable; the write queue is not stranded; the DB has
+    /// a hard background error, so later writes (sync and async) fail with it until Resume(), after which writes work;
+    /// and the DB closes. The port leaked the exception out of JoinBatchGroup while the writer was linked (or leading):
+    /// every later write and the close waited forever; an OnWalWriteFinish that threw failed every writer of the group
+    /// after its WAL record was written.
     /// </summary>
     [TestMethod]
-    [Ignore("audit #8 open: a throwing UserWriteCallback.OnWriteEnqueued strands the write queue (documented as must not throw)")]
+    [DynamicData(nameof(ThrowingCallbackCases))]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ThrowingOnWriteEnqueuedDoesNotStrandTheWriteQueue()
+    public void ThrowingUserWriteCallbackFailsSafely(WriteMode mode, bool onEnqueued, bool leader, bool async)
     {
-        RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(NewFs()));
+        RocksDatabase db = RocksDatabase.Open(DbPath, ModeOptions(NewFs(), mode));
         try
         {
-            using (var batch = new WriteBatch())
-            {
-                batch.Put(B("k"), B("v"));
-                await Assert.ThrowsAsync<InvalidOperationException>(async () => await db.WriteWithCallbackAsync(null, batch, new ThrowingEnqueuedCallback()));
-            }
-            Task next = db.PutAsync(B("next"), B("n")).AsTask();
-            Assert.AreSame(next, await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(5))), "the write queue is stranded");
-            await next;
+            db.Put(B("before"), B("1"));
+            // The throwing write leads the next group (first behind the held write) or follows a writer of the other kind.
+            string[] keys = leader ? ["thrower", "other"] : ["other", "thrower"];
+            int thrower = leader ? 0 : 1;
+            bool[] kinds = new bool[2];
+            kinds[thrower] = async;
+            kinds[1 - thrower] = !async;
+            var callbacks = new UserWriteCallback?[2];
+            callbacks[thrower] = new ThrowingCallback(onEnqueued);
+            callbacks[1 - thrower] = new NoOpUserCallback();
+            (Exception?[] errors, Exception? heldError) = RunGroupBehindHeldLeader(db, keys, kinds, new WriteOptions(), callbacks);
+            Assert.IsNull(heldError, heldError?.ToString());
+            Assert.IsInstanceOfType<CallbackFailure>(errors[thrower], errors[thrower]?.ToString() ?? "the throwing write succeeded");
+            Assert.AreEqual(onEnqueued ? "OnWriteEnqueued failed" : "OnWalWriteFinish failed", errors[thrower]!.Message);
+            Assert.IsNull(errors[1 - thrower], errors[1 - thrower]?.ToString());
+            Assert.AreEqual("v" + (1 - thrower), GetString(db, keys[1 - thrower]));
+            Assert.AreEqual("h", GetString(db, "held"));
+
+            // Writes stop with the hard background error until Resume.
+            RocksDbException? bg = db.BackgroundError;
+            Assert.IsNotNull(bg);
+            Assert.AreEqual(StatusCode.Aborted, bg.Code);
+            Assert.AreEqual(ErrorSeverity.HardError, bg.Severity);
+            var syncLater = Assert.ThrowsExactly<RocksDbException>(() => db.Put(B("later"), B("x")));
+            Assert.AreEqual(StatusCode.Aborted, syncLater.Code);
+            Task asyncLater = db.PutAsync(B("later"), B("y")).AsTask();
+            Assert.IsTrue(((IAsyncResult)asyncLater).AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(20)), "a later write hangs");
+            Assert.IsInstanceOfType<RocksDbException>(asyncLater.Exception?.InnerException, asyncLater.Exception?.ToString() ?? "a later write succeeded");
+            Assert.AreEqual(StatusCode.Aborted, ((RocksDbException)asyncLater.Exception!.InnerException!).Code);
+            Assert.IsNull(db.Get(B("later")));
+
+            db.Resume();
+            Assert.IsNull(db.BackgroundError);
+            db.Put(B("after"), B("a"));
+            Task asyncAfter = db.PutAsync(B("after2"), B("b")).AsTask();
+            Assert.IsTrue(asyncAfter.Wait(TimeSpan.FromSeconds(20)), "a write after Resume hangs");
+            Assert.AreEqual("a", GetString(db, "after"));
+            Assert.AreEqual("b", GetString(db, "after2"));
         }
         finally
         {
-            // Close waits for the write queue too: do not let a stranded queue hang the test run.
+            // Close needs the write queue: a stranded queue must fail the test, not hang the run.
             Task close = Task.Run(db.Dispose);
-            Assert.AreSame(close, await Task.WhenAny(close, Task.Delay(TimeSpan.FromSeconds(5))), "close waits for the stranded write queue");
+            Assert.IsTrue(close.Wait(TimeSpan.FromSeconds(20)), "close waits for a stranded write queue");
         }
     }
 

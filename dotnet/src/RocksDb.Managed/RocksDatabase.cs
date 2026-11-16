@@ -261,6 +261,11 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// order concurrent writers. Port of DB::WriteWithCallback(options, updates, user_write_cb). Not supported
     /// (NotSupported) on WritePrepared / WriteUnprepared transaction DBs.
     /// </summary>
+    /// <remarks>
+    /// When a method of <paramref name="callback"/> throws, this call rethrows that exception once the write group is
+    /// done, the outcome of the write is indeterminate (it may have been committed), and writes fail with a hard
+    /// <see cref="BackgroundError"/> until <see cref="Resume"/> (see <see cref="UserWriteCallback"/>).
+    /// </remarks>
     public void WriteWithCallback(WriteOptions? options, WriteBatch batch, UserWriteCallback callback) =>
         SyncValueTask.GetResult(_db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None));
 
