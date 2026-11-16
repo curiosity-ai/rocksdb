@@ -185,7 +185,15 @@ public sealed class Audit10WriteCustomizationTests
         reopened.Flush();
         reopened.CompactRange();
         AssertModel(reopened, model, phase + " (reopened, compacted)");
-        CollectionAssert.AreEqual(LiveSst(reopened).ToList(), SstOnDisk(fs).ToList(), phase + ": orphan table files after reopen");
+        // A point read that drops the last reference to a version leaves the files that version kept alive to the next
+        // purge (upstream ReturnAndCleanupSuperVersion does not purge; see Audit7WritePathFailuresTests
+        // .PointReadReleasingTheLastReferenceLeavesCompactionInputsToTheNextPurge). With automatic compactions the reads
+        // above can race one, so let it finish and trigger a purge (a flush) before comparing.
+        reopened.WaitForCompact();
+        reopened.Put(B("~purge"), B("1"));
+        reopened.Flush();
+        List<string> live = LiveSst(reopened).ToList(), onDisk = SstOnDisk(fs).ToList();
+        CollectionAssert.AreEqual(live, onDisk, phase + ": orphan table files after reopen: live [" + string.Join(",", live) + "] on disk [" + string.Join(",", onDisk) + "]");
     }
 
     private static Exception? FindUserException(Exception? e)
@@ -1508,5 +1516,67 @@ public sealed class Audit10WriteCustomizationTests
         Exception? failure = Capture(db.CompactRange);
         Assert.IsTrue(s.Calls > 0);
         AssertBackgroundFailureRecoverable(fs, db, failure, s, model, Dbo, Cfo, "compaction service " + where);
+    }
+
+    /// <summary>
+    /// Upstream issue draft 15: a DB with merge operands in its table files, opened without a merge operator. Native
+    /// 11.12 segfaults when a read merges an operand with an older value or runs backwards (GetContext::SaveValue and
+    /// DBIter::FindValueForCurrentKey only assert merge_operator != nullptr before TimedFullMerge); Get of operands with
+    /// nothing older and forward iteration return InvalidArgument. The port must return InvalidArgument for every read
+    /// that needs the operator (GetContext / DbIter check it before merging) and serve the other keys.
+    /// </summary>
+    [TestMethod]
+    public void ReadingMergeOperandsWithoutAnOperatorIsInvalidArgumentForEveryRead()
+    {
+        MemoryFileSystem fs = NewDbFs();
+        var withOperator = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator(), Level0FileNumCompactionTrigger = 100 };
+        using (RocksDatabase db = RocksDatabase.Open(Db, NewOptions(fs), withOperator))
+        {
+            db.Put(B("a"), B("1"));
+            db.Put(B("k"), B("base"));
+            db.Put(B("z"), B("2"));
+            db.Flush();
+            db.Merge(B("k"), B("o1")); // operand above an older base value in another file
+            db.Merge(B("m"), B("x"));  // operand with nothing older
+            db.Put(B("n"), B("3"));
+            db.Flush();
+        }
+        using RocksDatabase reopened = RocksDatabase.Open(Db, NewOptions(fs), new ColumnFamilyOptions { Level0FileNumCompactionTrigger = 100 });
+        Assert.AreEqual("1", GetString(reopened, "a"));
+        Assert.AreEqual("3", GetString(reopened, "n"));
+        Assert.AreEqual("2", GetString(reopened, "z"));
+        AssertInvalidArgument(() => reopened.Get(B("k")), "Get k (operand above an older value)");
+        AssertInvalidArgument(() => reopened.Get(B("m")), "Get m (operands only)");
+        AssertInvalidArgument(() => reopened.MultiGet(new[] { B("k") }), "MultiGet k");
+        AssertInvalidArgument(() => reopened.MultiGet(new[] { B("m") }), "MultiGet m");
+        AssertInvalidArgument(() =>
+        {
+            using Iterator it = reopened.NewIterator();
+            for (it.SeekToFirst(); it.Valid; it.Next()) { }
+        }, "forward iteration");
+        AssertInvalidArgument(() =>
+        {
+            using Iterator it = reopened.NewIterator();
+            for (it.SeekToLast(); it.Valid; it.Prev()) { }
+        }, "reverse iteration");
+        AssertInvalidArgument(() =>
+        {
+            using Iterator it = reopened.NewIterator();
+            it.SeekForPrev(B("k"));
+        }, "SeekForPrev k");
+        AssertInvalidArgument(() =>
+        {
+            using Iterator it = reopened.NewIterator();
+            it.SeekForPrev(B("m"));
+        }, "SeekForPrev m");
+        // The DB stays usable: an unrelated read and a write after the failed reads.
+        reopened.Put(B("b"), B("4"));
+        Assert.AreEqual("4", GetString(reopened, "b"));
+
+        static void AssertInvalidArgument(Action read, string what)
+        {
+            RocksDbException e = Assert.ThrowsExactly<RocksDbException>(read, what);
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code, what + ": " + e.Message);
+        }
     }
 }
