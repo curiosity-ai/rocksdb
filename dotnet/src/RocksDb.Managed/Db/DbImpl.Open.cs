@@ -203,7 +203,7 @@ internal sealed partial class DbImpl
         }
         catch (RocksDbException e) when (e.SubCode == StatusSubCode.PathNotFound && !Options.CreateIfMissing)
         {
-            throw RocksDbException.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
+            throw RocksDbException.InvalidArgument(FileNames.CurrentFilePath(DbName) + ": does not exist (create_if_missing is false)");
         }
 
         InitInfoLog();
@@ -211,7 +211,7 @@ internal sealed partial class DbImpl
         bool exists = Options.BestEffortsRecovery ? HasNonEmptyManifest() : FileSystem.FileExists(FileNames.CurrentFilePath(DbName));
         if (!exists)
         {
-            if (!Options.CreateIfMissing) ThrowHelper.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
+            if (!Options.CreateIfMissing) ThrowHelper.InvalidArgument(FileNames.CurrentFilePath(DbName) + ": does not exist (create_if_missing is false)");
             await NewDbAsync(descriptors[DefaultColumnFamilyName], synchronous, ct).ConfigureAwait(false);
         }
         else if (Options.ErrorIfExists)

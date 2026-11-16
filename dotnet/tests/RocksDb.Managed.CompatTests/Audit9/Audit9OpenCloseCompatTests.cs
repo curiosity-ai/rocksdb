@@ -201,6 +201,149 @@ public sealed class Audit9OpenCloseCompatTests
         }
     }
 
+    /// <summary>
+    /// DB::OpenForReadOnly (db_impl_readonly.cc) and DB::OpenAsSecondary (db_impl_secondary.cc) on a closed DB with an
+    /// unflushed WAL, a TryCatchUpWithPrimary and the close: the primary's directory keeps the same files as native
+    /// (read-only opens rotate the info LOG like native, nothing else is written or deleted; the secondary writes only
+    /// into its own directory; the port's secondary writes no info LOG there, native's does).
+    /// </summary>
+    [TestMethod]
+    public void ReadOnlyAndSecondaryOpensLeaveTheFilesNativeLeaves()
+    {
+        using var nativeDir = new TempDir("a9-ro-native");
+        using var managedDir = new TempDir("a9-ro-managed");
+        string nativeDb = System.IO.Path.Combine(nativeDir.Path, "db"), managedDb = System.IO.Path.Combine(managedDir.Path, "db");
+        string nativeSec = System.IO.Path.Combine(nativeDir.Path, "sec"), managedSec = System.IO.Path.Combine(managedDir.Path, "sec");
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), nativeDb))
+        {
+            db.Put(U("a"), U("1"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            db.Put(U("b"), U("2"));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDb, new DbOptions { CreateIfMissing = true }))
+        {
+            db.Put(U("a"), U("1"));
+            db.Flush();
+            db.Put(U("b"), U("2"));
+        }
+        string nativeBefore = Listing(nativeDb), managedBefore = Listing(managedDb);
+        Assert.AreEqual(nativeBefore, managedBefore);
+
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.OpenReadOnly(new RocksDbSharp.DbOptions(), nativeDb, false)) Assert.AreEqual("2", db.Get("b"));
+        using (RocksDatabase db = RocksDatabase.OpenReadOnly(managedDb, new DbOptions())) Assert.AreEqual("2", Encoding.UTF8.GetString(db.Get(U("b"))!));
+        string nativeRo = Listing(nativeDb), managedRo = Listing(managedDb);
+        Assert.AreEqual(nativeRo, managedRo, "after a read-only open and close");
+
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.OpenAsSecondary(new RocksDbSharp.DbOptions(), nativeDb, nativeSec))
+        {
+            db.TryCatchUpWithPrimary();
+            Assert.AreEqual("2", db.Get("b"));
+        }
+        using (RocksDatabase db = RocksDatabase.OpenAsSecondary(managedDb, managedSec, new DbOptions(),
+            [new ColumnFamilyDescriptor("default", new ColumnFamilyOptions())]))
+        {
+            db.TryCatchUpWithPrimary();
+            Assert.AreEqual("2", Encoding.UTF8.GetString(db.Get(U("b"))!));
+        }
+        Assert.AreEqual(nativeRo, Listing(nativeDb), "native: the secondary changed nothing in the primary's directory");
+        Assert.AreEqual(managedRo, Listing(managedDb), "managed: the secondary changed nothing in the primary's directory");
+        // Native keeps the secondary's info LOG in the secondary directory (OpenAsSecondary: "db_log_dir" defaults to
+        // secondary_path); the port's read-only and secondary opens write no info LOG at all (harmless deviation).
+        Assert.AreEqual("LOG x1, ", Listing(nativeSec));
+        Assert.AreEqual("", Listing(managedSec));
+    }
+
+    /// <summary>
+    /// DBImpl::Recover: opening a path without CURRENT and with create_if_missing = false is InvalidArgument
+    /// "&lt;dbname&gt;/CURRENT: does not exist (create_if_missing is false)" (the port named the directory, not CURRENT).
+    /// Native creates the directory first (DBImpl::Open: CreateDirIfMissing of the WAL dir and SetDirectories) and leaves
+    /// it with its LOG and LOCK; the port leaves nothing (harmless deviation).
+    /// </summary>
+    [TestMethod]
+    public void OpenWithoutCreateIfMissingReportsLikeNative()
+    {
+        using var root = new TempDir("a9-missing");
+        string nativePath = System.IO.Path.Combine(root.Path, "native"), managedPath = System.IO.Path.Combine(root.Path, "managed");
+        string? nativeError = null;
+        try
+        {
+            using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions(), nativePath);
+        }
+        catch (RocksDbSharp.RocksDbException e)
+        {
+            nativeError = e.Message;
+        }
+        RocksDbException managed = Assert.ThrowsExactly<RocksDbException>(() => RocksDatabase.Open(managedPath, new DbOptions()));
+        Assert.AreEqual(StatusCode.InvalidArgument, managed.Code);
+        Assert.AreEqual(nativeError!.Replace(nativePath, "<db>", StringComparison.Ordinal), managed.Message.Replace(managedPath, "<db>", StringComparison.Ordinal));
+        Assert.IsTrue(Directory.Exists(nativePath), "native creates the directory");
+        Assert.IsFalse(Directory.Exists(managedPath), "the port does not");
+    }
+
+    /// <summary>
+    /// DBImpl::Open -> DeleteObsoleteFiles (full scan, db_impl_files.cc FindObsoleteFiles / PurgeObsoleteFiles) and
+    /// MaybeUpdateNextFileNumber: files a crashed process left behind -- a table file in no version (numbered above and
+    /// below next_file_number), a blob file in no version (kept: ShouldKeepBlobFileDuringPurge, no footer), temp files
+    /// (*.dbtmp, OPTIONS-*.dbtmp), an old WAL and an old MANIFEST -- are deleted or kept as native does, and the DB then
+    /// writes new files without colliding with them.
+    /// </summary>
+    [TestMethod]
+    public void LeftoverFilesAreCleanedUpAtOpenLikeNative()
+    {
+        string[] junk = ["000003.sst", "000900.sst", "000901.blob", "000902.dbtmp", "OPTIONS-000903.dbtmp", "000001.log", "MANIFEST-000002", "000904.log"];
+        using var nativeDir = new TempDir("a9-junk-native");
+        using var managedDir = new TempDir("a9-junk-managed");
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), nativeDir.Path))
+        {
+            db.Put(U("a"), U("1"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }))
+        {
+            db.Put(U("a"), U("1"));
+            db.Flush();
+        }
+        foreach (string dir in new[] { nativeDir.Path, managedDir.Path })
+        {
+            foreach (string j in junk)
+            {
+                string p = System.IO.Path.Combine(dir, j);
+                if (!File.Exists(p)) File.WriteAllBytes(p, U("junk"));
+            }
+        }
+        static string Remaining(string dir, string[] names)
+        {
+            var left = new List<string>();
+            foreach (string n in names)
+            {
+                if (File.Exists(System.IO.Path.Combine(dir, n))) left.Add(n);
+            }
+            return string.Join(",", left);
+        }
+        string nativeBefore = Remaining(nativeDir.Path, junk), managedBefore = Remaining(managedDir.Path, junk);
+        using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), nativeDir.Path))
+        {
+            db.Put(U("b"), U("2"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            Assert.AreEqual("1", db.Get("a"));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true }))
+        {
+            db.Put(U("b"), U("2"));
+            db.Flush();
+            Assert.AreEqual("1", Encoding.UTF8.GetString(db.Get(U("a"))!));
+        }
+        string nativeAfter = Remaining(nativeDir.Path, junk), managedAfter = Remaining(managedDir.Path, junk);
+        Console.WriteLine("native:  " + nativeBefore + " -> " + nativeAfter + " | " + Listing(nativeDir.Path));
+        Console.WriteLine("managed: " + managedBefore + " -> " + managedAfter + " | " + Listing(managedDir.Path));
+        // PurgeObsoleteFiles keeps every OPTIONS-*.dbtmp ("TODO(yhchiang): carefully modify the third condition to safely
+        // remove the temp options files"); the port deletes a leftover one at open, when no OPTIONS write can be running
+        // (harmless deviation). Everything else matches.
+        Assert.AreEqual("000901.blob,OPTIONS-000903.dbtmp", nativeAfter);
+        Assert.AreEqual("000901.blob", managedAfter);
+        Assert.AreEqual(Listing(nativeDir.Path).Replace("OPTIONS.dbtmp x1, ", "", StringComparison.Ordinal), Listing(managedDir.Path));
+    }
+
     /// <summary>A failed open of the DB at a path (whose DB has a column family "cf1").</summary>
     public enum FailedOpen { MissingColumnFamily, UnlistedColumnFamily, ErrorIfExists, LockHeld }
 

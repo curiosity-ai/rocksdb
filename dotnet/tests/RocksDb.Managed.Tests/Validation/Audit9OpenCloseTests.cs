@@ -211,7 +211,11 @@ public sealed class Audit9OpenCloseTests
         o.WalDir = s == OpenScenario.SeparateWalDir ? WalDirPath : "";
         o.TrackAndVerifyWalsInManifest = s == OpenScenario.WalsTrackedInManifest;
         o.BestEffortsRecovery = s == OpenScenario.BestEffortsRecovery;
-        if (s == OpenScenario.ManifestRoll) o.MaxManifestFileSize = 1024;
+        if (s == OpenScenario.ManifestRoll)
+        {
+            o.MaxManifestFileSize = 1024;
+            o.MaxManifestSpaceAmpPct = 0;
+        }
         return o;
     }
 
@@ -572,5 +576,82 @@ public sealed class Audit9OpenCloseTests
             }
             Assert.IsTrue(crashAt < 400, s + ": unexpected number of crash points " + crashAt);
         }
+    }
+
+    // ---- read-only and secondary ---------------------------------------------------------------------------------
+
+    /// <summary>
+    /// DBImplReadOnly (db/db_impl/db_impl_readonly.cc): a read-only open replays the WALs into memtables and never
+    /// creates, writes, renames or deletes a file -- also not on close (CloseHelper skips the purge with read_only_), and
+    /// not with an unflushed WAL holding several column families' data.
+    /// </summary>
+    [TestMethod]
+    public void ReadOnlyOpenAndCloseMutateNothing()
+    {
+        var mem = NewMemFs();
+        var fs = new FaultInjectionFileSystem(mem);
+        using (RocksDatabase db = RocksDatabase.Open(Path, Options(fs)))
+        {
+            for (int i = 0; i < 50; i++) db.Put(Key(i), Value(i, i));
+            db.Flush();
+            for (int i = 50; i < 80; i++) db.Put(Key(i), Value(i, i));
+        }
+        fs.OpLog = new();
+        using (RocksDatabase ro = RocksDatabase.OpenReadOnly(Path, Options(fs)))
+        {
+            for (int i = 0; i < 80; i++) Assert.IsNotNull(ro.Get(Key(i)));
+            using Iterator it = ro.NewIterator();
+            int n = 0;
+            for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+            Assert.AreEqual(80, n);
+        }
+        Assert.AreEqual("", string.Join("; ", fs.OpLog), "a read-only open mutated files");
+        Assert.AreEqual(0, fs.OpenFiles);
+    }
+
+    /// <summary>
+    /// DBImplSecondary (db/db_impl/db_impl_secondary.cc): a secondary follows an in-process primary through MANIFEST
+    /// rotations (max_manifest_file_size) and WAL switches with TryCatchUpWithPrimary, writes only into its own
+    /// directory, and its close deletes none of the primary's files (no purge of a directory it does not own).
+    /// </summary>
+    [TestMethod]
+    public void SecondaryFollowsManifestRotationAndTouchesOnlyItsOwnDirectory()
+    {
+        var mem = NewMemFs();
+        var primaryFs = new FaultInjectionFileSystem(mem);
+        var secondaryFs = new FaultInjectionFileSystem(mem) { OpLog = new() };
+        DbOptions po = Options(primaryFs);
+        po.MaxManifestFileSize = 512;
+        po.MaxManifestSpaceAmpPct = 0;
+        using RocksDatabase primary = RocksDatabase.Open(Path, po);
+        primary.Put(Key(0), Value(0, 0));
+        primary.Flush();
+        const string secPath = "/audit9sec";
+        RocksDatabase secondary = RocksDatabase.OpenAsSecondary(Path, secPath, new DbOptions { FileSystem = secondaryFs },
+            [new ColumnFamilyDescriptor("default", new ColumnFamilyOptions())]);
+        try
+        {
+            var manifests = new HashSet<string>();
+            for (int round = 1; round <= 6; round++)
+            {
+                for (int i = 0; i < 10; i++) primary.Put(Key(round * 10 + i), Value(round * 10 + i, round));
+                primary.Flush(); // a MANIFEST write; above 512 bytes the next one starts a new MANIFEST
+                foreach (string f in mem.GetChildren(Path))
+                {
+                    if (f.StartsWith("MANIFEST-", StringComparison.Ordinal)) manifests.Add(f);
+                }
+                secondary.TryCatchUpWithPrimary();
+                for (int i = 0; i < 10; i++)
+                    Assert.AreEqual(S(Value(round * 10 + i, round)), S(secondary.Get(Key(round * 10 + i))), "round " + round);
+            }
+            Assert.IsTrue(manifests.Count > 1, "the primary never rotated its MANIFEST");
+        }
+        finally
+        {
+            secondary.Dispose();
+        }
+        foreach (string op in secondaryFs.OpLog)
+            Assert.IsTrue(op.Contains(secPath, StringComparison.Ordinal), "the secondary mutated a file outside its directory: " + op);
+        for (int i = 10; i < 70; i++) Assert.IsNotNull(primary.Get(Key(i)), "the primary lost key " + i);
     }
 }
