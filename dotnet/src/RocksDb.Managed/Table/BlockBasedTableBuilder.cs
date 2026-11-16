@@ -725,11 +725,12 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         if ((ulong)value.Length > uint.MaxValue) ThrowHelper.InvalidArgument("Embedded blob value is too large");
         ulong offset = _offset;
         const CompressionType compression = CompressionType.None; // placeholder upstream: payloads are uncompressed
-        _out.Write(value);
-        Span<byte> trailer = _out.GetSpan(BlockBasedTableConstants.BlockTrailerSize);
+        Span<byte> dst = _out.GetSpan(value.Length + BlockBasedTableConstants.BlockTrailerSize); // one reservation, see WriteMaybeCompressedBlock
+        value.CopyTo(dst);
+        Span<byte> trailer = dst.Slice(value.Length, BlockBasedTableConstants.BlockTrailerSize);
         trailer[0] = (byte)compression;
         Coding.EncodeFixed32(trailer[1..], BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, value, (byte)compression, offset));
-        _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
+        _out.Advance(value.Length + BlockBasedTableConstants.BlockTrailerSize);
         _offset += (ulong)value.Length + BlockBasedTableConstants.BlockTrailerSize;
         _embeddedBlobCount++;
         _embeddedBlobBytes += (ulong)value.Length;
@@ -824,14 +825,17 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         }
         var handle = new BlockHandle(_offset, (ulong)contents.Length);
         _compressionTypesUsed |= 1u << ((int)type & 31);
-        _out.Write(contents);
-        Span<byte> trailer = _out.GetSpan(BlockBasedTableConstants.BlockTrailerSize);
+        // One reservation for the block and its trailer: reserving the trailer after the block would grow the buffer a
+        // second time (doubling it) right after it was sized for the block, which for a block near 1 GiB needs a 2 GiB copy.
+        Span<byte> dst = _out.GetSpan(contents.Length + BlockBasedTableConstants.BlockTrailerSize);
+        contents.CopyTo(dst);
+        Span<byte> trailer = dst.Slice(contents.Length, BlockBasedTableConstants.BlockTrailerSize);
         trailer[0] = (byte)type;
         uint checksum = hasRawChecksum
             ? rawChecksum + BlockChecksum.ChecksumModifierForContext(_baseContextChecksum, _offset)
             : BlockChecksum.ComputeTrailerChecksum(_options.Checksum, _baseContextChecksum, contents, (byte)type, _offset);
         Coding.EncodeFixed32(trailer[1..], checksum);
-        _out.Advance(BlockBasedTableConstants.BlockTrailerSize);
+        _out.Advance(contents.Length + BlockBasedTableConstants.BlockTrailerSize);
         _offset += (ulong)contents.Length + BlockBasedTableConstants.BlockTrailerSize;
         if (_alignment > 0 && isDataBlock)
         {
@@ -869,6 +873,8 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     /// <summary>Finishes the table: writes remaining data, filter, index, range-del, properties, metaindex and footer, then flushes the file.</summary>
     public override void Finish()
     {
+        FinishDataBlocks();
+        DrainOutput();
         FinishCore();
         DrainOutput();
         _file.Flush();
@@ -877,6 +883,8 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
     /// <summary>Async <see cref="Finish"/>.</summary>
     public override async ValueTask FinishAsync(CancellationToken cancellationToken = default)
     {
+        FinishDataBlocks();
+        await DrainOutputAsync(cancellationToken).ConfigureAwait(false);
         using var metaIndex = new MetaIndexBuilder();
         BlockHandle indexHandle = FinishHead(metaIndex);
         if (FinishRangeDelBlock() >= OutputFlushThreshold)
@@ -896,7 +904,10 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Port of BlockBasedTableBuilder::Finish (meta block order: filter, index, [dict], range del, properties, metaindex, footer).</summary>
+    /// <summary>
+    /// Port of BlockBasedTableBuilder::Finish (meta block order: filter, index, [dict], range del, properties, metaindex,
+    /// footer), after <see cref="FinishDataBlocks"/>.
+    /// </summary>
     private void FinishCore()
     {
         using var metaIndex = new MetaIndexBuilder();
@@ -913,8 +924,11 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         WriteFooter(metaindexHandle, indexHandle);
     }
 
-    /// <summary>The remaining data blocks and the meta blocks before the range-del block (filter, index, dictionary).</summary>
-    private BlockHandle FinishHead(MetaIndexBuilder metaIndex)
+    /// <summary>
+    /// Writes the remaining data blocks. The caller drains the staged output before the meta blocks are staged, so that
+    /// a last data block near the 1 GiB entry limit is not copied again when the index block is appended behind it.
+    /// </summary>
+    private void FinishDataBlocks()
     {
         if (_closed) throw new InvalidOperationException("Table builder already finished.");
         Flush(default, hasNext: false);
@@ -923,7 +937,11 @@ public sealed partial class BlockBasedTableBuilder : TableBuilder
         if (_pc is not null) StopParallelCompression(abort: false);
         _closed = true;
         _props.TailStartOffset = _offset;
+    }
 
+    /// <summary>The meta blocks before the range-del block (filter, index, dictionary), after <see cref="FinishDataBlocks"/>.</summary>
+    private BlockHandle FinishHead(MetaIndexBuilder metaIndex)
+    {
         WriteFilterBlock(metaIndex);
         BlockHandle indexHandle = WriteIndexBlock(metaIndex);
         WriteCompressionDictBlock(metaIndex);

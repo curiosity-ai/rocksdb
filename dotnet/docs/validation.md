@@ -1075,8 +1075,9 @@ C++ reference: `WriteBatchInternal::Put` / `Merge` / `Delete` / `DeleteRange` / 
   later append copy the whole buffer: opening a native WAL with a 1.5 GiB record never finished.
 - **Tests:** `DbBasicTests.KeysAndValuesOverTheLimitAreRejectedWithoutStoppingTheDatabase` (every write path, over
   never-touched unmanaged memory), `RocksArrayPoolTests.PooledBufferWriterGrowthStaysGeometricPastOneGiB`, and
-  `DbCompatTests.ManagedReadsAValueOverItsWriteLimitThatNativeWrote` (a 1.5 GiB native value in the WAL and in an
-  SST; needs about 8 GB of memory, so it runs only with `HUGE_ENTRIES=1`).
+  `DbCompatTests.ManagedReadsAValueOverItsWriteLimitThatNativeWrote` (a 1.1 GiB native value in the WAL and in an
+  SST; needs about 8 GB of memory, so it runs only with `HUGE_ENTRIES=1`). One such entry costs several times its size
+  in memory on its way through recovery and flush (record buffer, memtable entry, the data block while it grows).
 
 ### GenericRateLimiter statistics test: timing assumption, not a race
 

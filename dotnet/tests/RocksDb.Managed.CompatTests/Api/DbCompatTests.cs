@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using RocksDb.Managed.CompatTests.Infrastructure;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Compression;
 using RocksDb.Managed.Env;
 using static RocksDb.Managed.CompatTests.Wal.NativeDbHelper;
 using RocksDb.Managed.Table.Filters;
@@ -347,7 +348,9 @@ public sealed class DbCompatTests
     /// (1 GiB) but must still open and read a database native wrote with a larger value, from its WAL and from an SST.
     /// Before: a WAL holding a 1 GiB value failed to open ("memtable entry too large"), and one holding a 1.5 GiB value
     /// never finished opening (the record buffer's growth overflowed past 1 GiB and turned quadratic).
-    /// Needs about 8 GB of memory, so it runs only with HUGE_ENTRIES=1.
+    /// 1.1 GiB, just over the write limit, uncompressed: one such entry costs several times its size in memory on the
+    /// way through recovery and flush (record buffer, memtable, block buffer while it grows, the value read back), so
+    /// the test needs about 8 GB and runs only with HUGE_ENTRIES=1.
     /// </summary>
     [TestMethod]
     [DataRow(false, DisplayName = "in the WAL")]
@@ -356,16 +359,16 @@ public sealed class DbCompatTests
     {
         if (Environment.GetEnvironmentVariable("HUGE_ENTRIES") != "1") Assert.Inconclusive("set HUGE_ENTRIES=1 to run (needs about 8 GB of memory)");
         using var dir = new TempDir("huge-value");
-        const int Size = 1536 << 20;
+        const int Size = 1100 << 20;
         byte[] value = new byte[Size];
         for (int i = 0; i < value.Length; i += 4096) value[i] = (byte)(i >> 12);
-        using (var db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true), dir.Path))
+        using (var db = RocksDbSharp.RocksDb.Open(new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetCompression(RocksDbSharp.Compression.No), dir.Path))
         {
             db.Put(U("huge"), value);
             db.Put(U("small"), U("s"));
             if (flushed) db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
         }
-        using (RocksDatabase m = RocksDatabase.Open(dir.Path, new DbOptions()))
+        using (RocksDatabase m = RocksDatabase.Open(dir.Path, new DbOptions(), new ColumnFamilyOptions { Compression = CompressionType.None }))
         {
             byte[]? got = m.Get(U("huge"));
             Assert.IsNotNull(got);
