@@ -2202,6 +2202,12 @@ Replication layer (reference: rocksdb-sharp):
 - Silent data loss without an error, in every recovery mode: a zeroed record header, a CRC-valid broken zstd WAL frame, a
   removed or empty WAL, a whole record cut out (sequence gap). Port matches native.
 
+- Upstream issue drafts, each reproduced with a C API program against native 11.12 and checked unchanged on `main`
+  (`upstream-issues/`): 08 log reader hang on a recyclable type, 09 LZ4 size 0xFFFFFFFF accepted, 10 huge block handle
+  aborts the process, 11 short TimedPut value aborts every open, 12 restore ignores a failed stale-WAL delete, 13 WAL
+  records dropped without a report (a zeroed header mid-log leaves a hole; a CRC-valid broken zstd frame), 14
+  UserWriteCallback not exception safe (audit #8).
+
 ### Open
 
 - `GetUpdatesSince` stopped on a damaged recycled record below LastSequence ends with OK; native returns TryAgain "Create
