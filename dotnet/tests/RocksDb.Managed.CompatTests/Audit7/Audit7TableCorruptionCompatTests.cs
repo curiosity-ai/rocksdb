@@ -381,4 +381,37 @@ public sealed unsafe class Audit7TableCorruptionCompatTests
             for (int i = 0; i < n; i++) Assert.AreEqual("found:" + Encoding.ASCII.GetString(V(i)), managed[i], name + " key " + i);
         }
     }
+
+    /// <summary>
+    /// The managed expansion bound on stored uncompressed sizes (BlockCompression.CheckedUncompressedSize) never rejects
+    /// a block native wrote: maximally compressible 4 MiB values (one data block each) compressed by native snappy,
+    /// LZ4, ZSTD and zlib (and blob files with the same codecs) read back through the managed DB.
+    /// </summary>
+    [TestMethod]
+    public void NativeHighRatioBlocksReadBack()
+    {
+        foreach (CompressionType t in new[] { CompressionType.Snappy, CompressionType.LZ4, CompressionType.Zstd, CompressionType.Zlib })
+        {
+            using var dir = new TempDir("a7-highratio");
+            byte[] zeros = new byte[4 << 20];
+            byte[] ones = new byte[1 << 20];
+            ones.AsSpan().Fill((byte)'x');
+            RocksDbSharp.DbOptions o = NativeOptions(NativeCompression(t), 7, (char)1, 0, bloom: false);
+            using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, dir.Path))
+            {
+                db.Put(B("a"), zeros);
+                db.Put(B("b"), ones);
+                db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            }
+            using (SstFile f = SstFile.Open(Directory.GetFiles(dir.Path, "*.sst").Single(), new TableReaderOptions()))
+            {
+                BlockHandle h = f.DataBlockHandles()[0];
+                Assert.AreEqual(t, f.BlockCompressionType(h), t + ": stored compressed");
+                Console.WriteLine(t + ": first data block " + h.Size + " bytes stored");
+            }
+            using RocksDatabase mdb = RocksDatabase.Open(dir.Path, new DbOptions(), ManagedOptions(t, 7, ChecksumType.Crc32c, 0, bloom: false));
+            CollectionAssert.AreEqual(zeros, mdb.Get(B("a")), t + " a");
+            CollectionAssert.AreEqual(ones, mdb.Get(B("b")), t + " b");
+        }
+    }
 }

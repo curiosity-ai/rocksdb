@@ -88,11 +88,26 @@ public sealed class Audit7TableCorruptionTests
         lookups.Add(TableTestUtil.IKey("a"u8, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek));
         lookups.Add(TableTestUtil.IKey("zz"u8, DbFormat.MaxSequenceNumber, DbFormat.ValueTypeForSeek));
         lookups.Sort((a, b) => InternalKeyComparator.Bytewise.Compare(a, b));
-        byte[] data = TableTestUtil.BuildTable(entries, format,
-            new TableBuilderOptions { PrefixExtractor = pe, CompressionType = ctype, CompressionOptions = compression });
+        // A trie user-defined index (utilities/trie_index) in a quarter of the tables.
+        BlockBasedIndexMode mode = rnd.Next(4) == 0
+            ? (new[] { BlockBasedIndexMode.StandardDefault, BlockBasedIndexMode.CustomDefault, BlockBasedIndexMode.CustomOnly })[rnd.Next(3)]
+            : BlockBasedIndexMode.StandardOnly;
+        byte[] data;
+        try
+        {
+            data = TableTestUtil.BuildTable(entries, mode == BlockBasedIndexMode.StandardOnly ? format : format with { UserDefinedIndexFactory = TrieIndexFactory.Instance, IndexMode = mode },
+                new TableBuilderOptions { PrefixExtractor = pe, CompressionType = ctype, CompressionOptions = compression });
+        }
+        catch (RocksDbException e) when (mode != BlockBasedIndexMode.StandardOnly && e.Code is StatusCode.InvalidArgument or StatusCode.NotSupported)
+        {
+            mode = BlockBasedIndexMode.StandardOnly; // a combination the trie index does not support
+            data = TableTestUtil.BuildTable(entries, format,
+                new TableBuilderOptions { PrefixExtractor = pe, CompressionType = ctype, CompressionOptions = compression });
+        }
         var ro = new TableReaderOptions { FilterPolicy = policy, PrefixExtractor = pe, MaxAutoReadaheadSize = rnd.Next(2) == 0 ? 0 : 256 * 1024 };
+        if (mode != BlockBasedIndexMode.StandardOnly) ro = ro with { UserDefinedIndexFactory = TrieIndexFactory.Instance, IndexMode = mode };
         string trace = $"seed={seed} index={indexType} fv={fv} checksum={checksum} comp={ctype} dict={compression.MaxDictBytes} filter={policy?.GetType().Name} "
-            + $"pf={format.PartitionFilters} hash={format.DataBlockIndexType} sep={format.SeparateKeyValueInDataBlock} pe={pe is not null} n={n} size={data.Length}";
+            + $"pf={format.PartitionFilters} hash={format.DataBlockIndexType} sep={format.SeparateKeyValueInDataBlock} pe={pe is not null} udi={mode} n={n} size={data.Length}";
         return new Built(data, ro, lookups, trace);
     }
 
@@ -274,6 +289,7 @@ public sealed class Audit7TableCorruptionTests
         int tables = Environment.GetEnvironmentVariable("AUDIT7_TABLE_ROUNDS") is { } r ? int.Parse(r, System.Globalization.CultureInfo.InvariantCulture) : 200;
         const int mutationsPerTable = 40;
         var codes = new Dictionary<StatusCode, int>();
+        int udiTables = 0;
         var failures = new List<string>();
         var sw = System.Diagnostics.Stopwatch.StartNew();
         for (int t = 0; t < tables && failures.Count < 20; t++)
@@ -281,6 +297,7 @@ public sealed class Audit7TableCorruptionTests
             int seed = baseSeed + t;
             var rnd = new Random(seed);
             Built b = BuildRandomTable(rnd, seed);
+            if (!b.Trace.Contains("udi=StandardOnly", StringComparison.Ordinal)) udiTables++;
             // The unmodified table must read cleanly.
             try
             {
@@ -313,7 +330,7 @@ public sealed class Audit7TableCorruptionTests
                 }
             }
         }
-        Console.WriteLine($"elapsed={sw.Elapsed} codes=" + string.Join(",", codes.Select(kv => kv.Key + ":" + kv.Value)));
+        Console.WriteLine($"elapsed={sw.Elapsed} udiTables={udiTables} codes=" + string.Join(",", codes.Select(kv => kv.Key + ":" + kv.Value)));
         if (failures.Count > 0) Assert.Fail(failures.Count + " failures:\n" + string.Join("\n\n", failures.Take(8)));
     }
 
@@ -745,5 +762,238 @@ public sealed class Audit7TableCorruptionTests
         for (it.SeekToFirst(); it.Valid; it.Next()) n++;
         Assert.AreEqual(entries.Count, n);
         Assert.IsTrue(GC.GetAllocatedBytesForCurrentThread() - before < 16 << 20, "allocation sized by num_entries");
+    }
+
+    private static bool IsExpectedStatus(RocksDbException e) =>
+        e.Code is StatusCode.Corruption or StatusCode.NotSupported
+        || (e.Code == StatusCode.InvalidArgument && e.Message.Contains("stub standard index", StringComparison.Ordinal))
+        || (e.Code == StatusCode.IOError && e.Message.StartsWith("IO error: While pread offset", StringComparison.Ordinal));
+
+    /// <summary>
+    /// DB-level mutation fuzz: one table file of a closed DB (MemoryFileSystem) is damaged, then the DB is opened
+    /// (paranoid_checks on and off, max_open_files -1 and 10) and read with Get / MultiGet / forward and backward
+    /// scans, with verify_checksums on and off. VersionBuilder::LoadTableHandlers, TableCache::FindTable, the level and
+    /// merging iterators and DBIter only let Corruption-type statuses through (or return correct results).
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000)]
+    public void MutatedTableInDbFailsWithStatusOnly()
+    {
+        int baseSeed = Environment.GetEnvironmentVariable("AUDIT7_TABLE_SEED") is { } sd ? int.Parse(sd, System.Globalization.CultureInfo.InvariantCulture) : 4242;
+        int rounds = Environment.GetEnvironmentVariable("AUDIT7_TABLE_ROUNDS") is { } r ? int.Parse(r, System.Globalization.CultureInfo.InvariantCulture) : 120;
+        var failures = new List<string>();
+        int statuses = 0;
+        for (int round = 0; round < rounds && failures.Count < 10; round++)
+        {
+            int seed = baseSeed + round * 7919;
+            var rnd = new Random(seed);
+            if (round % 20 == 0 || _dbImage is null) _dbImage = BuildDbImage(rnd, out _dbCfo, out _dbModel);
+            Dictionary<string, byte[]> image = _dbImage!;
+            var fs = new RocksDb.Managed.Env.MemoryFileSystem();
+            fs.CreateDirectoryIfMissing("/db");
+            foreach (KeyValuePair<string, byte[]> kv in image)
+            {
+                using RocksDb.Managed.Env.IWritableFile w = fs.CreateWritable(kv.Key);
+                w.Append(kv.Value);
+                w.Sync();
+            }
+            string[] ssts = image.Keys.Where(k => k.EndsWith(".sst", StringComparison.Ordinal)).OrderBy(k => k, StringComparer.Ordinal).ToArray();
+            string victim = ssts[rnd.Next(ssts.Length)];
+            byte[] damaged = Mutate(rnd, image[victim], out string what);
+            using (RocksDb.Managed.Env.IWritableFile w = fs.CreateWritable(victim))
+            {
+                w.Append(damaged);
+                w.Sync();
+            }
+            var dbo = new DbOptions { FileSystem = fs, ParanoidChecks = rnd.Next(2) == 0, MaxOpenFiles = rnd.Next(2) == 0 ? -1 : 10 };
+            var ro = new ReadOptions { VerifyChecksums = rnd.Next(2) == 0, FillCache = rnd.Next(2) == 0 };
+            string trace = $"seed={seed} {victim} {what} paranoid={dbo.ParanoidChecks} maxOpen={dbo.MaxOpenFiles} verify={ro.VerifyChecksums}";
+            try
+            {
+                using RocksDatabase db = RocksDatabase.Open("/db", dbo, _dbCfo!);
+                // Every block, the footer (format_version >= 6) and the meta blocks are checksummed: a read that
+                // succeeds must return the right value.
+                bool checkResults = ro.VerifyChecksums && _dbCfo!.TableOptions.Checksum != ChecksumType.NoChecksum && _dbCfo.TableOptions.FormatVersion >= 6;
+                for (int i = 0; i < 40; i++)
+                {
+                    string key = "key" + rnd.Next(0, 700).ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
+                    try
+                    {
+                        byte[]? v = db.Get(ro, System.Text.Encoding.ASCII.GetBytes(key));
+                        if (checkResults)
+                        {
+                            _dbModel!.TryGetValue(key, out string? expected);
+                            Assert.AreEqual(expected, v is null ? null : System.Text.Encoding.ASCII.GetString(v), trace + ": wrong result for " + key);
+                        }
+                    }
+                    catch (RocksDbException e) when (IsExpectedStatus(e)) { statuses++; }
+                }
+                try
+                {
+                    using var batch = new MultiGetBatch();
+                    for (int i = 0; i < 20; i++) batch.Add(System.Text.Encoding.ASCII.GetBytes("key" + rnd.Next(0, 700).ToString("D5", System.Globalization.CultureInfo.InvariantCulture)));
+                    db.MultiGet(ro, batch);
+                }
+                catch (RocksDbException e) when (IsExpectedStatus(e)) { statuses++; }
+                foreach (bool forward in new[] { true, false })
+                {
+                    try
+                    {
+                        using Iterator it = db.NewIterator(ro);
+                        int steps = 0;
+                        if (forward) for (it.SeekToFirst(); it.Valid && steps < 10_000; it.Next()) steps++;
+                        else for (it.SeekToLast(); it.Valid && steps < 10_000; it.Prev()) steps++;
+                        Assert.IsTrue(steps < 10_000, trace + ": scan did not terminate");
+                        it.Seek("key00300"u8);
+                    }
+                    catch (RocksDbException e) when (IsExpectedStatus(e)) { statuses++; }
+                }
+            }
+            catch (RocksDbException e) when (IsExpectedStatus(e))
+            {
+                statuses++;
+            }
+            catch (Exception e) when (e is not AssertFailedException)
+            {
+                failures.Add(trace + ": " + e.GetType().Name + ": " + e.Message + "\n" + e.StackTrace);
+            }
+        }
+        Console.WriteLine("statuses=" + statuses);
+        if (failures.Count > 0) Assert.Fail(failures.Count + " failures:\n" + string.Join("\n\n", failures.Take(5)));
+    }
+
+    private Dictionary<string, byte[]>? _dbImage;
+    private ColumnFamilyOptions? _dbCfo;
+    private Dictionary<string, string>? _dbModel;
+
+    private static Dictionary<string, byte[]> BuildDbImage(Random rnd, out ColumnFamilyOptions cfo, out Dictionary<string, string> model)
+    {
+        model = new Dictionary<string, string>(StringComparer.Ordinal);
+        var fs = new RocksDb.Managed.Env.MemoryFileSystem();
+        fs.CreateDirectoryIfMissing("/db");
+        int fv = rnd.Next(2, 9);
+        cfo = new ColumnFamilyOptions
+        {
+            Compression = (new[] { CompressionType.None, CompressionType.Snappy, CompressionType.LZ4, CompressionType.Zstd })[rnd.Next(4)],
+            DisableAutoCompactions = true,
+        };
+        cfo.TableOptions.FormatVersion = (uint)fv;
+        cfo.TableOptions.BlockSize = (ulong)rnd.Next(128, 1024);
+        cfo.TableOptions.Checksum = rnd.Next(2) == 0 ? ChecksumType.NoChecksum : ChecksumType.Xxh3;
+        cfo.TableOptions.IndexType = rnd.Next(3) == 0 ? IndexType.TwoLevelIndexSearch : IndexType.BinarySearch;
+        cfo.TableOptions.MetadataBlockSize = 128;
+        if (rnd.Next(2) == 0) cfo.TableOptions.FilterPolicy = new BloomFilterPolicy(10);
+        using (RocksDatabase db = RocksDatabase.Open("/db", new DbOptions { CreateIfMissing = true, FileSystem = fs }, cfo))
+        {
+            for (int f = 0; f < 3; f++)
+            {
+                for (int i = 0; i < 300; i++)
+                {
+                    string key = "key" + rnd.Next(0, 700).ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
+                    byte[] k = System.Text.Encoding.ASCII.GetBytes(key);
+                    if (rnd.Next(8) == 0)
+                    {
+                        db.Delete(k);
+                        model.Remove(key);
+                    }
+                    else
+                    {
+                        string value = "value-" + i + new string('v', rnd.Next(0, 60));
+                        db.Put(k, System.Text.Encoding.ASCII.GetBytes(value));
+                        model[key] = value;
+                    }
+                }
+                db.Flush();
+            }
+        }
+        var image = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (string name in fs.GetChildren("/db"))
+        {
+            string path = "/db/" + name;
+            if (fs.FileExists(path)) image[path] = fs.ReadAllBytes(path);
+        }
+        return image;
+    }
+
+    /// <summary>
+    /// Mutation fuzz of blob files: BlobFileReader::Create (ReadHeader / ReadFooter: magic, version, column family,
+    /// TTL, CRC) and GetBlob (IsValidBlobOffset, VerifyBlob, UncompressBlobIfNeeded) with verify_checksums on and off,
+    /// compressed and not, sync and async: only Corruption / NotSupported escape (or the right blob with checksums on).
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000)]
+    public async Task MutatedBlobFilesFailWithStatusOnly()
+    {
+        int baseSeed = Environment.GetEnvironmentVariable("AUDIT7_TABLE_SEED") is { } sd ? int.Parse(sd, System.Globalization.CultureInfo.InvariantCulture) : 777;
+        int rounds = Environment.GetEnvironmentVariable("AUDIT7_TABLE_ROUNDS") is { } r ? int.Parse(r, System.Globalization.CultureInfo.InvariantCulture) : 40;
+        const uint cfId = 3;
+        var failures = new List<string>();
+        for (int round = 0; round < rounds && failures.Count < 10; round++)
+        {
+            int seed = baseSeed + round;
+            var rnd = new Random(seed);
+            var fs = new RocksDb.Managed.Env.MemoryFileSystem();
+            fs.CreateDirectoryIfMissing("/db");
+            CompressionType ct = (new[] { CompressionType.None, CompressionType.Snappy, CompressionType.LZ4, CompressionType.Zstd, CompressionType.Zlib })[rnd.Next(5)];
+            var o = new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 0, BlobCompressionType = ct };
+            ulong number = 9;
+            var blobs = new List<(byte[] Key, byte[] Value, ulong Offset, ulong Size, CompressionType Compression)>();
+            using (var builder = new RocksDb.Managed.Db.Blob.BlobFileBuilder(fs, "/db", () => number, o, cfId, RocksDb.Managed.Db.Blob.BlobFileCreationReason.Flush,
+                       null, null, RocksDb.Managed.Env.WritableFileOptions.Default))
+            {
+                var w = new RocksDb.Managed.Util.PooledBufferWriter(32);
+                int n = rnd.Next(1, 30);
+                for (int i = 0; i < n; i++)
+                {
+                    byte[] key = System.Text.Encoding.ASCII.GetBytes("bkey" + i);
+                    byte[] value = new byte[rnd.Next(1, 3000)];
+                    if (rnd.Next(2) == 0) rnd.NextBytes(value); else value.AsSpan().Fill((byte)('a' + i % 26));
+                    w.Clear();
+                    Assert.IsTrue(builder.Add(key, value, w));
+                    RocksDb.Managed.Db.Blob.BlobIndex bi = RocksDb.Managed.Db.Blob.BlobIndex.Decode(w.WrittenSpan);
+                    blobs.Add((key, value, bi.Offset, bi.Size, bi.Compression));
+                }
+                builder.Finish();
+                w.Dispose();
+            }
+            string path = FileNames.BlobFileName("/db", number);
+            byte[] original = fs.ReadAllBytes(path);
+            for (int m = -1; m < 60; m++)
+            {
+                string what = "none";
+                byte[] d = m < 0 ? original : Mutate(rnd, original, out what);
+                using (RocksDb.Managed.Env.IWritableFile wf = fs.CreateWritable(path))
+                {
+                    wf.Append(d);
+                    wf.Sync();
+                }
+                bool verify = rnd.Next(2) == 0;
+                string trace = $"seed={seed} comp={ct} m={m} {what} verify={verify}";
+                try
+                {
+                    using RocksDb.Managed.Db.Blob.BlobFileReader reader = rnd.Next(4) == 0
+                        ? RocksDb.Managed.Db.Blob.BlobFileReader.OpenUnsealed(fs, path, cfId, null, null)
+                        : RocksDb.Managed.Db.Blob.BlobFileReader.Open(fs, path, cfId, null, null);
+                    reader.ExtendVisibleSize((ulong)d.Length);
+                    foreach ((byte[] key, byte[] value, ulong offset, ulong size, CompressionType compression) in blobs)
+                    {
+                        var output = new ArrayBufferWriter<byte>();
+                        try
+                        {
+                            if (rnd.Next(2) == 0) reader.GetBlob(key, offset, size, compression, verify, output);
+                            else await reader.GetBlobAsync(key, offset, size, compression, verify, output, CancellationToken.None);
+                            if (verify || m < 0) CollectionAssert.AreEqual(value, output.WrittenSpan.ToArray(), trace + " " + System.Text.Encoding.ASCII.GetString(key));
+                        }
+                        catch (RocksDbException e) when (m >= 0 && e.Code is StatusCode.Corruption or StatusCode.NotSupported) { }
+                    }
+                }
+                catch (RocksDbException e) when (m >= 0 && e.Code is StatusCode.Corruption or StatusCode.NotSupported) { }
+                catch (Exception e) when (e is not AssertFailedException)
+                {
+                    failures.Add(trace + ": " + e.GetType().Name + ": " + e.Message + "\n" + e.StackTrace);
+                }
+            }
+        }
+        if (failures.Count > 0) Assert.Fail(failures.Count + " failures:\n" + string.Join("\n\n", failures.Take(5)));
     }
 }
