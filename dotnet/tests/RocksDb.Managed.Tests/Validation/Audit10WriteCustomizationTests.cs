@@ -1292,4 +1292,101 @@ public sealed class Audit10WriteCustomizationTests
             lock (reasons) reasons.Add(info.CompactionReason);
         }
     }
+
+    // ---- file checksum generators across opens ----------------------------------------------------------------------
+
+    /// <summary>A factory of another checksum function (a byte sum); null for other requested names.</summary>
+    private sealed class SumChecksumFactory(bool sameNameAsCrc32c) : FileChecksumGenFactory
+    {
+        public override string Name => "Audit10SumFactory";
+
+        private string FuncName => sameNameAsCrc32c ? "FileChecksumCrc32c" : "Audit10Sum";
+
+        public override FileChecksumGenerator? CreateFileChecksumGenerator(FileChecksumGenContext context) =>
+            context.RequestedChecksumFuncName.Length == 0 || context.RequestedChecksumFuncName == FuncName ? new Gen(FuncName)
+            : context.RequestedChecksumFuncName == "Audit10Sum" ? new Gen("Audit10Sum") : null;
+
+        private sealed class Gen(string name) : FileChecksumGenerator
+        {
+            private ulong _sum;
+
+            public override string Name => name;
+
+            public override void Update(ReadOnlySpan<byte> data)
+            {
+                foreach (byte b in data) _sum += b;
+            }
+
+            public override void Finish()
+            {
+            }
+
+            public override byte[] GetChecksum() => BitConverter.GetBytes(_sum);
+        }
+    }
+
+    /// <summary>
+    /// The file checksum function changing between opens (DBImpl::VerifyChecksumInternal(use_file_checksum),
+    /// VerifyFullFileChecksum, GenerateOneFileChecksum): the name and value recorded in the MANIFEST stay with each file;
+    /// new files record the new function; VerifyFileChecksums asks the factory for each file's recorded function and
+    /// fails with InvalidArgument when it cannot create it, with Corruption when a generator of the same name computes
+    /// another value, and with InvalidArgument without a factory; a generator that throws during the verification
+    /// fails that call only.
+    /// </summary>
+    [TestMethod]
+    public void FileChecksumFunctionChangingBetweenOpens()
+    {
+        MemoryFileSystem fs = NewDbFs();
+        DbOptions Dbo(FileChecksumGenFactory? f)
+        {
+            DbOptions o = NewOptions(fs);
+            o.FileChecksumGenFactory = f;
+            return o;
+        }
+        var cfo = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator(), Level0FileNumCompactionTrigger = 100 };
+        Dictionary<string, string?> model;
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(FileChecksumGenCrc32cFactory.Instance), cfo))
+        {
+            model = WriteWorkload(db, 1);
+            db.Flush();
+            db.VerifyFileChecksums();
+        }
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(new SumChecksumFactory(false)), cfo))
+        {
+            Assert.AreEqual("FileChecksumCrc32c", db.GetLiveFilesMetadata().Single().FileChecksumFuncName);
+            var e = Assert.ThrowsExactly<RocksDbException>(db.VerifyFileChecksums);
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            StringAssert.Contains(e.Message, "Cannot get the file checksum generator based on the requested checksum function name: FileChecksumCrc32c");
+            db.Put(B("new"), B("1"));
+            model["new"] = "1";
+            db.Flush();
+            CollectionAssert.AreEquivalent(new[] { "FileChecksumCrc32c", "Audit10Sum" },
+                db.GetLiveFilesMetadata().Select(m => m.FileChecksumFuncName).ToArray());
+            AssertModel(db, model, "sum factory");
+        }
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(null), cfo))
+        {
+            var e = Assert.ThrowsExactly<RocksDbException>(db.VerifyFileChecksums);
+            Assert.AreEqual(StatusCode.InvalidArgument, e.Code);
+            AssertModel(db, model, "no factory");
+        }
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(new SumChecksumFactory(true)), cfo))
+        {
+            // The same function name as the crc32c files, another value: a mismatch.
+            var e = Assert.ThrowsExactly<RocksDbException>(db.VerifyFileChecksums);
+            Assert.AreEqual(StatusCode.Corruption, e.Code);
+            StringAssert.Contains(e.Message, "file checksum mismatch");
+        }
+        var s = new Switch();
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(new ThrowingChecksumFactory(s, ChecksumThrow.Update)), cfo))
+        {
+            // Rewrite every file with this factory's function (no trivial moves).
+            db.CompactRange(new CompactRangeOptions { BottommostLevelCompaction = BottommostLevelCompaction.Force }, null, null);
+            s.On = true;
+            Assert.IsInstanceOfType<UserCallbackException>(Capture(db.VerifyFileChecksums));
+            s.On = false;
+            db.VerifyFileChecksums();
+            AssertModel(db, model, "after a throwing verification");
+        }
+    }
 }
