@@ -202,10 +202,6 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         (long term, string candidateId, ulong lastLogSeq, long lastLogTerm) = request;
         lock (_gate)
         {
-            // While our log is being rebuilt from a snapshot we have nothing to compare the candidate's log against;
-            // granting a vote could help elect a candidate that lacks committed entries.
-            if (_resyncing) return new RequestVoteResult(_state.CurrentTerm, false);
-
             // Only a member can become leader of this cluster. A request from anyone else (a node configured for another
             // cluster, a member list that was changed on one node only) must neither get a vote - a majority here does
             // not overlap with a majority of its member list - nor move this node's term and depose its leader.
@@ -229,16 +225,73 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             string? votedFor = _state.VotedFor;
             if (votedFor != null && votedFor != candidateId) return new RequestVoteResult(_state.CurrentTerm, false);
 
-            // The candidate's log must be at least as up-to-date as ours.
-            ulong myLastSeq = _db.GetLatestSequenceNumber();
-            long myLastTerm = _state.Terms.GetTermForSeq(myLastSeq);
-            bool upToDate = lastLogTerm > myLastTerm || (lastLogTerm == myLastTerm && lastLogSeq >= myLastSeq);
+            // The candidate's log must be at least as up-to-date as ours. While our log is being rebuilt from a snapshot
+            // there is no log to compare against, only the term map that outlived it.
+            bool upToDate;
+            if (_resyncing)
+            {
+                upToDate = IsUpToDateWithoutLog(lastLogTerm, _state);
+            }
+            else
+            {
+                ulong myLastSeq = _db.GetLatestSequenceNumber();
+                long myLastTerm = _state.Terms.GetTermForSeq(myLastSeq);
+                upToDate = lastLogTerm > myLastTerm || (lastLogTerm == myLastTerm && lastLogSeq >= myLastSeq);
+            }
             if (!upToDate) return new RequestVoteResult(_state.CurrentTerm, false);
 
             _state.UpdateTermAndVote(term, candidateId);
-            _electionTimer.Reset();
+            if (!_resyncing) _electionTimer.Reset();
             return new RequestVoteResult(_state.CurrentTerm, true);
         }
+    }
+
+    /// <summary>
+    /// The vote of a member whose log is gone or being replaced: killed or powered off during a snapshot restore (which
+    /// deletes the old files before the new CURRENT arrives), or resyncing right now. Refusing every vote in that state
+    /// deadlocks a cluster whose majority is in it: the members that kept their data cannot win an election, and the
+    /// others wait for a leader to restore from. Granting a vote on an empty log could elect a candidate that lacks
+    /// entries this member helped commit.
+    /// </summary>
+    /// <remarks>
+    /// The term map outlives the log: a range is persisted before any entry of its term is accepted, it is dropped only
+    /// for entries this member never held, and adopting a leader's map only adds terms. So its last term is at least the
+    /// term of the last entry this member acknowledged. A candidate whose last log term is strictly greater has a log at
+    /// least as up-to-date as the one this member lost (Raft's election restriction, compared without the lost last
+    /// index, which is why equal terms are refused).
+    /// </remarks>
+    public static bool IsUpToDateWithoutLog(long candidateLastLogTerm, RaftPersistentState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        return candidateLastLogTerm > state.Terms.GetLast().Term;
+    }
+
+    /// <summary>
+    /// <see cref="HandleRequestVote"/> for a member that has no database yet and so no <see cref="RaftClusterNode"/>:
+    /// the host is pulling its initial snapshot. Same rules (membership, terms, the persisted vote, Bootstrap mode), with
+    /// <see cref="IsUpToDateWithoutLog"/> as the log comparison. REQUIRES: the caller serialises calls, and stops calling
+    /// before it creates the node for <paramref name="state"/>.
+    /// </summary>
+    public static RequestVoteResult HandleRequestVoteWithoutLog(RaftPersistentState state, Func<string, bool> isPeer, RequestVotePayload request)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(isPeer);
+        ArgumentNullException.ThrowIfNull(request);
+        (long term, string candidateId, _, long lastLogTerm) = request;
+        if (!isPeer(candidateId)) return new RequestVoteResult(state.CurrentTerm, false);
+        if (term > state.CurrentTerm)
+        {
+            // As in HandleRequestVote: a higher-term RequestVote proves the promotion quorum was reached somewhere.
+            if (state.Mode == ClusterMode.Bootstrap) state.SetMode(ClusterMode.Cluster);
+            state.UpdateTermAndVote(term, null);
+        }
+        if (term < state.CurrentTerm) return new RequestVoteResult(state.CurrentTerm, false);
+        if (state.Mode == ClusterMode.Bootstrap) return new RequestVoteResult(state.CurrentTerm, false);
+        string? votedFor = state.VotedFor;
+        if (votedFor != null && votedFor != candidateId) return new RequestVoteResult(state.CurrentTerm, false);
+        if (!IsUpToDateWithoutLog(lastLogTerm, state)) return new RequestVoteResult(state.CurrentTerm, false);
+        state.UpdateTermAndVote(term, candidateId);
+        return new RequestVoteResult(state.CurrentTerm, true);
     }
 
     public AppendEntriesResult HandleAppendEntries(HeartbeatPayload heartbeat)

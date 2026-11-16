@@ -48,7 +48,13 @@ public sealed class ClusterHarness : IAsyncDisposable
 
     public string DbPath(string id) => Root + "/" + id;
 
-    public async Task<ClusterNodeHost> StartAsync(string id)
+    public Task<ClusterNodeHost> StartAsync(string id) => StartAsync(id, registerFirst: false);
+
+    /// <summary>
+    /// Starts a node. With <paramref name="registerFirst"/> it is reachable while it starts, as a gRPC host is: a node
+    /// without a database then answers RPCs (votes) while it waits to pull its initial snapshot.
+    /// </summary>
+    public async Task<ClusterNodeHost> StartAsync(string id, bool registerFirst)
     {
         IFileSystem fs = WrapFileSystem?.Invoke(id, FileSystem) ?? FileSystem;
         bool archive = ArchiveWals;
@@ -75,9 +81,10 @@ public sealed class ClusterHarness : IAsyncDisposable
         });
         // Registered before starting: a follower's first stream attach and the leader's first heartbeats must reach it.
         // Its handlers are only used once StartAsync has created the node (the in-memory client resolves lazily).
+        if (registerFirst) Network.Register(id, host);
         await host.StartAsync(CancellationToken.None);
         _hosts[id] = host;
-        Network.Register(id, host);
+        if (!registerFirst) Network.Register(id, host);
         return host;
     }
 

@@ -130,6 +130,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     private RocksDatabase _db = null!;
     private RaftPersistentState _state = null!;
     private RaftClusterNode _node = null!;
+    private readonly Lock _votesWithoutNodeGate = new();
     private Task? _followerTask;
     private CancellationTokenSource? _followerCts;
     private string? _following;
@@ -202,7 +203,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             TimeProvider = _cfg.TimeProvider,
             SyncLogWrites = _cfg.SyncWal,
         };
-        _node = new RaftClusterNode(raft, _state, _db, new Transport(this));
+        var created = new RaftClusterNode(raft, _state, _db, new Transport(this));
+        // From here on the node answers votes; none answered from the persisted state alone may still be in progress.
+        lock (_votesWithoutNodeGate) Volatile.Write(ref _node, created);
         _node.LeaderChanged += OnLeaderChanged;
         _node.RoleChanged += OnRoleChanged;
         _node.ModeChanged += (_, e) => Log("mode -> " + e.Mode);
@@ -410,7 +413,23 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     // ---------------------------------------------------------------------------------------------------
     // Incoming RPCs
 
-    public RequestVoteResult HandleRequestVote(RequestVotePayload request) => _node.HandleRequestVote(request);
+    public RequestVoteResult HandleRequestVote(RequestVotePayload request)
+    {
+        RaftClusterNode? node = Volatile.Read(ref _node);
+        if (node != null) return node.HandleRequestVote(request);
+        lock (_votesWithoutNodeGate)
+        {
+            // Pulling the initial snapshot: there is no node yet, but this member still has a vote, or a cluster whose
+            // majority is restoring at once can never elect the leader they wait for (RaftClusterNode.IsUpToDateWithoutLog).
+            node = Volatile.Read(ref _node);
+            if (node != null) return node.HandleRequestVote(request);
+            RaftPersistentState? state = _state;
+            if (state == null) return new RequestVoteResult(0, false);
+            return RaftClusterNode.HandleRequestVoteWithoutLog(state, IsPeer, request);
+        }
+    }
+
+    private bool IsPeer(string nodeId) => nodeId != _cfg.NodeId && Member(nodeId) != null;
 
     public AppendEntriesResult HandleHeartbeat(HeartbeatPayload payload) => _node.HandleAppendEntries(payload);
 
@@ -722,10 +741,16 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
         CancellationToken ct = linked.Token;
+        long lastWaitLog = 0;
         while (true)
         {
             ClusterMember? source = await FindLeaderAsync(ct).ConfigureAwait(false);
             if (source == null && _state.Mode == ClusterMode.Bootstrap && !IsBootstrapPrimary) source = BootstrapMember();
+            if (source == null && Environment.TickCount64 - lastWaitLog >= 10_000)
+            {
+                lastWaitLog = Environment.TickCount64;
+                Log("no database yet: waiting for a leader to pull the snapshot from (term " + _state.CurrentTerm + ", voting on the persisted term map)");
+            }
             if (source != null)
             {
                 try
