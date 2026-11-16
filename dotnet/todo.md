@@ -443,3 +443,13 @@ Still open from this round:
 - [ ] GetUpdatesSince ends with OK where native returns TryAgain when stopped below LastSequence on a damaged recycled record (tailing design)
 - [x] OPTIONS parsing never less strict than native (empty `comparator=`, empty / malformed `blob_compression_opts`, malformed `file_checksum_gen_factory` fixed; stricter-than-native classes accepted by rule, listed in validation.md)
 - [ ] `BlockBasedTableReader.IterPool` hands out pooled `BlockIter` (a public type): not checked whether user code can hold a stale one
+
+## Audit #8 (2026-11-16; docs/validation.md "Audit #8: the asynchronous implementation")
+
+- [x] Iterator dispose during a pending async move no longer hands its pooled core to another iterator; ScanAsync goes through the iterator core (statistics, tracing, tailing renewal) and rejects overlapping MoveNextAsync; GetAsync merge chains no longer double-count tickers
+- [x] Close no longer hangs behind write-buffer-manager stalls or waits for thread-pool work; cancelled MANIFEST writes are atomic for the caller
+- [x] Transactions: range lock granted during cancellation released; lock timeouts beyond 24.8 days
+- [x] Sync/async parity differential tests for writes, reads, iterators, transactions, backup, control APIs; public async surface inventory test
+- [ ] A throwing `OnWriteEnqueued` callback strands the write queue (design decision; repro ignored)
+- [ ] Sync writers behind an async leader depend on a thread-pool continuation (write-thread design; repro ignored)
+- [ ] `AsyncPrefetchBuffer.TakePending` blocks on a pool continuation without `Prefetch` support (macOS / custom file systems; repro ignored)

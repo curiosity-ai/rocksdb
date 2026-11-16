@@ -2263,3 +2263,93 @@ options whose value or k/m/g shift overflows (native wraps), stricter integers i
 - Replication: plain follower against a transport that duplicates, loses and reorders chunks (each chunk applied once),
   cancellation at chunk boundaries, GetUpdatesSince / WalTailer statuses, snapshot receiver validation, Raft term map and
   log end durability, every catch block in Hosting / Switchover / Cluster.
+
+## Audit #8: the asynchronous implementation (2026-11-16)
+
+Four parallel reviews of the async side of the port: the async primitives and the write path; the read path and
+iterators; the file layer, background work and the async control APIs; transactions, utilities and the public async
+surface. Native RocksDB has no async API, so the reference for an async call is the port's sync path (one implementation
+for both, `synchronous: true`) and, below it, the C++ semantics of the operation; native was compared where it can
+observe the outcome. The reviews ran the sync and async APIs side by side on file systems whose async members really
+complete asynchronously (and out of order), under a deliberately exhausted thread pool, and on a single-threaded
+`SynchronizationContext`. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit8*`.
+
+### Fixed
+
+- Disposing an iterator while one of its async moves waited for a file read returned its pooled core immediately; the
+  next `NewIterator` rented it and the stale move then repositioned that unrelated iterator (k00300 -> k00305 in the
+  test). Pending async moves are now tracked (pooled, no cost when a move completes synchronously) and Dispose hands the
+  release to the move. A pending scan step then fails with ObjectDisposedException.
+- `ScanAsync` moved the inner DB iterator directly instead of going through the iterator core: no NUMBER_DB_SEEK / NEXT /
+  FOUND / ITER_BYTES_READ, no query tracing, and a tailing iterator was not renewed (after a flush ScanAsync missed writes
+  the sync `Range()` returns). Overlapping `MoveNextAsync` calls moved the iterator under a pending step; they now throw
+  InvalidOperationException, and `MoveNextAsync` after the enumeration's DisposeAsync returns false.
+- `GetAsync` restarted the table lookup synchronously for merge chains, counting block cache, filter and bytes-read
+  tickers twice (values were correct); it now uses the sync path's entry-visiting table lookup.
+- Close hung behind writes stalled by a shared `WriteBufferManager` (allow_stall): close released the first stalled
+  write, the next queued writer stalled again, and the stall loop did not observe the closing flag. It now leaves the
+  queue with ObjectDisposedException, as `DelayWrite` does (C++: DelayWrite stops at shutting_down_).
+- Dispose could block up to 35 s on a starved thread pool: the private SstFileManager's delete scheduler and the info LOG
+  writer waited for their thread-pool tasks. Dispose now waits only for a deletion in progress and drains the LOG queue
+  itself (C++ CloseHelper joins only the DB's own threads).
+- A cancelled MANIFEST write (`CreateColumnFamilyAsync`, `DropColumnFamilyAsync`, `SetOptionsAsync`) could leave the change
+  committed in the MANIFEST while the caller saw OperationCanceledException; the OPTIONS write and WAL switch after a
+  commit honoured the token too. The token now only bounds the wait for the MANIFEST writer slot; post-commit steps use
+  no token (C++ `LogAndApply` cannot be interrupted).
+- Range locks: a lock granted while its waiter was being cancelled was kept in the lock tree but never tracked by the
+  transaction, so it was never released. The grant now stands (as on the point-lock path).
+- Lock timeouts beyond int.MaxValue ms (`TimeSpan.MaxValue`, a far holder expiration) threw ArgumentOutOfRangeException
+  from the point lock manager and the default custom mutex; sync and async also diverged between 24.8 and 49.7 days.
+  Waits are now stepped (C++ `AcquireWithTimeout` / `TryLockFor` take any int64).
+- Async writes counted IOSTATS bytes_written twice on file systems without RWF_NOWAIT buffered writes (ext4);
+  `Sync()` and `SyncAsync()` on a closed file threw different exceptions; the OpenAsync documentation claimed asynchronous
+  recovery reads.
+
+### Open
+
+- A user `UserWriteCallback.OnWriteEnqueued` that throws leaves its writer linked in the write queue: every later write
+  and Dispose hang. Documented as "must not throw"; C++'s callback cannot fail. Ignored repro
+  `ThrowingOnWriteEnqueuedDoesNotStrandTheWriteQueue`.
+- A sync writer queued behind an async write leader waits for the leader's thread-pool continuation (async WAL I/O,
+  stall waits); with the pool full of sync writers a capped pool deadlocks and the default pool stalls until it injects
+  threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`.
+- `AsyncPrefetchBuffer.TakePending` blocks a compaction thread (or a sync CompactRange) on a read continuation that needs
+  a pool thread when the file system has no `Prefetch` (macOS LocalFileSystem, in-memory and custom file systems; not
+  Linux LocalFileSystem). Ignored repro `CompactionPrefetchProgressesWithThreadPoolExhausted`.
+
+### Known deviations recorded by this audit
+
+- NUMBER_SUPERVERSION_ACQUIRES / RELEASES differ between sync and async (the per-processor slot is held across an await);
+  FILE_READ_*_MICROS histograms, PerfContext timers and async read bytes_read are thread-local and not recorded (or
+  under-counted) for reads that complete on another thread.
+- GetAsync and async iterator moves do not apply `ReadOptions.Deadline` (documented); entity blob columns, the pessimistic
+  snapshot check, the optimistic commit check and backup's session-id read use synchronous I/O inside async calls.
+- Disposing an iterator whose sync moves left an async_io readahead in flight waits for the read (C++: AbortIO).
+- Queued and follower writers ignore their CancellationToken (documented); a cancelled delayed leader still consumed its
+  write-controller delay; cancelled rate-limiter waiters keep their bytes charged.
+- `CancelAllBackgroundWorkAsync(bool)` and `ResumeAsync()` take no CancellationToken (upstream has none);
+  `TryGetForUpdateAsync` rejects a null value buffer where the sync form accepts it; `TransactionDatabase` has no
+  `SingleDeleteAsync` and WriteBatchWithIndex no async GetFromBatchAndDB.
+
+### Verified
+
+- Sync/async parity, seeded: writes in all five write modes (statuses, sequence numbers, tickers, contents, invalid
+  writes), point reads and MultiGet across 13 ReadOptions variants over memtable + L0 + deeper levels with merges, range
+  deletions, entities and blob values, iterator moves incl. randomly mixed sync/async moves, ScanAsync vs Range(),
+  transactions (WriteCommitted / WritePrepared / WriteUnprepared, optimistic), backup / restore / checkpoint directories,
+  WAL tailing, control APIs (same DB files after the same program).
+- The sync API never reaches an async file member (no `SyncValueTask` fallback), also from the background work it
+  triggers. With the thread pool exhausted, sync Open / Put / Flush / CompactRange / WaitForCompact / Get / iteration /
+  Dispose progress.
+- No deadlock on a single-threaded SynchronizationContext (sync calls on the context thread, async calls awaited on it,
+  incl. a lock wait released by a sync commit); every await in the library uses ConfigureAwait (except the deliberate
+  `BackgroundThreadPool.SwitchTo`); no AggregateException escapes.
+- Cancellation: async reads cancelled while waiting for I/O leave nothing pinned and pooled objects reusable; canceled
+  writes are all-or-nothing; FlushAsync / CompactRangeAsync / WaitForCompactAsync cancellation strands nothing;
+  DisposeAsync racing them releases everyone; point-lock cancellation cleans the wait-for graph; backup cancelled
+  mid-copy is garbage-collected.
+- Mixed sync/async write groups, a failed insert reaching every writer once, async writers never resumed on a sync
+  leader's thread; concurrent sync and async MANIFEST writers; FileSyncWorkers (800 concurrent offloaded syncs, each
+  completed once, shared across DBs); async moves and scans allocate nothing in Release.
+- Public async surface inventory (300 methods): every one takes a CancellationToken and has a sync counterpart, except
+  listed and justified cases; the test fails on any change.
