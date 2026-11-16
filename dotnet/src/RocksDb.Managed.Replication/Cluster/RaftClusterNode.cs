@@ -286,7 +286,6 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         }
     }
 
-<<<<<<< HEAD
     /// <summary>
     /// The vote of a member whose log is gone or being replaced: killed or powered off during a snapshot restore (which
     /// deletes the old files before the new CURRENT arrives), or resyncing right now. Refusing every vote in that state
@@ -335,11 +334,8 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         return new RequestVoteResult(state.CurrentTerm, true);
     }
 
-    public AppendEntriesResult HandleAppendEntries(HeartbeatPayload heartbeat)
-=======
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<AppendEntriesResult> HandleAppendEntriesAsync(HeartbeatPayload heartbeat, CancellationToken cancellationToken)
->>>>>>> worktree-agent-a91bec1cc19aae85f
     {
         ArgumentNullException.ThrowIfNull(heartbeat);
         AppendEntriesResult result;
