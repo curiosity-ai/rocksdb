@@ -472,6 +472,11 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     private async ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, bool synchronous, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
+        // WriteCommittedTxnDB::Write: FailIfBatchHasTs (pessimistic_transaction_db.h).
+        if (_options.WritePolicy == TransactionWritePolicy.WriteCommitted && batch.HasKeyWithTimestamp)
+        {
+            ThrowHelper.NotSupported("Writes with timestamp must go through transaction API instead of TransactionDB.");
+        }
         if (_options.SkipConcurrencyControl)
         {
             await _db.Impl.WriteAsync(options, batch, validateColumnFamilies: true, synchronous, cancellationToken).ConfigureAwait(false);
@@ -489,12 +494,25 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
         return txn;
     }
 
+    /// <summary>
+    /// PessimisticTransactionDB::FailIfCfEnablesTs (pessimistic_transaction_db.h), checked by Put / Delete / SingleDelete
+    /// / Merge: writes to a column family with user-defined timestamps must go through a transaction.
+    /// </summary>
+    private void FailIfCfEnablesTs(ColumnFamily? cf)
+    {
+        if ((cf ?? _db.DefaultColumnFamily).Data.TimestampSize > 0)
+        {
+            ThrowHelper.NotSupported("Write operation with user timestamp must go through the transaction API instead of TransactionDB.");
+        }
+    }
+
     private void Direct(WriteOptions? options, ColumnFamily? cf, DirectOp op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         // PessimisticTransactionDB::Put / Delete / SingleDelete / Merge do not consult skip_concurrency_control (only
         // Write(batch) does): the key is always locked through an internal transaction.
         // Since the client didn't create a transaction, they don't care about conflict checking for this write. So we
         // just need to do PutUntracked().
+        FailIfCfEnablesTs(cf);
         using PessimisticTransaction txn = BeginInternalTransaction(options);
         switch (op)
         {
@@ -509,6 +527,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
     private async ValueTask DirectAsync(WriteOptions? options, ColumnFamily? cf, DirectOp op, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value,
         CancellationToken cancellationToken)
     {
+        FailIfCfEnablesTs(cf);
         using PessimisticTransaction txn = BeginInternalTransaction(options);
         await txn.WriteUntrackedAsync(cf, (byte)op, key, value, cancellationToken).ConfigureAwait(false);
         await txn.CommitAsync(cancellationToken).ConfigureAwait(false);
