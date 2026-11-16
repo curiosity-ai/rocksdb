@@ -125,6 +125,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         batch.EntityRun = true;
+        batch.ThrowIfDisposed();
         if (batch.Count == 0) return;
         SyncValueTask.GetResult(_db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None));
     }
@@ -135,6 +136,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         batch.EntityRun = true;
+        batch.ThrowIfDisposed();
         if (batch.Count == 0) return ValueTask.CompletedTask;
         return _db.MultiGetAsync(_cfd, options, batch, synchronous: false, cancellationToken);
     }

@@ -172,6 +172,9 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void DropColumnFamily(ColumnFamily columnFamily)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        // A handle of another DB would be dropped through this DB's MANIFEST and write thread (upstream: undefined
+        // behaviour, the handle is static_cast to ColumnFamilyHandleImpl).
+        CheckOwnColumnFamily(columnFamily);
         SyncValueTask.GetResult(_db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None));
         ReleaseHandle(columnFamily);
     }
@@ -200,6 +203,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public async ValueTask DropColumnFamilyAsync(ColumnFamily columnFamily, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         await _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: false, cancellationToken).ConfigureAwait(false);
         ReleaseHandle(columnFamily);
     }
@@ -375,6 +379,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public Iterator NewIterator(ColumnFamily columnFamily, ReadOptions? options)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         return columnFamily.NewIterator(options);
     }
     /// <summary>Creates an iterator over the default column family; table files are opened asynchronously.</summary>

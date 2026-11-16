@@ -38,6 +38,9 @@ public sealed partial class WriteBatch : IDisposable
     private int _savePointCount;
     private readonly int _maxBytes;
     private bool _pooled;
+    // Set by Dispose (cleared by Rent): a second Dispose is a no-op, and adding records to a disposed batch throws
+    // ObjectDisposedException instead of writing into a batch that sits in the pool or has no buffer.
+    private bool _disposed;
 
     [Flags]
     private enum ContentFlags : uint
@@ -105,6 +108,7 @@ public sealed partial class WriteBatch : IDisposable
             if (b is not null && Interlocked.CompareExchange(ref pool[i], null, b) == b)
             {
                 b._pooled = true;
+                b._disposed = false;
                 return b;
             }
         }
@@ -117,6 +121,10 @@ public sealed partial class WriteBatch : IDisposable
     /// </summary>
     public void Dispose()
     {
+        // IDisposable: calls after the first are ignored. Without this a second Dispose of a pooled batch (already in the
+        // pool) released its rep, and the next Rent handed out a batch without a header.
+        if (_disposed) return;
+        _disposed = true;
         if (_pooled && _rep.Capacity <= MaxPooledCapacity && _maxBytes == 0)
         {
             _pooled = false;
@@ -131,6 +139,17 @@ public sealed partial class WriteBatch : IDisposable
         _pooled = false;
         _rep.Dispose();
     }
+
+    /// <summary>Throws <see cref="ObjectDisposedException"/> once the batch was disposed.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void ThrowIfDisposed()
+    {
+        if (_disposed) ThrowDisposed();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(WriteBatch));
 
     // ---- Accessors --------------------------------------------------------------------------------------------
 
@@ -626,6 +645,7 @@ public sealed partial class WriteBatch : IDisposable
     /// </summary>
     public WriteBatch PutLogData(ReadOnlySpan<byte> blob)
     {
+        ThrowIfDisposed();
         SaveState(out SavePoint save);
         Span<byte> dst = _rep.GetSpan(1 + Coding.MaxVarint32Length + blob.Length);
         dst[0] = (byte)EntryType.LogData;
@@ -767,6 +787,7 @@ public sealed partial class WriteBatch : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private Span<byte> BeginRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, int keyLength, long valueLength, out int p)
     {
+        ThrowIfDisposed();
         // RocksDatabase.MaxKeyLength / MaxValueLength (a deviation from upstream's uint32 limits): checked before
         // anything is written, so the batch and the database are unchanged by a rejected record.
         if ((uint)keyLength > RocksDatabase.MaxKeyLength || (ulong)valueLength > RocksDatabase.MaxValueLength) ThrowTooLarge(keyLength, valueLength);
