@@ -459,7 +459,9 @@ internal sealed class ErrorHandler
     {
         DbOptions o = _db.Options;
         int resumeCount = o.MaxBgErrorResumeCount;
-        TimeSpan interval = TimeSpan.FromMicroseconds(o.BgErrorResumeRetryInterval);
+        // bgerror_resume_retry_interval is any uint64 of microseconds; Task.Delay takes at most uint.MaxValue - 1 ms
+        // (~49.7 days), longer waits are indistinguishable (close cancels the wait).
+        TimeSpan interval = TimeSpan.FromMicroseconds((long)Math.Min(o.BgErrorResumeRetryInterval, (uint.MaxValue - 1UL) * 1000));
         ulong retryCount = 0;
         RocksDbException? oldError;
         while (resumeCount > 0)
@@ -595,8 +597,12 @@ internal sealed class ErrorHandler
             if (synchronous) t.GetAwaiter().GetResult();
             else await t.ConfigureAwait(false);
         }
-        catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException)
+        catch (Exception e) when (e is not OutOfMemoryException)
         {
+            // CloseHelper joins the recovery thread and goes on whatever happened there: an unexpected failure of the
+            // recovery task must not stop the close half way (LOCK and files left open).
+            if (e is not (RocksDbException or IOException or ObjectDisposedException or OperationCanceledException))
+                _db.LogWarn("ErrorHandler: the recovery task failed: " + e);
         }
     }
 

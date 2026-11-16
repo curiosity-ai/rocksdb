@@ -1083,6 +1083,40 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// </summary>
     public async ValueTask CloseAsync(bool synchronous)
     {
+        // DBImpl::Close / ~DBImpl hold closing_mutex_ for the whole close: a close made while another one runs returns
+        // only once that one has finished (LOCK released), like a close after it. Its error is reported to its caller
+        // only (closing again does nothing here; upstream returns closing_status_ again).
+        TaskCompletionSource? running = Volatile.Read(ref _closeCompletion);
+        if (running is null)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return; // a failed open (AbortOpen)
+            var mine = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            running = Interlocked.CompareExchange(ref _closeCompletion, mine, null);
+            if (running is null)
+            {
+                try
+                {
+                    await CloseCoreAsync(synchronous).ConfigureAwait(false);
+                }
+                finally
+                {
+                    mine.TrySetResult();
+                }
+                return;
+            }
+        }
+        // A close from OnErrorRecoveryEnd raised by the recovery task (ErrorHandler.EndAutoRecoveryAsync) must not wait:
+        // the running close may itself be waiting for that task. It returns; the running close completes the close.
+        if (running.Task.IsCompleted || ErrorHandler.CurrentRecoveryEndNotification is not null) return;
+        if (synchronous) running.Task.GetAwaiter().GetResult();
+        else await running.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>Set by the first <see cref="CloseAsync"/>, completed when it has finished (closing_mutex_ / closed_).</summary>
+    private TaskCompletionSource? _closeCompletion;
+
+    private async ValueTask CloseCoreAsync(bool synchronous)
+    {
         if (Volatile.Read(ref _disposed) != 0) return;
         // DBImpl::DelayWrite stops waiting once shutting_down_ is set (CancelAllBackgroundWork signals bg_cv_). Close needs
         // the write queue, which a leader waiting for stopped writes holds until the stall ends (never, if nothing is
@@ -1106,6 +1140,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             ExitUnbatchedQueues();
+            WriteThread.Return(w, synchronous);
             return;
         }
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
