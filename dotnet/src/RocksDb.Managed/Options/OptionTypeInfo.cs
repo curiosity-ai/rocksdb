@@ -194,16 +194,7 @@ internal sealed class OptionTable<TOwner>
     public OptionTable<TOwner> EnumId<TEnum>(string name, EnumMap<TEnum> map, Func<TOwner, TEnum> get, Action<TOwner, TEnum> set) where TEnum : struct, System.Enum =>
         Add(name, o => map.ToName(get(o)), (o, v) =>
         {
-            string id;
-            try
-            {
-                id = OptionStrings.UnwrapId(v);
-            }
-            catch (RocksDbException)
-            {
-                return; // a malformed "{..." value: native cannot create the object either (NotSupported, ignored)
-            }
-            if (map.TryParse(id, out TEnum parsed)) set(o, parsed);
+            if (OptionStrings.TryUnwrapId(v, out string id) && map.TryParse(id, out TEnum parsed)) set(o, parsed);
         });
 }
 
@@ -460,6 +451,26 @@ internal static class OptionEnumMaps
 internal static class OptionStrings
 {
     public static string FormatBool(bool v) => v ? "true" : "false";
+
+    /// <summary>
+    /// <see cref="UnwrapId"/> that returns false instead of throwing for a malformed "{..." value. Native cannot create
+    /// a Customizable from such a value either: Customizable creation fails with NotSupported, which
+    /// ConfigOptions::ignore_unsupported_options (default true) turns into OK with the option unchanged
+    /// (options/configurable.cc ConfigureOptions), so callers leave the option as it is.
+    /// </summary>
+    public static bool TryUnwrapId(string v, out string id)
+    {
+        try
+        {
+            id = UnwrapId(v);
+            return true;
+        }
+        catch (RocksDbException)
+        {
+            id = v;
+            return false;
+        }
+    }
 
     /// <summary>Customizable ids may be written as "{id=Name;...}"; returns the id only (or the value unchanged).</summary>
     public static string UnwrapId(string v)

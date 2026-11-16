@@ -207,19 +207,50 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     }
 
     /// <summary>
-    /// Audit #7 open (low): option values native rejects and the managed parser accepts. Native: "comparator=" is
-    /// "Missing configurable object: comparator" (OptionTypeInfo::AsCustomRawPtr without kAllowNull), an empty
-    /// blob_compression_opts struct is "unable to parse the specified CF option", and a malformed
-    /// file_checksum_gen_factory struct is ignored (NotSupported) where the managed setter clears the factory.
+    /// A malformed file_checksum_gen_factory struct cannot create the Customizable (NotSupported, ignored by
+    /// ignore_unsupported_options): the factory set before stays. The managed setter cleared it.
     /// </summary>
     [TestMethod]
-    [Ignore("audit #7 open: option value edge cases outside the OPTIONS file grammar (comparator=, blob_compression_opts=)")]
+    public void MalformedFileChecksumGenFactoryIgnoredLikeNative()
+    {
+        string text = "[Version]\n  rocksdb_version=11.12.0\n  options_file_version=1.1\n[DBOptions]\n  file_checksum_gen_factory=FileChecksumGenCrc32cFactory\n" +
+            "  file_checksum_gen_factory={\n[CFOptions \"default\"]\n";
+        (string? native, string? managed) = BothParse(text);
+        Assert.IsNull(native);
+        AssertSameOutcome(native, managed);
+        Assert.IsNotNull(OptionsFile.Parse(text, preserveUnknownOptions: false).DbOptions.FileChecksumGenFactory);
+    }
+
+    /// <summary>
+    /// Option values native rejects that the managed parser accepted: "comparator=" leaves no comparator and
+    /// OptionTypeInfo::Prepare / Validate fail with "Missing configurable object: comparator" (options/options_helper.cc);
+    /// an empty blob_compression_opts goes to the legacy ParseCompressionOptions (options/cf_options.cc), which fails with
+    /// "unable to parse the specified CF option blob_compression_opts".
+    /// </summary>
+    [TestMethod]
     [DataRow("[CFOptions \"default\"]\n  comparator=\n")]
     [DataRow("[CFOptions \"default\"]\n  blob_compression_opts=\n")]
+    [DataRow("[CFOptions \"default\"]\n  blob_compression_opts=1:2\n")]
     public void EmptyRequiredOptionValuesRejectedLikeNative(string tail)
     {
         (string? native, string? managed) = BothParse(Head + tail);
+        Assert.IsNotNull(native);
         AssertSameOutcome(native, managed);
+    }
+
+    /// <summary>The legacy ':' form of blob_compression_opts is accepted by both, with the same fields.</summary>
+    [TestMethod]
+    public void BlobCompressionOptsLegacyFormLikeNative()
+    {
+        string text = Head + "[CFOptions \"default\"]\n  blob_compression_opts=-13:4:1:16\n";
+        (string? native, string? managed) = BothParse(text);
+        Assert.IsNull(native);
+        AssertSameOutcome(native, managed);
+        CompressionOptions c = OptionsFile.Parse(text, preserveUnknownOptions: false).ColumnFamilies[0].Options.BlobCompressionOpts;
+        Assert.AreEqual(-13, c.WindowBits);
+        Assert.AreEqual(4, c.Level);
+        Assert.AreEqual(1, c.Strategy);
+        Assert.AreEqual(16u, c.MaxDictBytes);
     }
 
     private static int Seed()
@@ -245,19 +276,55 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     [TestMethod]
     public void MutatedOptionsFileAcceptedOrRejectedLikeNative()
     {
-        int seed = Seed();
-        Console.WriteLine("seed=" + seed);
-        var rnd = new Random(seed);
+        // AUDIT7_OPTS_SEEDS=n runs n consecutive seeds from AUDIT7_SEED (3000 mutations each, no time limit).
+        int first = Seed();
+        string? many = Environment.GetEnvironmentVariable("AUDIT7_OPTS_SEEDS");
+        int seeds = many is not null ? int.Parse(many, System.Globalization.CultureInfo.InvariantCulture) : 1;
         using var dir = new TempDir("a7optsfuzz");
         string baseText = NativeOptionsFileText(Path.Combine(dir.Path, "db"));
+        string probe = Path.Combine(dir.Path, "probe");
+        Directory.CreateDirectory(probe);
+        var lessStrict = new List<string>();
+        var stricter = new SortedDictionary<string, int>(StringComparer.Ordinal);
+        int clean = 0;
+        for (int seed = first; seed < first + seeds; seed++)
+        {
+            int before = lessStrict.Count;
+            FuzzOptionsFile(seed, baseText, probe, seeds == 1 ? TimeSpan.FromSeconds(15) : TimeSpan.MaxValue, lessStrict, stricter);
+            if (lessStrict.Count == before) clean++;
+        }
+        Console.WriteLine("seeds " + first + ".." + (first + seeds - 1) + ": " + clean + " without a less-strict difference");
+        Console.WriteLine("allowed stricter-than-native classes (managed rejects, native accepts; or another rejection code):");
+        foreach (KeyValuePair<string, int> kv in stricter) Console.WriteLine("  " + kv.Value + "x " + kv.Key);
+        foreach (string d in lessStrict.Distinct().Take(200)) Console.WriteLine("LESS STRICT " + d);
+        Assert.AreEqual(0, lessStrict.Count, lessStrict.Count + " inputs native rejects and managed accepts, first: " +
+            (lessStrict.Count > 0 ? lessStrict[0] : ""));
+    }
+
+    /// <summary>A short class name for a stricter-than-native difference: the option name and the managed error.</summary>
+    private static string StricterClass(string line, string managed)
+    {
+        int eq = line.IndexOf('=', StringComparison.Ordinal);
+        string name = eq > 0 ? line[..eq].Trim() : line.Trim();
+        if (name.Length > 40) name = name[..40];
+        string msg = System.Text.RegularExpressions.Regex.Replace(managed, "'[^']*'|\\(at line \\d+\\)", "");
+        if (msg.Length > 110) msg = msg[..110];
+        return name + " -> " + msg;
+    }
+
+    /// <summary>
+    /// One seed of the differential OPTIONS fuzz. The managed parser may be stricter than native (reject what native
+    /// accepts, or reject with another code) but never less strict: input native rejects must be rejected.
+    /// </summary>
+    private static void FuzzOptionsFile(int seed, string baseText, string probe, TimeSpan budget, List<string> lessStrict,
+        SortedDictionary<string, int> stricter)
+    {
+        var rnd = new Random(seed);
         string[] lines = baseText.Split('\n');
         string[] hostile = ["99999999999999999999999", "-1", "1e400", "kNoSuchEnum", "", "{", "}", "0x10", "true;", "9223372036854775808",
             "18446744073709551616", "1.2.3", " 5 ", "0", "4294967296", "2147483648", "1.5", "nan", "kZSTD", "false", "1", "yes", ":"];
-        var diffs = new List<string>();
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        string probe = Path.Combine(dir.Path, "probe");
-        Directory.CreateDirectory(probe);
-        for (int iter = 0; iter < 3000 && sw.Elapsed < TimeSpan.FromSeconds(15); iter++)
+        for (int iter = 0; iter < 3000 && sw.Elapsed < budget; iter++)
         {
             string[] m = (string[])lines.Clone();
             int li = rnd.Next(m.Length);
@@ -289,23 +356,21 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
                 Assert.Fail("seed=" + seed + " iter=" + iter + " line '" + m[li] + "': unexpected " + e);
                 return;
             }
-            bool same = (native is null) == (managed is null);
-            if (same && native is not null)
+            if (native is not null && managed is null)
             {
-                string code = native.StartsWith("Invalid argument", StringComparison.Ordinal) ? "InvalidArgument"
-                    : native.StartsWith("Corruption", StringComparison.Ordinal) ? "Corruption" : "?";
-                same = managed!.StartsWith(code + ":", StringComparison.Ordinal);
+                lessStrict.Add("seed=" + seed + " line '" + m[li].Trim() + "' (was '" + line.Trim() + "'): native=" + native);
+                continue;
             }
-            if (!same && (m[li].Contains("comparator=", StringComparison.Ordinal) || m[li].Contains("blob_compression_opts=", StringComparison.Ordinal)
-                || m[li].Contains("file_checksum_gen_factory=", StringComparison.Ordinal)
-                || (m[li].IndexOf('=', StringComparison.Ordinal) is int e2 and > 0 && m[li][..e2].Contains('.', StringComparison.Ordinal))))
+            if (managed is null) continue;
+            string code = native is null ? "OK"
+                : native.StartsWith("Invalid argument", StringComparison.Ordinal) ? "InvalidArgument"
+                : native.StartsWith("Corruption", StringComparison.Ordinal) ? "Corruption" : "?";
+            if (native is null || !managed.StartsWith(code + ":", StringComparison.Ordinal))
             {
-                same = true; // audit #7 open, see EmptyRequiredOptionValuesRejectedLikeNative; "customizable.=x" dotted names
+                string key = (native is null ? "native OK: " : "native " + code + ": ") + StricterClass(m[li], managed);
+                stricter[key] = stricter.TryGetValue(key, out int n) ? n + 1 : 1;
             }
-            if (!same) diffs.Add("line '" + m[li].Trim() + "' (was '" + line.Trim() + "'): native=" + (native ?? "OK") + " | managed=" + (managed ?? "OK"));
         }
-        foreach (string d in diffs.Distinct().Take(80)) Console.WriteLine(d);
-        Assert.AreEqual(0, diffs.Count, "seed=" + seed + ": " + diffs.Count + " differences, first: " + (diffs.Count > 0 ? diffs[0] : ""));
     }
 
     // ---- DB open: native and managed on the same damaged directory ------------------------------------------------

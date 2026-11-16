@@ -457,7 +457,14 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
 
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
         .Add("comparator", static o => o._comparator.Serialize(ComparatorId) ?? BytewiseComparator.ClassName,
-            static (o, v) => o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId))
+            static (o, v) =>
+            {
+                // AsCustomRawPtr<const Comparator> without kAllowNull (options/cf_options.cc): an empty value leaves no
+                // comparator, and OptionTypeInfo::Prepare / Validate (options/options_helper.cc) then fail with "Missing
+                // configurable object: comparator" (InvalidArgument from the OPTIONS loader).
+                if (v.Length == 0) ThrowHelper.InvalidArgument("Missing configurable object: comparator");
+                o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId);
+            })
         .Add("merge_operator", static o => o._mergeOperator.Serialize(MergeOperatorOptionsId) ?? "nullptr",
             static (o, v) => o._mergeOperator.Parse(v, Managed.MergeOperator.CreateBuiltin, MergeOperatorOptionsId))
         .Add("compaction_filter", static o => o._compactionFilter.Serialize(CompactionFilterId) ?? "nullptr",
@@ -492,8 +499,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
             static (c, v) => CompressionOptions.ParseLegacy(c, v, "compression_opts"))
         .Struct("bottommost_compression_opts", static o => o.BottommostCompressionOpts, static (o, v) => o.BottommostCompressionOpts = v,
             static (c, v) => CompressionOptions.ParseLegacy(c, v, "bottommost_compression_opts"))
-        // blob_compression_opts has no legacy ':' form upstream (plain OptionTypeInfo::Struct).
-        .Struct("blob_compression_opts", static o => o.BlobCompressionOpts, static (o, v) => o.BlobCompressionOpts = v, null)
+        // blob_compression_opts: OptionTypeInfo::Struct with a parse function that takes the legacy ':' form when the value
+        // has no '=' (options/cf_options.cc), so an empty value is "unable to parse the specified CF option".
+        .Struct("blob_compression_opts", static o => o.BlobCompressionOpts, static (o, v) => o.BlobCompressionOpts = v,
+            static (c, v) => CompressionOptions.ParseLegacy(c, v, "blob_compression_opts"))
         .Add("compression_manager", static o => o.CompressionManagerName ?? "nullptr",
             static (o, v) => { string id = OptionStrings.UnwrapId(v); o.CompressionManagerName = id.Length == 0 || id == "nullptr" ? null : id; })
         .Add("compression_per_level", static o => FormatCompressionList(o.CompressionPerLevel),
