@@ -913,6 +913,12 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
     private void WriteRaw(ReadOnlySpan<byte> data, long offset)
     {
         IOStatsContext.Add(IOStatsMetric.BytesWritten, (ulong)data.Length); // WritableFileWriter: IOSTATS_ADD(bytes_written)
+        WriteRawUncounted(data, offset);
+    }
+
+    /// <summary><see cref="WriteRaw"/> without the IOSTATS count (for callers that counted the bytes already).</summary>
+    private void WriteRawUncounted(ReadOnlySpan<byte> data, long offset)
+    {
         Preallocate(offset + data.Length);
         try
         {
@@ -965,7 +971,7 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
                 // fdatasync of SyncAsync, which blocks much longer, runs on a dedicated sync thread).
                 try
                 {
-                    WriteRaw(data.Span, offset);
+                    WriteRawUncounted(data.Span, offset); // counted above
                     return ValueTask.CompletedTask;
                 }
                 catch (Exception e)
@@ -1040,6 +1046,8 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
 
     public void Sync()
     {
+        // Like SyncAsync: a closed file fails with InvalidArgument (not ObjectDisposedException from the closed handle).
+        ThrowIfDisposed();
         Flush();
         long perfSync = PerfContext.StartTimer(); // IOSTATS_TIMER_GUARD(fsync_nanos)
         UnixNative.DataSync(_handle, _path);

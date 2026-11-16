@@ -75,7 +75,11 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken = default) =>
         OpenAsync(path, options, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, defaultColumnFamilyOptions)], cancellationToken);
 
-    /// <summary>Async <see cref="Open(string, DbOptions, IReadOnlyList{ColumnFamilyDescriptor})"/>: recovery reads and writes asynchronously.</summary>
+    /// <summary>
+    /// Async <see cref="Open(string, DbOptions, IReadOnlyList{ColumnFamilyDescriptor})"/>: the files the open writes (recovery
+    /// flushes, MANIFEST, OPTIONS) are written asynchronously; the MANIFEST and the WALs are read with blocking reads on the
+    /// calling thread. Cancellation is not observed while the new MANIFEST is written.
+    /// </summary>
     public static async ValueTask<RocksDatabase> OpenAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
         CancellationToken cancellationToken = default)
     {

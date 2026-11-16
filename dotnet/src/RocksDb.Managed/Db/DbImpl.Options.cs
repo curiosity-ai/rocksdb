@@ -283,7 +283,8 @@ internal sealed partial class DbImpl
             RegisterRecordSeqnoTimeWorker();
             RescheduleCompactionTrigger();
             LogInfo("SetOptions() on column family [" + cfd.Name + "], inputs:" + description);
-            await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
+            // The options are applied: not cancellable any more (a cancellation would report them as not applied).
+            await WriteOptionsFileAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
             LogInfo("[" + cfd.Name + "] SetOptions() succeeded");
         }
         finally
@@ -653,14 +654,14 @@ internal sealed partial class DbImpl
             {
                 // SwitchWAL when wal_bytes_per_sync changed or the WALs already exceed a lowered max_total_wal_size: the
                 // column families holding the oldest WAL are flushed so it can be released.
-                WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+                WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
                 try
                 {
                     if (walOtherOptionChanged || Volatile.Read(ref _walsTotalSize) > (long)GetMaxTotalWalSize())
                     {
                         try
                         {
-                            await SwitchWalAsync(synchronous, ct).ConfigureAwait(false);
+                            await SwitchWalAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
                         }
                         catch (Exception e) when (e is RocksDbException or IOException)
                         {
@@ -674,7 +675,8 @@ internal sealed partial class DbImpl
                 }
             }
             LogInfo("SetDBOptions(), inputs:" + description);
-            await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
+            // The options are applied: the WAL switch above and the OPTIONS file are not cancellable any more.
+            await WriteOptionsFileAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
             LogInfo("SetDBOptions() succeeded");
         }
         finally
