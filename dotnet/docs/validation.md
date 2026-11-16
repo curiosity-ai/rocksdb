@@ -2143,6 +2143,15 @@ Write path, background errors, close:
   iterator Refresh / RefreshAsync / SetBounds now disposes the iterator and rethrows (before, it silently iterated
   nothing); a foreign or released snapshot is rejected before the iterator's view is released.
 
+- Releasing an iterator never purged the files its super version kept alive: the inputs of a compaction that ran while
+  the iterator was open stayed on disk until the next flush, compaction or close. Now as `CleanupIteratorSuperVersion`:
+  on the last reference the iterator release runs FindObsoleteFiles / PurgeObsoleteFiles, in the background (HIGH pool)
+  with `background_purge_on_iterator_cleanup` / `avoid_unnecessary_blocking_io`. Native 11.12 (`.sst` files on disk:
+  2 L0 files, iterator open, CompactRange, iterator disposed): 2 -> 3 -> 1; managed was 2 -> 3 -> 3, now 2 -> 3 -> 1.
+  Point reads keep upstream behaviour (`ReturnAndCleanupSuperVersion` does not purge: a Get that drops the last reference
+  leaves the files to the next purge), which made `FailedCompactionLeavesNoOrphanOutputs` flaky; that test now triggers a
+  purge before comparing, and `PointReadReleasingTheLastReferenceLeavesCompactionInputsToTheNextPurge` pins the race.
+
 Public API:
 
 - Pooled public objects (`WriteBatch`, `WriteBatchWithIndex`, `PooledValue`): a stale second Dispose after the object was
