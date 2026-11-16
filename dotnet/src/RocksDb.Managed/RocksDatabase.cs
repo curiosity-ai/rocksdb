@@ -36,6 +36,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     private readonly ColumnFamily _default;
     private readonly Dictionary<uint, ColumnFamily> _handles = new();
     private readonly Lock _handlesLock = new();
+    private int _handlesReleased;
 
     private RocksDatabase(DbImpl db)
     {
@@ -197,7 +198,8 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>Close: every remaining handle is released (OnColumnFamilyHandleDeletionStarted).</summary>
     private void ReleaseAllHandles()
     {
-        if (!_db.HasListeners || _db.IsDisposed) return;
+        // Once, even with concurrent closes (each handle is deleted once upstream).
+        if (!_db.HasListeners || _db.IsDisposed || Interlocked.Exchange(ref _handlesReleased, 1) != 0) return;
         List<ColumnFamily> handles;
         lock (_handlesLock) handles = new List<ColumnFamily>(_handles.Values);
         foreach (ColumnFamily h in handles) _db.NotifyOnColumnFamilyHandleDeletionStarted(h);

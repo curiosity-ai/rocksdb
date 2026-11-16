@@ -1100,6 +1100,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 }
                 finally
                 {
+                    // A close that failed before it took over the DB (nothing closed yet) can be retried by a later close.
+                    if (Volatile.Read(ref _disposed) == 0) Volatile.Write(ref _closeCompletion, null);
                     mine.TrySetResult();
                 }
                 return;

@@ -112,6 +112,41 @@ public sealed class Audit9OpenCloseTests
         Assert.AreEqual("1", S(again.Get(B("a"))));
     }
 
+    /// <summary>
+    /// ~DBImpl (db/db_impl/db_impl.cc) closes whatever is outstanding: DB::Close returns Aborted "Cannot close DB with
+    /// unreleased snapshot." and stays open, but the destructor (and rocksdb_close, which deletes the DB) runs CloseImpl
+    /// regardless. Dispose is that destructor: with a snapshot, an iterator and a transaction outstanding it closes,
+    /// releases the LOCK and every file, the DB reopens with the data, and the leftovers are disposed afterwards without
+    /// touching the directory.
+    /// </summary>
+    [TestMethod]
+    public void DisposeWithOutstandingSnapshotIteratorAndTransactionClosesLikeTheDestructor()
+    {
+        var fs = new FaultInjectionFileSystem(NewMemFs());
+        DbOptions o = Options(fs);
+        TransactionDatabase db = TransactionDatabase.Open(Path, o);
+        db.Database.Put(B("a"), B("1"));
+        db.Database.Flush();
+        db.Database.Put(B("b"), B("2"));
+        Snapshot snap = db.Database.GetSnapshot();
+        Iterator it = db.Database.NewIterator();
+        it.SeekToFirst();
+        Transaction txn = db.BeginTransaction(new WriteOptions());
+        txn.Put(B("t"), B("uncommitted"));
+        db.Database.CompactRange(); // the iterator keeps the compaction's input alive
+        db.Dispose();
+        Assert.AreEqual(0, fs.OpenLocks);
+        fs.OpLog = new();
+        txn.Dispose();
+        it.Dispose();
+        snap.Dispose();
+        Assert.AreEqual("", string.Join("; ", fs.OpLog), "releasing leftovers after the close touched the directory");
+        using RocksDatabase again = RocksDatabase.Open(Path, Options(fs));
+        Assert.AreEqual("1", S(again.Get(B("a"))));
+        Assert.AreEqual("2", S(again.Get(B("b"))));
+        Assert.IsNull(again.Get(B("t")));
+    }
+
     // ---- crash consistency of DB::Open ---------------------------------------------------------------------------
 
     /// <summary>What the DB looks like before the open that crashes, and how that open is configured.</summary>

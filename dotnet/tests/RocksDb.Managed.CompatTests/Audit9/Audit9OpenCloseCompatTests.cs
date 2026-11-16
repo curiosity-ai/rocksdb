@@ -345,6 +345,30 @@ public sealed class Audit9OpenCloseCompatTests
     }
 
     /// <summary>
+    /// The info LOG at open (CreateLoggerFromOptions renames LOG to LOG.old.&lt;ts&gt;) and the old info logs trimmed to
+    /// keep_log_file_num by the obsolete-file purge (PurgeObsoleteFiles: old_info_log_files): after each of several
+    /// open / close cycles the DB directory holds as many LOG.old files as native's.
+    /// </summary>
+    [TestMethod]
+    public void OldInfoLogsAreTrimmedToKeepLogFileNumLikeNative()
+    {
+        using var nativeDir = new TempDir("a9-log-native");
+        using var managedDir = new TempDir("a9-log-managed");
+        var native = new List<string>();
+        var managed = new List<string>();
+        for (int round = 0; round < 6; round++)
+        {
+            var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+            N.rocksdb_options_set_keep_log_file_num(no.Handle, (UIntPtr)2);
+            using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path)) db.Put(U("k" + round), U("v"));
+            native.Add(Listing(nativeDir.Path));
+            using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true, KeepLogFileNum = 2 })) db.Put(U("k" + round), U("v"));
+            managed.Add(Listing(managedDir.Path));
+        }
+        CollectionAssert.AreEqual(native, managed, "\nnative:\n" + string.Join("\n", native) + "\nmanaged:\n" + string.Join("\n", managed));
+    }
+
+    /// <summary>
     /// DBImpl::Recover / RecoverLogFiles: the last sequence number after an open (replayed WALs, recovery flush, empty
     /// reopen, avoid_flush_during_recovery) is the same as native's, so is the sequence number of the first write after
     /// it; every open gets a new db_session_id (DBImpl::SetDbSessionId) while the DB id stays.
