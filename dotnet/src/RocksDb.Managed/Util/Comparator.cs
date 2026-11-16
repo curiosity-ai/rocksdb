@@ -45,9 +45,16 @@ public abstract class Comparator
     public abstract int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b);
     public virtual bool Equal(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => Compare(a, b) == 0;
 
-    /// <summary>Port of FindShortestSeparator: writes a short key k with start &lt;= k &lt; limit into <paramref name="result"/>. Default: start unchanged.</summary>
+    /// <summary>
+    /// Port of FindShortestSeparator: if start &lt; limit, writes a short key k with start &lt;= k &lt; limit into
+    /// <paramref name="result"/>. Default: start unchanged. As upstream ("an implementation of this method that does
+    /// nothing is correct"), an override that writes nothing keeps start unchanged.
+    /// </summary>
     public virtual void FindShortestSeparator(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, System.Buffers.IBufferWriter<byte> result) => result.Write(start);
-    /// <summary>Port of FindShortSuccessor. Default: key unchanged.</summary>
+    /// <summary>
+    /// Port of FindShortSuccessor: writes a short key &gt;= <paramref name="key"/> into <paramref name="result"/>. Default:
+    /// key unchanged; an override that writes nothing also keeps the key unchanged, as upstream.
+    /// </summary>
     public virtual void FindShortSuccessor(ReadOnlySpan<byte> key, System.Buffers.IBufferWriter<byte> result) => result.Write(key);
     /// <summary>Size in bytes of the user-defined timestamp suffix of every user key (0 = no timestamps).</summary>
     public virtual int TimestampSize => 0;

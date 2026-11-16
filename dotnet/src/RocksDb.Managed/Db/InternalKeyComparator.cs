@@ -177,6 +177,16 @@ public sealed class InternalKeyComparator
             if (isSuccessor) _user.FindShortSuccessor(userStart, scratch);
             else _user.FindShortestSeparator(userStart, DbFormat.ExtractUserKey(limit), scratch);
             ReadOnlySpan<byte> shortened = scratch.WrittenSpan;
+            // include/rocksdb/comparator.h (FindShortestSeparator / FindShortSuccessor): "Simple comparator
+            // implementations may return with *start unchanged, i.e., an implementation of this method that does
+            // nothing is correct." Upstream passes a copy of start to modify; here the override writes into an empty
+            // buffer, so an override that writes nothing means "unchanged" (start is always a valid separator). Without
+            // this, an empty key could become the index entry (wrong for comparators where it sorts last).
+            if (shortened.Length == 0 && userStart.Length != 0)
+            {
+                result.Write(start);
+                return false;
+            }
             if (shortened.Length <= userStart.Length && _user.Compare(userStart, shortened) < 0)
             {
                 // User key has become shorter physically, but larger logically. Tack on the earliest possible

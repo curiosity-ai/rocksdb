@@ -301,6 +301,59 @@ public sealed class Audit10ReadCustomizationTests
 
     private static int ThrowingReader(ReadOnlySpan<byte> value, int state) => throw new HookException();
 
+    /// <summary>Reverse bytewise order (the empty key sorts last) whose separator / successor overrides do nothing.</summary>
+    private sealed class ReverseNoShortening : Comparator
+    {
+        public override string Name => "audit10.ReverseNoShortening";
+        public override int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => b.SequenceCompareTo(a);
+        public override void FindShortestSeparator(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, IBufferWriter<byte> result) { }
+        public override void FindShortSuccessor(ReadOnlySpan<byte> key, IBufferWriter<byte> result) { }
+    }
+
+    /// <summary>
+    /// include/rocksdb/comparator.h (FindShortestSeparator / FindShortSuccessor): "Simple comparator implementations may
+    /// return with *start unchanged, i.e., an implementation of this method that does nothing is correct." An override
+    /// that writes nothing keeps the index key unchanged (ShortenedIndexBuilder::FindShortestInternalKeySeparator /
+    /// FindShortInternalKeySuccessor). Before the fix the empty key became the index entry of every block, which sorts
+    /// last under this comparator: point lookups missed keys (and the native differential run did not finish). Native:
+    /// Audit10ReadCustomizationCompatTests.ComparatorWithEmptySeparatorOverridesMatchesNative.
+    /// </summary>
+    [TestMethod]
+    [Timeout(30_000)]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ComparatorWhoseSeparatorOverridesWriteNothingKeepsIndexKeys(bool partitionedIndex)
+    {
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions { Comparator = new ReverseNoShortening() };
+        cfo.TableOptions.BlockSize = 256;
+        if (partitionedIndex)
+        {
+            cfo.TableOptions.IndexType = IndexType.TwoLevelIndexSearch;
+            cfo.TableOptions.MetadataBlockSize = 256;
+        }
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, Opts(fs), cfo))
+        {
+            Fill(db, 500, "a");
+            db.Flush();
+        }
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, Opts(fs), cfo))
+        {
+            AssertFilled(db, 500, "a");
+            using Iterator it = db.NewIterator();
+            it.Seek(Key(250));
+            Assert.AreEqual("a250", S(it.Value.ToArray()));
+            it.Next();
+            Assert.AreEqual("a249", S(it.Value.ToArray()));
+            it.SeekForPrev(Key(250));
+            Assert.AreEqual("a250", S(it.Value.ToArray()));
+            it.Prev();
+            Assert.AreEqual("a251", S(it.Value.ToArray()));
+            it.SeekToLast();
+            Assert.AreEqual("a0", S(it.Value.ToArray()));
+        }
+    }
+
     /// <summary>
     /// The comparator throwing during a flush (BuildTable): the flush fails like an I/O error (kFlushNoWAL + IOError with
     /// paranoid_checks: kFatalError, so Resume refuses), no table file is left and the data is intact after a reopen.

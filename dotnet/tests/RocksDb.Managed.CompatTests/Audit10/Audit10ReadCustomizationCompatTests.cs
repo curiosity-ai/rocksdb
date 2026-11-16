@@ -97,6 +97,37 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
             LengthFirst(new ReadOnlySpan<byte>((void*)a, (int)alen), new ReadOnlySpan<byte>((void*)b, (int)blen));
     }
 
+    private const string ReverseName = "audit10.ReverseNoShortening";
+
+    /// <summary>
+    /// Reverse bytewise order (the empty key sorts last) under a custom name, with FindShortestSeparator /
+    /// FindShortSuccessor overrides that do nothing: comparator.h allows that ("an implementation of this method that
+    /// does nothing is correct"), meaning the key stays unchanged.
+    /// </summary>
+    private sealed class ManagedReverseNoShortening : Comparator
+    {
+        public override string Name => ReverseName;
+        public override int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => b.SequenceCompareTo(a);
+        public override void FindShortestSeparator(ReadOnlySpan<byte> start, ReadOnlySpan<byte> limit, System.Buffers.IBufferWriter<byte> result) { }
+        public override void FindShortSuccessor(ReadOnlySpan<byte> key, System.Buffers.IBufferWriter<byte> result) { }
+    }
+
+    /// <summary>The same order through rocksdb_comparator_create (whose separator / successor do nothing).</summary>
+    private sealed class NativeReverse : RocksDbSharp.Comparator
+    {
+        public string Name => ReverseName;
+        public int Compare(IntPtr a, UIntPtr alen, IntPtr b, UIntPtr blen) =>
+            new ReadOnlySpan<byte>((void*)b, (int)blen).SequenceCompareTo(new ReadOnlySpan<byte>((void*)a, (int)alen));
+    }
+
+    /// <summary>The user key order of <paramref name="hook"/>'s column family.</summary>
+    private static int Cmp(Hook hook, ReadOnlySpan<byte> a, ReadOnlySpan<byte> b) => hook switch
+    {
+        Hook.LengthFirstComparator => LengthFirst(a, b),
+        Hook.ReverseNoShortening => b.SequenceCompareTo(a),
+        _ => a.SequenceCompareTo(b),
+    };
+
     /// <summary>table_filter: tables whose entry count is a multiple of three are skipped.</summary>
     private static bool KeepTable(ulong numEntries) => numEntries % 3 != 0;
 
@@ -116,7 +147,7 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
     private readonly record struct Op(OpKind Kind, byte[]? A = null, byte[]? B = null, string? Text = null);
 
     /// <summary>What the scenario plugs into both engines.</summary>
-    private enum Hook { BarPrefix, BarPrefixPartitioned, LengthFirstComparator, BuiltInPrefixChanges, TableFilter }
+    private enum Hook { BarPrefix, BarPrefixPartitioned, LengthFirstComparator, BuiltInPrefixChanges, TableFilter, ReverseNoShortening }
 
     /// <summary>Small data and metadata blocks, so that tables have many index entries (separators) and filter partitions.</summary>
     private const ulong SmallBlock = 256;
@@ -158,7 +189,7 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
             else if (p < 770)
             {
                 byte[] a = K(), b = K();
-                int c = hook == Hook.LengthFirstComparator ? LengthFirst(a, b) : a.AsSpan().SequenceCompareTo(b);
+                int c = Cmp(hook, a, b);
                 if (c != 0) ops.Add(c < 0 ? new Op(OpKind.DeleteRange, a, b) : new Op(OpKind.DeleteRange, b, a));
             }
             else if (p < 800) ops.Add(new Op(OpKind.Flush));
@@ -221,6 +252,9 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
                     break;
                 case Hook.LengthFirstComparator:
                     cf.SetComparator(new NativeLengthFirst());
+                    break;
+                case Hook.ReverseNoShortening:
+                    cf.SetComparator(new NativeReverse());
                     break;
             }
             cf.SetBlockBasedTableFactory(bbto);
@@ -338,6 +372,9 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
                 case Hook.LengthFirstComparator:
                     cf.Comparator = new ManagedLengthFirst();
                     break;
+                case Hook.ReverseNoShortening:
+                    cf.Comparator = new ManagedReverseNoShortening();
+                    break;
             }
             return cf;
         }
@@ -406,8 +443,7 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
     /// <summary>The reads of one Read op: Gets around the two keys and iterators in every mode the hook supports.</summary>
     private static List<ReadSpec> ReadSpecs(Hook hook, byte[] a, byte[] b, SliceTransform? extractor)
     {
-        bool cmp = hook == Hook.LengthFirstComparator;
-        (byte[] lo, byte[] hi) = (cmp ? LengthFirst(a, b) : a.AsSpan().SequenceCompareTo(b)) <= 0 ? (a, b) : (b, a);
+        (byte[] lo, byte[] hi) = Cmp(hook, a, b) <= 0 ? (a, b) : (b, a);
         bool tf = hook == Hook.TableFilter;
         var specs = new List<ReadSpec>();
         foreach (bool snap in new[] { false, true })
@@ -508,6 +544,10 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
             {
                 foreach (TableProperties p in m.Db.DefaultColumnFamily.GetPropertiesOfAllTables().Values) Assert.AreEqual(ComparatorName, p.ComparatorName);
             }
+            if (hook == Hook.ReverseNoShortening)
+            {
+                foreach (TableProperties p in m.Db.DefaultColumnFamily.GetPropertiesOfAllTables().Values) Assert.AreEqual(ReverseName, p.ComparatorName);
+            }
         }
         using (var m = new ManagedEngine(managedDir.Path, hook)) expected = Run(m, hook, lastRead, readsOnly: true);
         using (var n = new NativeEngine(managedDir.Path, hook)) AssertSameLogs(expected, Run(n, hook, lastRead, readsOnly: true), "native reading the managed DB");
@@ -541,6 +581,16 @@ public sealed unsafe class Audit10ReadCustomizationCompatTests
     /// </summary>
     [TestMethod]
     public void CustomComparatorReadsMatchNative() => Differential(Hook.LengthFirstComparator, Seed(), 2500);
+
+    /// <summary>
+    /// include/rocksdb/comparator.h: "Simple comparator implementations may return with *start unchanged, i.e., an
+    /// implementation of this method that does nothing is correct." A reverse-order comparator (the empty key sorts
+    /// last) whose FindShortestSeparator / FindShortSuccessor overrides write nothing must keep the index keys
+    /// unchanged, like native's C API comparator (whose separator / successor do nothing): 256-byte blocks give many
+    /// index entries; reads, seeks in both directions and the cross-engine reopen match native.
+    /// </summary>
+    [TestMethod]
+    public void ComparatorWithEmptySeparatorOverridesMatchesNative() => Differential(Hook.ReverseNoShortening, Seed(), 2500);
 
     /// <summary>
     /// SetOptions(prefix_extractor) between built-in extractors (cf_mutable_options prefix_extractor, applied to new
