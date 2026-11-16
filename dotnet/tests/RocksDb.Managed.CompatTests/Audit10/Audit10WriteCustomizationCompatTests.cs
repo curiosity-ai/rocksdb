@@ -233,6 +233,46 @@ public sealed unsafe class Audit10WriteCustomizationCompatTests
         Factory,
     }
 
+    /// <summary>The merge operator an engine opens with: the same, none, or another one (a different name, "+" joins).</summary>
+    public enum MergeMode
+    {
+        Same,
+        None,
+        Renamed,
+    }
+
+    private sealed class RenamedMerge : MergeOperator
+    {
+        public override string Name => "Audit10OtherMerge";
+
+        public override bool FullMerge(ReadOnlySpan<byte> key, bool hasExistingValue, ReadOnlySpan<byte> existingValue, in MergeOperands operands,
+            IBufferWriter<byte> result)
+        {
+            var parts = new List<string>();
+            if (hasExistingValue) parts.Add(Encoding.UTF8.GetString(existingValue));
+            for (int i = 0; i < operands.Count; i++) parts.Add(Encoding.UTF8.GetString(operands[i]));
+            result.Write(B(string.Join("+", parts)));
+            return true;
+        }
+    }
+
+    private static RocksDbSharp.MergeOperator NativeRenamedMerge() => RocksDbSharp.MergeOperators.Create(
+        "Audit10OtherMerge",
+        static (ReadOnlySpan<byte> key, RocksDbSharp.MergeOperators.OperandsEnumerator operands, out bool success) =>
+        {
+            success = false;
+            return [];
+        },
+        static (ReadOnlySpan<byte> key, bool hasExisting, ReadOnlySpan<byte> existing, RocksDbSharp.MergeOperators.OperandsEnumerator operands,
+            out bool success) =>
+        {
+            var parts = new List<string>();
+            if (hasExisting) parts.Add(Encoding.UTF8.GetString(existing));
+            for (int i = 0; i < operands.Count; i++) parts.Add(Encoding.UTF8.GetString(operands.Get(i)));
+            success = true;
+            return B(string.Join("+", parts));
+        });
+
     private interface IEngine : IDisposable
     {
         void Put(byte[] k, byte[] v);
@@ -261,25 +301,35 @@ public sealed unsafe class Audit10WriteCustomizationCompatTests
         }
         catch (RocksDbSharp.RocksDbException e)
         {
-            // "Corruption: ..." / "Invalid argument: ..." -> the code word.
-            string m = e.Message;
-            return "error " + (m.StartsWith("Corruption", StringComparison.Ordinal) ? "Corruption"
-                : m.StartsWith("Invalid argument", StringComparison.Ordinal) ? "InvalidArgument" : m);
+            return "error " + NativeCode(e.Message);
         }
     }
+
+    /// <summary>"Corruption: ..." / "Invalid argument: ..." -> the code word of the managed StatusCode.</summary>
+    private static string NativeCode(string message) =>
+        message.StartsWith("Corruption", StringComparison.Ordinal) ? "Corruption"
+        : message.StartsWith("Invalid argument", StringComparison.Ordinal) ? "InvalidArgument" : message;
 
     private sealed class NativeEngine : IEngine
     {
         private readonly RocksDbSharp.RocksDb _db;
         private readonly List<RocksDbSharp.Snapshot> _snaps = new();
 
-        public NativeEngine(string path, FilterMode filter, List<string> contexts)
+        public NativeEngine(string path, FilterMode filter, List<string> contexts) : this(path, filter, contexts, MergeMode.Same, false)
+        {
+        }
+
+        public NativeEngine(string path, FilterMode filter, List<string> contexts, MergeMode merge, bool avoidFlushDuringRecovery)
         {
             RocksDbSharp.DbOptions o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetDisableAutoCompactions(1)
                 .SetWriteBufferSize(4 << 20);
-            RocksDbSharp.MergeOperator mo = NativeMerge();
-            s_keepAlive.Add(mo);
-            o.SetMergeOperator(mo);
+            RocksDbSharp.Native.Instance.rocksdb_options_set_avoid_flush_during_recovery(o.Handle, avoidFlushDuringRecovery ? (byte)1 : (byte)0);
+            if (merge != MergeMode.None)
+            {
+                RocksDbSharp.MergeOperator mo = merge == MergeMode.Same ? NativeMerge() : NativeRenamedMerge();
+                s_keepAlive.Add(mo);
+                o.SetMergeOperator(mo);
+            }
             if (filter == FilterMode.Filter) o.SetCompactionFilter(NewNativeFilter());
             if (filter == FilterMode.Factory)
             {
@@ -335,7 +385,7 @@ public sealed unsafe class Audit10WriteCustomizationCompatTests
             }
             catch (RocksDbSharp.RocksDbException e)
             {
-                return "error " + e.Message.Split(':')[0];
+                return "error " + NativeCode(e.Message);
             }
         }
 
@@ -358,12 +408,12 @@ public sealed unsafe class Audit10WriteCustomizationCompatTests
                 {
                     string m = Marshal.PtrToStringAnsi(err)!;
                     RocksDbSharp.Native.Instance.rocksdb_free(err);
-                    return sb.Append("error ").Append(m.Split(':')[0]).ToString();
+                    return sb.Append("error ").Append(NativeCode(m)).ToString();
                 }
             }
             catch (RocksDbSharp.RocksDbException e)
             {
-                sb.Append("error ").Append(e.Message.Split(':')[0]);
+                sb.Append("error ").Append(NativeCode(e.Message));
             }
             return sb.ToString();
         }
@@ -380,12 +430,26 @@ public sealed unsafe class Audit10WriteCustomizationCompatTests
         private readonly RocksDatabase _db;
         private readonly List<Snapshot> _snaps = new();
 
-        public ManagedEngine(string path, FilterMode filter, List<string> contexts)
+        public ManagedEngine(string path, FilterMode filter, List<string> contexts) : this(path, filter, contexts, MergeMode.Same, false)
         {
-            var cfo = new ColumnFamilyOptions { DisableAutoCompactions = true, MergeOperator = new ManagedMerge(), WriteBufferSize = 4 << 20 };
+        }
+
+        public ManagedEngine(string path, FilterMode filter, List<string> contexts, MergeMode merge, bool avoidFlushDuringRecovery)
+        {
+            var cfo = new ColumnFamilyOptions
+            {
+                DisableAutoCompactions = true,
+                MergeOperator = merge switch
+                {
+                    MergeMode.Same => new ManagedMerge(),
+                    MergeMode.Renamed => new RenamedMerge(),
+                    _ => null,
+                },
+                WriteBufferSize = 4 << 20,
+            };
             if (filter == FilterMode.Filter) cfo.CompactionFilter = new ManagedFilter();
             if (filter == FilterMode.Factory) cfo.CompactionFilterFactory = new ManagedFilterFactory(contexts);
-            _db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true }, cfo);
+            _db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, AvoidFlushDuringRecovery = avoidFlushDuringRecovery }, cfo);
         }
 
         public RocksDatabase Db => _db;
@@ -778,5 +842,98 @@ public sealed unsafe class Audit10WriteCustomizationCompatTests
             }
         }
         Assert.AreEqual(string.Join("\n", outcomes[0]), string.Join("\n", outcomes[1]), baseKind);
+    }
+
+    /// <summary>
+    /// A DB with merge operands reopened without its merge operator, or with a different one (another name). Upstream
+    /// does not check the operator against the OPTIONS file or the rocksdb.merge.operator table property: without one,
+    /// every read that meets an operand fails with InvalidArgument "merge_operator is not properly initialized."
+    /// (GetContext::SaveValue, DBIter::MergeValuesNewToOld, CompactionIterator::NextFromInput, also the flush of a WAL
+    /// replay, which then fails the open); with another one, the chains merge with it. Each engine reopens the DB the
+    /// other one wrote.
+    /// </summary>
+    [TestMethod]
+    [DataRow(MergeMode.None, false)]
+    [DataRow(MergeMode.None, true)]
+    [DataRow(MergeMode.Renamed, false)]
+    public void ReopenWithoutOrWithAnotherMergeOperatorMatchesNative(MergeMode merge, bool avoidFlushDuringRecovery)
+    {
+        using var dirA = new TempDir("a10mo-a");
+        using var dirB = new TempDir("a10mo-b");
+        var outcomes = new List<string>[2];
+        for (int e = 0; e < 2; e++)
+        {
+            var o = new List<string>();
+            outcomes[e] = o;
+            // Engine e writes, the other one reopens.
+            string path = e == 0 ? dirA.Path : dirB.Path;
+            IEngine w = e == 0 ? new NativeEngine(path, FilterMode.None, []) : new ManagedEngine(path, FilterMode.None, []);
+            try
+            {
+                w.Put(B("a"), B("1"));
+                w.Put(B("k"), B("base"));
+                w.Merge(B("k"), B("o1"));
+                w.Merge(B("m"), B("x"));
+                w.Flush();
+                w.Merge(B("k"), B("o2"));
+                w.Put(B("z"), B("2"));
+            }
+            finally
+            {
+                w.Dispose();
+            }
+            IEngine r;
+            try
+            {
+                r = e == 1 ? new NativeEngine(path, FilterMode.None, [], merge, avoidFlushDuringRecovery)
+                    : new ManagedEngine(path, FilterMode.None, [], merge, avoidFlushDuringRecovery);
+            }
+            catch (Exception ex) when (ex is RocksDbException or RocksDbSharp.RocksDbException)
+            {
+                o.Add("open " + Outcome(() => throw ex));
+                continue;
+            }
+            try
+            {
+                o.Add("open ok");
+                foreach (string k in new[] { "a", "k", "m", "z" }) o.Add("get " + k + " " + r.Get(B(k), 0));
+                o.Add("multiget " + r.MultiGet([B("a"), B("k"), B("z")], 0));
+                o.Add("scan " + r.Scan(null, null, false, 0));
+                if (merge != MergeMode.None)
+                {
+                    o.Add("scan back " + r.Scan(null, null, true, 0));
+                }
+                else if (r is ManagedEngine)
+                {
+                    // Upstream behaviour not shared: native's reverse iteration (DBIter::FindValueForCurrentKey) only
+                    // asserts merge_operator_ != nullptr and then dereferences it in TimedFullMerge, crashing the
+                    // process (SIGSEGV with the NuGet librocksdb 11.12); the port fails like the forward direction.
+                    StringAssert.EndsWith(r.Scan(null, null, true, 0), "error InvalidArgument");
+                }
+                o.Add("scan z " + r.Scan(B("n"), null, false, 0));
+                o.Add("flush " + Outcome(() =>
+                {
+                    r.Flush();
+                    return null;
+                }));
+                _ = Outcome(() =>
+                {
+                    r.Compact(null, null);
+                    return null;
+                });
+                o.Add("put after compact " + Outcome(() =>
+                {
+                    r.Put(B("p"), B("3"));
+                    return null;
+                }));
+                o.Add("files " + r.FilesPerLevel());
+                o.Add("get k " + r.Get(B("k"), 0));
+            }
+            finally
+            {
+                r.Dispose();
+            }
+        }
+        Assert.AreEqual(string.Join("\n", outcomes[0]), string.Join("\n", outcomes[1]), merge + " avoidFlushDuringRecovery=" + avoidFlushDuringRecovery);
     }
 }
