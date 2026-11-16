@@ -327,6 +327,31 @@ internal sealed class ErrorHandler
         }
     }
 
+    /// <summary>
+    /// Managed addition (no upstream counterpart): sets <paramref name="err"/> as a hard background error with
+    /// <paramref name="reason"/>, without the severity maps and without automatic recovery: writes stop until
+    /// <see cref="RocksDatabase.Resume"/>. Used for a UserWriteCallback that threw (DbImpl.OnUserWriteCallbackFailed),
+    /// which upstream treats as undefined behaviour and whose status the maps would classify as fatal. Listeners are
+    /// told (OnBackgroundError may suppress or replace the error, as in HandleKnownErrors). Called without the mutex.
+    /// </summary>
+    internal RocksDbException? SetHardBgError(RocksDbException err, BackgroundErrorReason reason)
+    {
+        Interlocked.Increment(ref _errorCount);
+        _db.Stats?.RecordTick(Ticker.ErrorHandlerBgErrorCount);
+        _db.LogWarn("Background error " + err.Message + ", reason " + (int)reason);
+        RocksDbException classified = err.WithSeverity(ErrorSeverity.HardError);
+        lock (_db.Mutex)
+        {
+            if (_recoveryInProgress && _recoveryError is null) _recoveryError = classified;
+        }
+        RocksDbException? s = NotifyOnBackgroundError(reason, classified, autoRecovery: false, out _);
+        lock (_db.Mutex)
+        {
+            if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated: false, FlushReason.ErrorRecovery);
+            return _bgError;
+        }
+    }
+
     private static ErrorSeverity Severity(RocksDbException? e) => e?.Severity ?? ErrorSeverity.NoError;
 
     /// <summary>

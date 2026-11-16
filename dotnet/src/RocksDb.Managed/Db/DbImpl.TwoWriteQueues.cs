@@ -146,8 +146,10 @@ internal sealed partial class DbImpl
         }
         finally
         {
+            Exception? userCallbackError = w.UserCallbackError;
             WriteThread.Return(w, synchronous);
             stats?.RecordElapsedMicros(Histogram.DbWrite, writeStart);
+            if (userCallbackError is not null) OnUserWriteCallbackFailed(userCallbackError);
         }
     }
 
