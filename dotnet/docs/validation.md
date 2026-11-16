@@ -2305,11 +2305,20 @@ complete asynchronously (and out of order), under a deliberately exhausted threa
   `Sync()` and `SyncAsync()` on a closed file threw different exceptions; the OpenAsync documentation claimed asynchronous
   recovery reads.
 
+- A user `UserWriteCallback` whose `OnWriteEnqueued` or `OnWalWriteFinish` throws left its writer linked in the write
+  queue: every later write and Dispose hung. Upstream calls these void, non-noexcept callbacks with no exception safety
+  (`WriteThread::JoinBatchGroup`: `LinkOne`, then `CheckWriteEnqueuedCallback()`), so a throw is undefined behaviour there.
+  **Deliberate deviation** (decided by the maintainers): the exception is recorded on the writer, the writer completes its
+  group normally (the other writers get their own outcome), then the DB sets a hard background error (Aborted,
+  `BackgroundErrorReason.WriteCallback`, no auto-recovery; managed-only `ErrorHandler.SetHardBgError`, because upstream's
+  severity maps make every WriteCallback / MemTable status fatal) and the caller gets the original exception. Later writes
+  fail until `Resume()`; the throwing write's outcome is indeterminate (documented). Before, a throwing `OnWalWriteFinish`
+  also failed every writer of its group after their WAL record was written. `ThrowingUserWriteCallbackFailsSafely`: 40
+  rows (5 write modes x both callbacks x leader / follower x sync / async). Upstream issue draft in
+  `upstream-issues/`.
+
 ### Open
 
-- A user `UserWriteCallback.OnWriteEnqueued` that throws leaves its writer linked in the write queue: every later write
-  and Dispose hang. Documented as "must not throw"; C++'s callback cannot fail. Ignored repro
-  `ThrowingOnWriteEnqueuedDoesNotStrandTheWriteQueue`.
 - A sync writer queued behind an async write leader waits for the leader's thread-pool continuation (async WAL I/O,
   stall waits); with the pool full of sync writers a capped pool deadlocks and the default pool stalls until it injects
   threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`.

@@ -450,7 +450,7 @@ Still open from this round:
 - [x] Close no longer hangs behind write-buffer-manager stalls or waits for thread-pool work; cancelled MANIFEST writes are atomic for the caller
 - [x] Transactions: range lock granted during cancellation released; lock timeouts beyond 24.8 days
 - [x] Sync/async parity differential tests for writes, reads, iterators, transactions, backup, control APIs; public async surface inventory test
-- [ ] A throwing `OnWriteEnqueued` callback strands the write queue (design decision; repro ignored)
+- [x] A throwing `UserWriteCallback` (OnWriteEnqueued / OnWalWriteFinish) fails safely: hard background error, caller gets the exception, Resume() recovers (deliberate deviation; upstream: undefined behaviour)
 - [ ] Sync writers behind an async leader depend on a thread-pool continuation (write-thread design; repro ignored)
 - [ ] `AsyncPrefetchBuffer.TakePending` blocks on a pool continuation without `Prefetch` support (macOS / custom file systems; repro ignored)
 
