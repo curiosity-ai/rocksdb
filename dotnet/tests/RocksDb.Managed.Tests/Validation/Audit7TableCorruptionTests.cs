@@ -250,6 +250,22 @@ public sealed class Audit7TableCorruptionTests
                     it.SeekForPrev(lk);
                     if (it.Valid) { _ = it.Key.Length; it.Prev(); }
                 }
+                // The async iterator paths (block reads with async I/O and readahead).
+                steps = 0;
+                await it.SeekToFirstAsync();
+                while (it.Valid && steps < 5000)
+                {
+                    steps++;
+                    await it.NextAsync();
+                }
+                Assert.IsTrue(steps < 5000, "async forward scan did not terminate");
+                if (b.Lookups.Count > 0)
+                {
+                    await it.SeekAsync(b.Lookups[0]);
+                    if (it.Valid) await it.PrevAsync();
+                    await it.SeekForPrevAsync(b.Lookups[^1]);
+                    await it.SeekToLastAsync();
+                }
             }
             BlockIter? rd = reader.NewRangeTombstoneIterator();
             if (rd is not null)
@@ -414,6 +430,7 @@ public sealed class Audit7TableCorruptionTests
         int tables = Environment.GetEnvironmentVariable("AUDIT7_TABLE_ROUNDS") is { } r ? int.Parse(r, System.Globalization.CultureInfo.InvariantCulture) : 100;
         var failures = new List<string>();
         var codes = new Dictionary<StatusCode, int>();
+        var messages = new SortedSet<string>(StringComparer.Ordinal);
         for (int t = 0; t < tables && failures.Count < 20; t++)
         {
             int seed = baseSeed + t;
@@ -449,6 +466,7 @@ public sealed class Audit7TableCorruptionTests
                 catch (RocksDbException e) when (m >= 0 && e.Code is StatusCode.Corruption or StatusCode.NotSupported or StatusCode.InvalidArgument)
                 {
                     codes[e.Code] = codes.GetValueOrDefault(e.Code) + 1;
+                    if (e.Code != StatusCode.Corruption) messages.Add(e.Message.Length > 80 ? e.Message[..80] : e.Message);
                 }
                 catch (Exception e) when (e is not AssertFailedException)
                 {
@@ -456,7 +474,7 @@ public sealed class Audit7TableCorruptionTests
                 }
             }
         }
-        Console.WriteLine("codes=" + string.Join(",", codes.Select(kv => kv.Key + ":" + kv.Value)));
+        Console.WriteLine("codes=" + string.Join(",", codes.Select(kv => kv.Key + ":" + kv.Value)) + "\n" + string.Join("\n", messages));
         if (failures.Count > 0) Assert.Fail(failures.Count + " failures:\n" + string.Join("\n\n", failures.Take(8)));
     }
 
