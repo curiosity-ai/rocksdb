@@ -100,4 +100,55 @@ public sealed class Audit7WritePathFailuresCompatTests
         // Native's message carries an empty state ("Shutdown in progress: "); the status code is what must agree.
         foreach (string status in new[] { nFlush, nWait, mFlush, mWait, mCompact }) StringAssert.StartsWith(status, "Shutdown in progress");
     }
+    private static int SstCount(string dir) => Directory.GetFiles(dir, "*.sst").Length;
+
+    /// <summary>
+    /// DBImpl::CleanupIteratorSuperVersion: the inputs of a compaction that ran while an iterator was open stay on disk
+    /// (the iterator's super version references them) and are deleted when the iterator is released -- by the release
+    /// itself (FindObsoleteFiles + PurgeObsoleteFiles), with no other flush or compaction. Both engines: 2 L0 files,
+    /// iterator, CompactRange -> 3 table files on disk, iterator released -> 1.
+    /// </summary>
+    [TestMethod]
+    public void IteratorReleaseDeletesCompactionInputsLikeNative()
+    {
+        using var nativeDir = new TempDir("a7-iter-purge-native");
+        int[] nativeCounts;
+        {
+            var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true).SetDisableAutoCompactions(1);
+            using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(o, nativeDir.Path);
+            for (int i = 0; i < 100; i++) db.Put(U("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)), U("a"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            for (int i = 0; i < 100; i += 2) db.Put(U("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)), U("b"));
+            db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
+            int before = SstCount(nativeDir.Path);
+            RocksDbSharp.Iterator it = db.NewIterator();
+            it.SeekToFirst();
+            db.CompactRange((byte[]?)null, null);
+            int pinned = SstCount(nativeDir.Path);
+            it.Dispose();
+            int released = SstCount(nativeDir.Path);
+            nativeCounts = [before, pinned, released];
+        }
+        using var managedDir = new TempDir("a7-iter-purge-managed");
+        int[] managedCounts;
+        {
+            using RocksDatabase db = RocksDatabase.Open(managedDir.Path, new DbOptions { CreateIfMissing = true },
+                new ColumnFamilyOptions { DisableAutoCompactions = true });
+            for (int i = 0; i < 100; i++) db.Put(U("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)), U("a"));
+            db.Flush();
+            for (int i = 0; i < 100; i += 2) db.Put(U("k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture)), U("b"));
+            db.Flush();
+            int before = SstCount(managedDir.Path);
+            Iterator it = db.NewIterator();
+            it.SeekToFirst();
+            db.CompactRange();
+            int pinned = SstCount(managedDir.Path);
+            it.Dispose();
+            int released = SstCount(managedDir.Path);
+            managedCounts = [before, pinned, released];
+        }
+        Console.WriteLine("native " + string.Join(",", nativeCounts) + " managed " + string.Join(",", managedCounts));
+        CollectionAssert.AreEqual(new[] { 2, 3, 1 }, nativeCounts, "native");
+        CollectionAssert.AreEqual(nativeCounts, managedCounts, "managed");
+    }
 }

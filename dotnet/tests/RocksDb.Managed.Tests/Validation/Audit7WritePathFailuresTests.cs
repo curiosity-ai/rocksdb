@@ -783,8 +783,87 @@ public sealed class Audit7WritePathFailuresTests
         using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
         for (int i = 0; i < 200; i++) CollectionAssert.AreEqual(Value(i, i % 2 == 0 ? 1 : 0), reopened.Get(Key(i)), "after reopen " + i);
         reopened.WaitForCompact();
-        CollectionAssert.AreEqual(LiveSst(reopened).ToList(), SstOnDisk(fs).ToList(), "files left after the reopen");
+        // The reads above may hold the super version that still references the compaction inputs while the compaction of
+        // the reopened DB installs its result; a point read that drops the last reference leaves the inputs to the next
+        // purge (DBImpl::ReturnAndCleanupSuperVersion -> CleanupSuperVersion does not run FindObsoleteFiles), as upstream.
+        // The next flush purges them (BackgroundCallFlush -> FindObsoleteFiles + PurgeObsoleteFiles).
+        reopened.Put(B("after"), B("1"));
+        reopened.Flush();
+        List<string> live = LiveSst(reopened).ToList(), disk = SstOnDisk(fs).ToList();
+        CollectionAssert.AreEqual(live, disk, "files left after the reopen: live [" + string.Join(", ", live) + "], on disk [" + string.Join(", ", disk) + "]");
     }
+
+    /// <summary>Two overlapping L0 files and a compaction of them held at its start until <paramref name="gate"/> is set.</summary>
+    private static RocksDatabase OpenWithTwoL0Files(IFileSystem fs, ManualResetEventSlim gate)
+    {
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait(Timeout));
+        RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { Level0FileNumCompactionTrigger = 2 });
+        for (int i = 0; i < 100; i++) db.Put(Key(i), Value(i, 0));
+        db.Flush();
+        for (int i = 0; i < 100; i += 2) db.Put(Key(i), Value(i, 1));
+        db.Flush();
+        return db;
+    }
+
+    private static string Files(IEnumerable<string> files) => "[" + string.Join(", ", files) + "]";
+
+    /// <summary>
+    /// A point read that holds the super version while a compaction installs its result keeps the compaction inputs; when
+    /// the read drops the last reference, DBImpl::ReturnAndCleanupSuperVersion -> CleanupSuperVersion only queues them as
+    /// obsolete (no FindObsoleteFiles), so they stay on disk until the next flush / compaction / iterator release / close
+    /// purges them -- upstream behavior. Deterministic form of the interleaving that made
+    /// <see cref="FailedCompactionLeavesNoOrphanOutputs"/> flaky.
+    /// </summary>
+    [TestMethod]
+    public void PointReadReleasingTheLastReferenceLeavesCompactionInputsToTheNextPurge()
+    {
+        MemoryFileSystem fs = NewFs();
+        using var gate = new ManualResetEventSlim(false);
+        using RocksDatabase db = OpenWithTwoL0Files(fs, gate);
+        ColumnFamily cf = db.DefaultColumnFamily;
+        List<string> inputs = LiveSst(db).ToList();
+        Assert.AreEqual(2, inputs.Count);
+        // A read in flight: the reference a Get takes (GetReferencedSuperVersion) and releases (ReturnSuperVersion).
+        SuperVersion sv = DbImpl.GetReferencedSuperVersion(cf.Data);
+        gate.Set();
+        db.WaitForCompact();
+        Assert.AreEqual(1, LiveSst(db).Count);
+        foreach (string f in inputs) CollectionAssert.Contains(SstOnDisk(fs).ToList(), f, "pinned by the read");
+        cf.Db.ReturnSuperVersion(sv);
+        foreach (string f in inputs) CollectionAssert.Contains(SstOnDisk(fs).ToList(), f, "a point read does not purge");
+        db.Put(B("next"), B("1"));
+        db.Flush();
+        CollectionAssert.AreEqual(LiveSst(db).ToList(), SstOnDisk(fs).ToList(), "the next flush purges them");
+    }
+
+    /// <summary>
+    /// DBImpl::CleanupIteratorSuperVersion: an iterator that held the super version across a compaction deletes the
+    /// compaction inputs when it is released (FindObsoleteFiles + PurgeObsoleteFiles), at once or, with
+    /// ReadOptions::background_purge_on_iterator_cleanup, on a background thread (SchedulePurge). The port did not purge
+    /// on iterator release. Native: Audit7WritePathFailuresCompatTests.IteratorReleaseDeletesCompactionInputsLikeNative.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void IteratorReleaseDeletesCompactionInputs(bool backgroundPurge)
+    {
+        MemoryFileSystem fs = NewFs();
+        using var gate = new ManualResetEventSlim(false);
+        using RocksDatabase db = OpenWithTwoL0Files(fs, gate);
+        List<string> inputs = LiveSst(db).ToList();
+        Iterator it = db.NewIterator(new ReadOptions { BackgroundPurgeOnIteratorCleanup = backgroundPurge });
+        it.SeekToFirst();
+        Assert.IsTrue(it.Valid);
+        gate.Set();
+        db.WaitForCompact();
+        foreach (string f in inputs) CollectionAssert.Contains(SstOnDisk(fs).ToList(), f, "pinned by the iterator");
+        it.Dispose();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (backgroundPurge && SstOnDisk(fs).Count > LiveSst(db).Count && sw.Elapsed < Timeout) Thread.Sleep(5);
+        CollectionAssert.AreEqual(LiveSst(db).ToList(), SstOnDisk(fs).ToList(),
+            "after the iterator release: live " + Files(LiveSst(db)) + ", on disk " + Files(SstOnDisk(fs)));
+    }
+
     /// <summary>
     /// A CompactRange that passed its closed-DB check just before the close (here: with nothing to flush, held right
     /// after the flush step) must fail once the close released the column family's super version. It used to spin

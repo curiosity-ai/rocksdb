@@ -939,7 +939,7 @@ internal sealed partial class DbImpl
             OptimizeFiltersForHits = cfd.Options.OptimizeFiltersForHits,
             NumNonEmptyLevels = s.NumNonEmptyLevels,
             ReadCallback = callback,
-            Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot),
+            Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot, options?.BackgroundPurgeOnIteratorCleanup ?? false),
         };
     }
 
@@ -1076,7 +1076,7 @@ internal sealed partial class DbImpl
     /// Releases an iterator's super version reference (CleanupSuperVersionHandle) and the snapshot it owns
     /// (WritePreparedTxnDB::IteratorState).
     /// </summary>
-    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv, Snapshot? ownedSnapshot) : IDisposable
+    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv, Snapshot? ownedSnapshot, bool backgroundPurge) : IDisposable
     {
         private int _done;
 
@@ -1084,7 +1084,7 @@ internal sealed partial class DbImpl
         {
             if (Interlocked.Exchange(ref _done, 1) == 0)
             {
-                db.ReturnSuperVersion(sv);
+                db.ReturnIteratorSuperVersion(sv, backgroundPurge);
                 ownedSnapshot?.Dispose();
             }
         }
