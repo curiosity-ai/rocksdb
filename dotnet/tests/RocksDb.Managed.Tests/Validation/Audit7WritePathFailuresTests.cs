@@ -565,4 +565,175 @@ public sealed class Audit7WritePathFailuresTests
             db.Dispose();
         }
     }
+    /// <summary>
+    /// After Close every API fails with ObjectDisposedException (a managed contract: native has no use-after-close
+    /// behavior, the handle is gone), WaitForCompact with ShutdownInProgress (DBImpl::WaitForCompact once
+    /// shutting_down_ is set), and Dispose again is a no-op -- never a NullReferenceException or a hang. Synchronous and
+    /// asynchronous forms, default and named column family.
+    /// </summary>
+    [TestMethod]
+    public async Task EveryCallAfterCloseFailsWithObjectDisposed()
+    {
+        MemoryFileSystem fs = NewFs();
+        DbOptions o = NewOptions(fs);
+        o.CreateMissingColumnFamilies = true;
+        RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { MergeOperator = new StringAppendOperator() });
+        ColumnFamily cf = db.CreateColumnFamily("cf", new ColumnFamilyOptions());
+        db.Put(B("a"), B("1"));
+        cf.Put(B("a"), B("1"));
+        db.Flush();
+        await db.DisposeAsync();
+        var calls = new List<(string Name, Func<Task> Call)>
+        {
+            ("Put", () => { db.Put(B("b"), B("2")); return Task.CompletedTask; }),
+            ("PutAsync", async () => await db.PutAsync(B("b"), B("2"))),
+            ("cf.Put", () => { cf.Put(B("b"), B("2")); return Task.CompletedTask; }),
+            ("Delete", () => { db.Delete(B("a")); return Task.CompletedTask; }),
+            ("DeleteRange", () => { db.DeleteRange(B("a"), B("b")); return Task.CompletedTask; }),
+            ("Merge", () => { db.Merge(B("a"), B("x")); return Task.CompletedTask; }),
+            ("Write", () =>
+            {
+                using WriteBatch batch = db.CreateWriteBatch();
+                batch.Put(B("b"), B("2"));
+                db.Write(batch);
+                return Task.CompletedTask;
+            }),
+            ("WriteAsync", async () =>
+            {
+                using WriteBatch batch = db.CreateWriteBatch();
+                batch.Put(B("b"), B("2"));
+                await db.WriteAsync(batch);
+            }),
+            ("Get", () => { _ = db.Get(B("a")); return Task.CompletedTask; }),
+            ("cf.Get", () => { _ = cf.Get(B("a")); return Task.CompletedTask; }),
+            ("MultiGet", () => { _ = db.MultiGet(new[] { B("a") }); return Task.CompletedTask; }),
+            ("NewIterator", () => { using Iterator it = db.NewIterator(); it.SeekToFirst(); return Task.CompletedTask; }),
+            ("GetSnapshot", () => { using Snapshot s = db.GetSnapshot(); return Task.CompletedTask; }),
+            ("Flush", () => { db.Flush(); return Task.CompletedTask; }),
+            ("FlushAsync", async () => await db.FlushAsync()),
+            ("CompactRange", () => { db.CompactRange(); return Task.CompletedTask; }),
+            ("CompactRangeAsync", async () => await db.CompactRangeAsync()),
+            ("GetProperty", () => { _ = db.GetProperty("rocksdb.stats"); return Task.CompletedTask; }),
+            ("GetLiveFilesMetadata", () => { _ = db.GetLiveFilesMetadata(); return Task.CompletedTask; }),
+            ("CreateColumnFamily", () => { db.CreateColumnFamily("cf2", new ColumnFamilyOptions()); return Task.CompletedTask; }),
+            ("Resume", () => { db.Resume(); return Task.CompletedTask; }),
+            ("WaitForCompact", () => { db.WaitForCompact(); return Task.CompletedTask; }),
+            ("Dispose", () => { db.Dispose(); return Task.CompletedTask; }),
+        };
+        var wrong = new List<string>();
+        foreach ((string name, Func<Task> call) in calls)
+        {
+            Task t;
+            try
+            {
+                t = call();
+            }
+            catch (Exception e)
+            {
+                t = Task.FromException(e);
+            }
+            if (!((IAsyncResult)t).AsyncWaitHandle.WaitOne(Timeout))
+            {
+                wrong.Add(name + ": hung");
+                continue;
+            }
+            Exception? error = t.Exception?.InnerException;
+            string expected = name switch
+            {
+                "Dispose" => "none",
+                "WaitForCompact" => "ShutdownInProgress",
+                _ => "ObjectDisposed",
+            };
+            string actual = error switch
+            {
+                null => "none",
+                ObjectDisposedException => "ObjectDisposed",
+                RocksDbException { Code: StatusCode.ShutdownInProgress } => "ShutdownInProgress",
+                _ => error.GetType().Name + ": " + error.Message,
+            };
+            if (actual != expected) wrong.Add(name + ": " + actual);
+        }
+        Assert.AreEqual(0, wrong.Count, string.Join("\n", wrong));
+    }
+    private static SortedSet<string> SstOnDisk(IFileSystem fs)
+    {
+        var set = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (string f in fs.GetChildren(DbPath))
+        {
+            string name = Path.GetFileName(f);
+            if (name.EndsWith(".sst", StringComparison.Ordinal)) set.Add(name);
+        }
+        return set;
+    }
+
+    private static SortedSet<string> LiveSst(RocksDatabase db)
+    {
+        var set = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (LiveFileMetadata m in db.GetLiveFilesMetadata()) set.Add(Path.GetFileName(m.Name));
+        return set;
+    }
+
+    /// <summary>
+    /// A compaction that fails while writing its output (table file append / sync, or the MANIFEST write that installs
+    /// it) leaves the DB consistent: CompactionJob::CleanupCompaction / FindObsoleteFiles remove the outputs of a job
+    /// whose edit was not written, the outputs of a failed MANIFEST write are kept until the next open decides
+    /// (ErrorHandler::AddFilesToQuarantine), the data reads the same before and after the reopen, and the reopened DB
+    /// holds exactly its live table files.
+    /// </summary>
+    [TestMethod]
+    [DataRow(".sst", 2)] // FaultOps.Append
+    [DataRow(".sst", 4)] // FaultOps.Sync
+    [DataRow("MANIFEST", 2)]
+    [DataRow("MANIFEST", 4)]
+    public void FailedCompactionLeavesNoOrphanOutputs(string fragment, int faultOps)
+    {
+        var fs = new FaultInjectionFileSystem(NewFs());
+        var cfo = new ColumnFamilyOptions { Level0FileNumCompactionTrigger = 2 };
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait(Timeout));
+        RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        try
+        {
+            for (int i = 0; i < 200; i++) db.Put(Key(i), Value(i, 0));
+            db.Flush();
+            for (int i = 0; i < 200; i += 2) db.Put(Key(i), Value(i, 1));
+            db.Flush();
+            fs.FailMatching(fragment, (FaultOps)faultOps, 1, InjectedFaultKind.IOError);
+            gate.Set();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            RocksDbException? bg = null;
+            while (sw.Elapsed < Timeout)
+            {
+                try
+                {
+                    db.Put(B("probe"), B("1"));
+                }
+                catch (RocksDbException e)
+                {
+                    bg = e;
+                    break;
+                }
+                Thread.Sleep(10);
+            }
+            Assert.IsNotNull(bg, "the failed compaction did not stop writes (paranoid_checks: fatal IOError)");
+            Assert.AreEqual(StatusCode.IOError, bg.Code);
+            Assert.AreEqual(1, fs.TargetedFaults);
+            for (int i = 0; i < 200; i++) CollectionAssert.AreEqual(Value(i, i % 2 == 0 ? 1 : 0), db.Get(Key(i)), "before reopen " + i);
+            if (fragment == ".sst")
+            {
+                // Nothing reached the MANIFEST: the partial outputs are gone already.
+                CollectionAssert.AreEqual(LiveSst(db).ToList(), SstOnDisk(fs).ToList(), "orphan compaction outputs");
+            }
+        }
+        finally
+        {
+            gate.Set();
+            try { db.Dispose(); }
+            catch (RocksDbException) { }
+        }
+        using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        for (int i = 0; i < 200; i++) CollectionAssert.AreEqual(Value(i, i % 2 == 0 ? 1 : 0), reopened.Get(Key(i)), "after reopen " + i);
+        reopened.WaitForCompact();
+        CollectionAssert.AreEqual(LiveSst(reopened).ToList(), SstOnDisk(fs).ToList(), "files left after the reopen");
+    }
 }
