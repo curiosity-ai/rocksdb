@@ -23,6 +23,10 @@ public sealed class ErrorHandlerTests
         public bool DisableAutoRecovery { get; set; }
         public bool SuppressErrors { get; set; }
         public int RecoveryBegins;
+        /// <summary>Runs in OnErrorRecoveryEnd, before <see cref="RecoveryEnded"/> is set.</summary>
+        public Action<BackgroundErrorRecoveryInfo>? RecoveryEndAction { get; set; }
+        public int RecoveryEndThreadId;
+        public bool RecoveryEndOnThreadPool;
 
         public override void OnBackgroundError(BackgroundErrorEventArgs e)
         {
@@ -39,6 +43,9 @@ public sealed class ErrorHandlerTests
         public override void OnErrorRecoveryEnd(BackgroundErrorRecoveryInfo info)
         {
             RecoveryEnds.Enqueue(info);
+            RecoveryEndThreadId = Environment.CurrentManagedThreadId;
+            RecoveryEndOnThreadPool = Thread.CurrentThread.IsThreadPoolThread;
+            RecoveryEndAction?.Invoke(info);
             RecoveryEnded.Set();
         }
 
@@ -527,6 +534,112 @@ public sealed class ErrorHandlerTests
         fs.ClearFailMatching();
         Assert.AreEqual(0, fs.OpenFiles);
         AssertReopens(fs, "a");
+    }
+
+    /// <summary>
+    /// A listener closes the DB from OnErrorRecoveryEnd raised by the automatic recovery task, after a recovered error
+    /// (raised by ResumeImpl) or after the recovery gave up (raised by the recovery loop). Upstream's close would join the
+    /// recovery thread it runs on; here the close does not wait for it (sync Dispose, and DisposeAsync blocked on).
+    /// </summary>
+    [TestMethod]
+    [DataRow(false, false, DisplayName = "Dispose, recovered")]
+    [DataRow(true, false, DisplayName = "DisposeAsync, recovered")]
+    [DataRow(false, true, DisplayName = "Dispose, recovery gave up")]
+    [DataRow(true, true, DisplayName = "DisposeAsync, recovery gave up")]
+    public void CloseFromOnErrorRecoveryEndOfAutoRecovery(bool disposeAsync, bool recoveryGivesUp)
+    {
+        (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        if (recoveryGivesUp) options.MaxBgErrorResumeCount = 2;
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("RecoverFromRetryableBGIOError:BeforeResume", () => gate.Wait(Timeout));
+        RocksDatabase db = RocksDatabase.Open(DbPath, options);
+        Exception? closeError = null;
+        bool closed = false;
+        listener.RecoveryEndAction = _ =>
+        {
+            try
+            {
+                if (disposeAsync)
+                {
+                    closed = db.DisposeAsync().AsTask().Wait(Timeout);
+                }
+                else
+                {
+                    db.Dispose();
+                    closed = true;
+                }
+            }
+            catch (Exception e)
+            {
+                closeError = e;
+            }
+        };
+        try
+        {
+            Put(db, "a");
+            fs.FailMatching(".sst", FaultOps.Append, recoveryGivesUp ? 1000 : 1, InjectedFaultKind.Retryable);
+            RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+            Assert.AreEqual(ErrorSeverity.SoftError, ex.Severity);
+            gate.Set();
+            // Set once the listener's close returned: a close waiting for the recovery task fails here instead of hanging.
+            BackgroundErrorRecoveryInfo end = listener.WaitForRecoveryEnd();
+            Assert.IsNull(closeError, closeError?.ToString());
+            Assert.IsTrue(closed, "close did not finish");
+            if (recoveryGivesUp) Assert.AreEqual(StatusCode.Aborted, end.NewBackgroundError!.Code);
+            else Assert.IsNull(end.NewBackgroundError);
+            Assert.ThrowsExactly<ObjectDisposedException>(() => Put(db, "b"));
+            db.Dispose(); // already closed: no-op
+            fs.ClearFailMatching();
+            Assert.AreEqual(0, fs.OpenFiles);
+            AssertReopens(fs, "a");
+        }
+        finally
+        {
+            gate.Set();
+            TestHooks.ClearAll();
+            db.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The synchronous Resume runs the whole recovery (wait for background work, new MANIFEST, new WAL, recovery flush)
+    /// on the calling thread: run on a dedicated (non-pool) thread, the recovery's own OnErrorRecoveryEnd, raised after
+    /// all of it, comes on that thread. An await that did not complete synchronously would have resumed on the pool.
+    /// </summary>
+    [TestMethod]
+    [DataRow(".sst", DisplayName = "flush error")]
+    [DataRow(".log", DisplayName = "WAL write error")]
+    [DataRow("MANIFEST", DisplayName = "MANIFEST write error")]
+    public void SyncResumeRunsOnTheCallingThread(string failingFile)
+    {
+        (FaultInjectionFileSystem fs, DbOptions options, ErrorListener listener) = Setup();
+        options.MaxBgErrorResumeCount = 0; // retryable errors are hard until Resume
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, options))
+        {
+            Put(db, "a");
+            fs.FailMatching(failingFile, FaultOps.Append, 1, InjectedFaultKind.Retryable);
+            RocksDbException ex = failingFile == ".log"
+                ? Assert.ThrowsExactly<RocksDbException>(() => Put(db, "lost"))
+                : Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+            Assert.AreEqual(StatusCode.IOError, ex.Code);
+            Assert.AreEqual(ErrorSeverity.HardError, db.BackgroundError!.Severity);
+            Exception? resumeError = null;
+            var thread = new Thread(() =>
+            {
+                try { db.Resume(); }
+                catch (Exception e) { resumeError = e; }
+            }) { IsBackground = true, Name = "sync-resume" };
+            thread.Start();
+            Assert.IsTrue(thread.Join(Timeout), "Resume did not finish");
+            Assert.IsNull(resumeError, resumeError?.ToString());
+            Assert.IsNull(db.BackgroundError);
+            Assert.AreEqual(1, listener.RecoveryEnds.Count);
+            Assert.IsNull(listener.WaitForRecoveryEnd().NewBackgroundError);
+            Assert.AreEqual(thread.ManagedThreadId, listener.RecoveryEndThreadId, "the recovery left the calling thread");
+            Assert.IsFalse(listener.RecoveryEndOnThreadPool);
+            Put(db, "b");
+        }
+        AssertReopens(fs, "a", "b");
     }
 
     private static string CurrentManifest(FaultInjectionFileSystem fs)

@@ -213,6 +213,21 @@ public sealed class ExternalFileIngestionInfo
 /// not wait for a flush or compaction to finish (deadlock risk), but it may read from or write to the DB. Exceptions
 /// thrown by callbacks are caught and logged.
 /// </para>
+/// <para>
+/// <b>Error recovery</b>: <see cref="OnBackgroundError"/> and <see cref="OnErrorRecoveryBegin"/> run on the thread whose
+/// operation failed: a flush or compaction (including the flushes an error recovery runs), a write or memtable switch
+/// that failed its WAL write, or the error recovery itself. <see cref="OnErrorRecoveryEnd"/> runs on the recovery: the
+/// automatic recovery task, the <see cref="SstFileManager"/>'s out-of-space recovery task or the thread calling
+/// <see cref="RocksDatabase.Resume"/> (during close, also the thread that reported an error the recovery was refused for).
+/// <list type="bullet">
+/// <item>From <see cref="OnErrorRecoveryEnd"/> raised by a recovery, the DB may be closed (<see cref="RocksDatabase.Dispose"/>,
+/// or <see cref="RocksDatabase.DisposeAsync"/>, also when blocking on it): the close does not wait for the recovery task
+/// that raised the callback, which has no DB work left. This deviates from upstream, where the close self-joins.</item>
+/// <item>From <see cref="OnBackgroundError"/>, <see cref="OnErrorRecoveryBegin"/> and the flush and compaction
+/// callbacks, the DB must not be closed, and nothing may wait for background work or the write queue (a flush or
+/// compaction with wait, <see cref="RocksDatabase.Resume"/>): the caller may be that work, so these deadlock.</item>
+/// </list>
+/// </para>
 /// </summary>
 public abstract class EventListener
 {

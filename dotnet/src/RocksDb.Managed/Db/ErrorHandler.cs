@@ -26,6 +26,12 @@ namespace RocksDb.Managed.Db;
 /// published through a volatile field for the lock-free write path check (is_db_stopped_). Listeners are called without
 /// the mutex (upstream releases it around the callbacks).
 /// </para>
+/// <para>
+/// <b>Closing from OnErrorRecoveryEnd</b> (deviation): upstream's close joins the recovery thread, so a listener that
+/// closes the DB from OnErrorRecoveryEnd raised by the recovery thread self-joins. Here the notification of a recovery
+/// task (<see cref="ErrorRecoveryRun"/>) is marked on the execution context, and a close made under that mark does not
+/// wait for that task: it is the caller, past its last DB operation (see <see cref="NotifyOnErrorRecoveryEnd"/>).
+/// </para>
 /// </summary>
 internal sealed class ErrorHandler
 {
@@ -40,8 +46,12 @@ internal sealed class ErrorHandler
     private bool _walWriteError;                 // DBRecoverContext::IsWALWriteErrorRecovery (simplified)
     private volatile bool _isDbStopped;          // is_db_stopped_
     private Task _recoveryTask = Task.CompletedTask;
+    private ErrorRecoveryRun? _startedRecoveryRun; // the automatic recovery run that started last (guarded by mutex)
     private readonly CancellationTokenSource _recoveryCancellation = new();
     private long _errorCount;
+
+    /// <summary>The recovery run whose OnErrorRecoveryEnd listeners are running on this execution context, or null.</summary>
+    private static readonly AsyncLocal<ErrorRecoveryRun?> s_recoveryEndNotification = new();
 
     public ErrorHandler(DbImpl db) => _db = db;
 
@@ -243,7 +253,7 @@ internal sealed class ErrorHandler
             }
             // StartRecoverFromRetryableBGIOError with end_recovery_ set: the listeners are still told that the recovery
             // of this error ended with ShutdownInProgress (error_handler.cc).
-            if (recoveryEndedByShutdown && current is not null) NotifyOnErrorRecoveryEnd(current, ShutdownStatus());
+            if (recoveryEndedByShutdown && current is not null) NotifyOnErrorRecoveryEnd(current, ShutdownStatus(), run: null);
             return current;
         }
         return HandleKnownErrors(err, reason, walRelated);
@@ -358,9 +368,10 @@ internal sealed class ErrorHandler
 
     /// <summary>
     /// Port of ErrorHandler::RecoverFromBGError. Called without the mutex. Returns null on success, otherwise the
-    /// reason the recovery failed.
+    /// reason the recovery failed. <paramref name="run"/>: the recovery task calling it (the SstFileManager's), null for
+    /// a manual Resume. With <paramref name="synchronous"/> every wait blocks the calling thread (no thread-pool work).
     /// </summary>
-    public async ValueTask<RocksDbException?> RecoverFromBgErrorAsync(bool isManual)
+    public async ValueTask<RocksDbException?> RecoverFromBgErrorAsync(bool isManual, ErrorRecoveryRun? run, bool synchronous)
     {
         bool softNoBgWorkOnEntry;
         RocksDbException? cleared = null;
@@ -387,13 +398,13 @@ internal sealed class ErrorHandler
         }
         if (clearedDirectly)
         {
-            if (cleared is not null) NotifyOnErrorRecoveryEnd(cleared, null);
+            if (cleared is not null) NotifyOnErrorRecoveryEnd(cleared, null, run);
             return null;
         }
         RocksDbException? s;
         try
         {
-            s = await _db.ResumeImplAsync().ConfigureAwait(false);
+            s = await _db.ResumeImplAsync(run, synchronous).ConfigureAwait(false);
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
@@ -428,17 +439,23 @@ internal sealed class ErrorHandler
         // Set in the same lock hold as the error, otherwise intervening writes could see an error without a recovery.
         _recoveryInProgress = true;
         Task previous = _recoveryTask;
+        var run = new ErrorRecoveryRun();
         _recoveryTask = Task.Run(async () =>
         {
             try { await previous.ConfigureAwait(false); }
             catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException) { }
-            await RecoverFromRetryableBgIoErrorAsync().ConfigureAwait(false);
+            lock (_db.Mutex) _startedRecoveryRun = run;
+            await RecoverFromRetryableBgIoErrorAsync(run).ConfigureAwait(false);
         });
         return false;
     }
 
-    /// <summary>Port of ErrorHandler::RecoverFromRetryableBGIOError (the automatic recovery loop).</summary>
-    private async Task RecoverFromRetryableBgIoErrorAsync()
+    /// <summary>
+    /// Port of ErrorHandler::RecoverFromRetryableBGIOError (the automatic recovery loop, on <see cref="_recoveryTask"/>).
+    /// Every OnErrorRecoveryEnd it raises is its last DB operation besides statistics, logging and test hooks (a listener
+    /// may close the DB there, see <see cref="EndAutoRecoveryAsync"/>).
+    /// </summary>
+    private async Task RecoverFromRetryableBgIoErrorAsync(ErrorRecoveryRun run)
     {
         DbOptions o = _db.Options;
         int resumeCount = o.MaxBgErrorResumeCount;
@@ -457,7 +474,7 @@ internal sealed class ErrorHandler
             }
             if (_endRecovery)
             {
-                if (oldError is not null) NotifyOnErrorRecoveryEnd(oldError, ShutdownStatus());
+                if (oldError is not null) NotifyOnErrorRecoveryEnd(oldError, ShutdownStatus(), run);
                 return;
             }
             TestHooks.Invoke("RecoverFromRetryableBGIOError:BeforeResume");
@@ -466,7 +483,7 @@ internal sealed class ErrorHandler
             RocksDbException? s;
             try
             {
-                s = await _db.ResumeImplAsync().ConfigureAwait(false);
+                s = await _db.ResumeImplAsync(run, synchronous: false).ConfigureAwait(false);
             }
             catch (Exception e) when (e is not OutOfMemoryException)
             {
@@ -484,7 +501,7 @@ internal sealed class ErrorHandler
                 // Shutdown, or the error became worse than hard: stop.
                 lock (_db.Mutex) _recoveryInProgress = false;
                 _db.Stats?.RecordInHistogram(Histogram.ErrorHandlerAutoresumeRetryCount, retryCount);
-                NotifyOnErrorRecoveryEnd(bg ?? oldError!, bg ?? s);
+                NotifyOnErrorRecoveryEnd(bg ?? oldError!, bg ?? s, run);
                 return;
             }
             // recovery_error_.GetRetryable() only: a file-scoped error that is not retryable ends the recovery.
@@ -513,7 +530,7 @@ internal sealed class ErrorHandler
                 // The recovery error is more serious or not retryable, or another error happened: stop.
                 lock (_db.Mutex) _recoveryInProgress = false;
                 _db.Stats?.RecordInHistogram(Histogram.ErrorHandlerAutoresumeRetryCount, retryCount);
-                NotifyOnErrorRecoveryEnd(bg ?? oldError!, recoveryError ?? s);
+                NotifyOnErrorRecoveryEnd(bg ?? oldError!, recoveryError ?? s, run);
                 return;
             }
             resumeCount--;
@@ -525,7 +542,7 @@ internal sealed class ErrorHandler
         }
         if (oldError is not null)
         {
-            NotifyOnErrorRecoveryEnd(oldError, new RocksDbException(StatusCode.Aborted, "Operation aborted: Exceeded resume retry count"));
+            NotifyOnErrorRecoveryEnd(oldError, new RocksDbException(StatusCode.Aborted, "Operation aborted: Exceeded resume retry count"), run);
         }
         TestHooks.Invoke("RecoverFromRetryableBGIOError:LoopOut");
         _db.Stats?.RecordInHistogram(Histogram.ErrorHandlerAutoresumeRetryCount, retryCount);
@@ -536,15 +553,24 @@ internal sealed class ErrorHandler
     /// <summary>
     /// Port of CancelErrorRecoveryForShutDown + EndAutoRecovery: stops automatic recovery and waits for the recovery
     /// task. Called without the mutex, before close waits for background work.
+    /// <para>
+    /// Called from OnErrorRecoveryEnd raised by the automatic recovery run that started last, it does not wait (upstream
+    /// self-joins): that run is the caller and is past its last DB operation. A run chained after it has not started (it
+    /// awaits the caller) and ends at once on <c>_endRecovery</c>. A stale mark (an execution context captured during an
+    /// older run's notification) does not match the run that started last, so close waits as usual.
+    /// </para>
     /// </summary>
     public async ValueTask EndAutoRecoveryAsync(bool synchronous)
     {
         Task t;
+        bool calledByRecoveryTask;
+        ErrorRecoveryRun? caller = s_recoveryEndNotification.Value;
         lock (_db.Mutex)
         {
             _autoRecovery = false;
             _endRecovery = true;
             t = _recoveryTask;
+            calledByRecoveryTask = caller is not null && caller == _startedRecoveryRun;
         }
         // CancelErrorRecoveryForShutDown: a recovery waiting in the SstFileManager is dropped; one running right now sees
         // the shutdown and ends.
@@ -558,6 +584,11 @@ internal sealed class ErrorHandler
         }
         catch (AggregateException)
         {
+        }
+        if (calledByRecoveryTask)
+        {
+            _db.LogInfo("ErrorHandler: close called from the recovery task's OnErrorRecoveryEnd, not waiting for it");
+            return;
         }
         try
         {
@@ -620,25 +651,50 @@ internal sealed class ErrorHandler
         return result;
     }
 
-    /// <summary>Port of EventHelpers::NotifyOnErrorRecoveryEnd. Called without the mutex.</summary>
-    internal void NotifyOnErrorRecoveryEnd(RocksDbException oldError, RocksDbException? newError)
+    /// <summary>
+    /// Port of EventHelpers::NotifyOnErrorRecoveryEnd. Called without the mutex. <paramref name="run"/>: the recovery task
+    /// raising it, or null (a manual Resume, or the thread reporting an error during shutdown). A recovery task raises it
+    /// only once it holds no write queue, background job or lock and has no DB work left; its listeners run under
+    /// <see cref="s_recoveryEndNotification"/>, so that closing the DB from them does not wait for that task.
+    /// </summary>
+    internal void NotifyOnErrorRecoveryEnd(RocksDbException oldError, RocksDbException? newError, ErrorRecoveryRun? run)
     {
         _db.LogInfo(newError is null ? "ErrorHandler: Recovered from background error" : "ErrorHandler: Recovery ended: " + newError.Message);
         List<EventListener> listeners = _db.Options.Listeners;
         if (listeners.Count == 0) return;
         var info = new BackgroundErrorRecoveryInfo { OldBackgroundError = oldError, NewBackgroundError = newError };
-        foreach (EventListener l in listeners)
+        ErrorRecoveryRun? outer = s_recoveryEndNotification.Value;
+        if (run is not null) s_recoveryEndNotification.Value = run;
+        try
         {
-            try
+            foreach (EventListener l in listeners)
             {
-                l.OnErrorRecoveryEnd(info);
-            }
-            catch (Exception e) when (e is not OutOfMemoryException)
-            {
-                _db.LogWarn("EventListener.OnErrorRecoveryEnd threw: " + e.Message);
+                try
+                {
+                    l.OnErrorRecoveryEnd(info);
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    _db.LogWarn("EventListener.OnErrorRecoveryEnd threw: " + e.Message);
+                }
             }
         }
+        finally
+        {
+            if (run is not null) s_recoveryEndNotification.Value = outer;
+        }
     }
+
+    /// <summary>The recovery run whose OnErrorRecoveryEnd listeners are running on the current execution context, or null.</summary>
+    internal static ErrorRecoveryRun? CurrentRecoveryEndNotification => s_recoveryEndNotification.Value;
+}
+
+/// <summary>
+/// Identity of one run of a recovery task: the automatic recovery loop of <see cref="ErrorHandler"/>, or one recovery
+/// attempt of the <see cref="SstFileManager"/>'s out-of-space recovery task. Compared by reference.
+/// </summary>
+internal sealed class ErrorRecoveryRun
+{
 }
 
 /// <summary>
@@ -660,16 +716,9 @@ internal sealed partial class DbImpl
             if (_readOnly) ThrowHelper.NotSupported("Cannot resume a read-only DB");
             if (ErrorHandler.IsRecoveryInProgress) throw new RocksDbException(StatusCode.Busy, "Resource busy: Recovery in progress");
         }
-        RocksDbException? s;
-        if (synchronous)
-        {
-            // The recovery awaits background work; run it off the caller's synchronization context.
-            s = Task.Run(async () => await ErrorHandler.RecoverFromBgErrorAsync(isManual: true).ConfigureAwait(false)).GetAwaiter().GetResult();
-        }
-        else
-        {
-            s = await ErrorHandler.RecoverFromBgErrorAsync(isManual: true).ConfigureAwait(false);
-        }
+        // Synchronous: the whole recovery (waits, MANIFEST and WAL switch, flushes) runs on the calling thread, and the
+        // ValueTask is complete when returned.
+        RocksDbException? s = await ErrorHandler.RecoverFromBgErrorAsync(isManual: true, run: null, synchronous).ConfigureAwait(false);
         if (s is not null) ThrowBackgroundError(s);
     }
 
@@ -677,11 +726,13 @@ internal sealed partial class DbImpl
     /// Port of DBImpl::ResumeImpl: waits for running background jobs, refuses fatal errors, switches to a new MANIFEST
     /// after a MANIFEST write error, replaces a failed WAL, flushes the memtables (all column families, or only the
     /// pending immutable memtables for kErrorRecoveryRetryFlush), deletes obsolete files and clears the error.
-    /// Returns null on success. Called without the mutex, by <see cref="ErrorHandler"/> only.
+    /// Returns null on success. Called without the mutex, by <see cref="ErrorHandler"/> only. <paramref name="run"/>: the
+    /// recovery task running it (null for a manual Resume), passed to OnErrorRecoveryEnd. With
+    /// <paramref name="synchronous"/> every wait and I/O blocks the calling thread.
     /// </summary>
-    internal async ValueTask<RocksDbException?> ResumeImplAsync()
+    internal async ValueTask<RocksDbException?> ResumeImplAsync(ErrorRecoveryRun? run, bool synchronous)
     {
-        await WaitForBackgroundWorkAsync(synchronous: false).ConfigureAwait(false);
+        await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
         TestHooks.Invoke("DBImpl::ResumeImpl:Start");
         RocksDbException? s = null;
         bool walError, retryOnly;
@@ -707,7 +758,7 @@ internal sealed partial class DbImpl
             ColumnFamilyData defaultCf = GetColumnFamilyData(DefaultColumnFamilyName);
             try
             {
-                await Versions.LogAndApplyAsync(defaultCf, new VersionEdit { ColumnFamily = defaultCf.Id }, synchronous: false, CancellationToken.None)
+                await Versions.LogAndApplyAsync(defaultCf, new VersionEdit { ColumnFamily = defaultCf.Id }, synchronous, CancellationToken.None)
                     .ConfigureAwait(false);
             }
             catch (Exception e) when (e is not OutOfMemoryException)
@@ -717,7 +768,7 @@ internal sealed partial class DbImpl
             }
         }
 
-        if (s is null) s = await FlushForRecoveryAsync(walError, retryOnly).ConfigureAwait(false);
+        if (s is null) s = await FlushForRecoveryAsync(walError, retryOnly, synchronous).ConfigureAwait(false);
 
         if (s is null && walError)
         {
@@ -759,7 +810,8 @@ internal sealed partial class DbImpl
             if (_shuttingDown) s ??= new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
             SignalBackgroundWork();
         }
-        if (cleared is not null) ErrorHandler.NotifyOnErrorRecoveryEnd(cleared, null);
+        // The recovery's last DB operation: a listener may close the DB from here (ErrorHandler.EndAutoRecoveryAsync).
+        if (cleared is not null) ErrorHandler.NotifyOnErrorRecoveryEnd(cleared, null, run);
         if (s is not null) LogInfo("DB resume requested but failed: " + s.Message);
         return s;
     }
@@ -769,7 +821,7 @@ internal sealed partial class DbImpl
     /// holding data (every column family after a WAL error, which also replaces the failed WAL), then runs the flushes
     /// on this task (background flush scheduling is stopped while the error is set). Returns the first failure.
     /// </summary>
-    private async ValueTask<RocksDbException?> FlushForRecoveryAsync(bool walError, bool retryOnly)
+    private async ValueTask<RocksDbException?> FlushForRecoveryAsync(bool walError, bool retryOnly, bool synchronous)
     {
         List<ColumnFamilyData> cfds = GetColumnFamilies();
         if (!retryOnly)
@@ -777,7 +829,7 @@ internal sealed partial class DbImpl
             WriteThread.Writer w;
             try
             {
-                w = await EnterUnbatchedAsync(synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                w = await EnterUnbatchedAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
             }
             catch (ObjectDisposedException)
             {
@@ -799,7 +851,7 @@ internal sealed partial class DbImpl
                     foreach (ColumnFamilyData cfd in cfds)
                     {
                         if (cfd.Dropped) continue;
-                        if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                        if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous, CancellationToken.None).ConfigureAwait(false);
                     }
                 }
                 finally
@@ -813,7 +865,7 @@ internal sealed partial class DbImpl
             }
             finally
             {
-                ExitUnbatched(w, synchronous: false);
+                ExitUnbatched(w, synchronous);
             }
         }
         // RetryFlushesForErrorRecovery without atomic_flush: a flush request per column family with sealed memtables.
@@ -837,7 +889,7 @@ internal sealed partial class DbImpl
             for (int i = 0; i < members.Count; i++)
             {
                 // BackgroundFlushAsync releases the accounting taken above for its column family.
-                await BackgroundFlushAsync(members[i]).ConfigureAwait(false);
+                await BackgroundFlushAsync(members[i], synchronous).ConfigureAwait(false);
                 lock (_mutex)
                 {
                     RocksDbException? stop = ErrorHandler.RecoveryError
@@ -874,7 +926,7 @@ internal sealed partial class DbImpl
         // flush of every column family, so the per-CF flush results (and with them the WAL replay boundaries) are committed
         // as one MANIFEST atomic group and a crash in between cannot recover only part of a write batch that spans column
         // families. Like any atomic flush it is installed after the older flushes of its column families.
-        RocksDbException? s = await AtomicFlushMemTablesToOutputFilesAsync(synchronous: false, forRecovery: true).ConfigureAwait(false);
+        RocksDbException? s = await AtomicFlushMemTablesToOutputFilesAsync(synchronous, forRecovery: true).ConfigureAwait(false);
         lock (_mutex)
         {
             if (ErrorHandler.RecoveryError is { } re) return re;
