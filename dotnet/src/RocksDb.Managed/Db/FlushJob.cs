@@ -39,6 +39,10 @@ internal readonly record struct FlushJobContext(TableFileCreationReason Reason, 
 /// </summary>
 internal static class FlushJob
 {
+    /// <summary>OutputValidator::CanAdd (db/output_validator.cc) for a flush output.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowOutOfOrder() => ThrowHelper.Corruption("Compaction sees out-of-order keys.");
+
     /// <summary>
     /// Test hook: when it returns true the flush behaves as if every entry had been dropped (BuildTable with an empty
     /// output: the file is abandoned and the flush installs no table).
@@ -346,6 +350,8 @@ internal static class FlushJob
                 {
                     timed.Rewrite(key, seq, value, out key, out value, out type);
                 }
+                // OutputValidator::CanAdd: one comparison with the previous key, before the table builder sees the key.
+                if (!first && icmp.Compare(key, lastKey.WrittenSpan) < 0) ThrowOutOfOrder();
                 builder.Add(key, value);
                 // OutputValidator::Add(key_after_flush, value_after_flush)
                 if (hashOutput) paranoidHash = Hash.NPHash64(value, Hash.NPHash64(key, paranoidHash));
@@ -553,6 +559,9 @@ internal static class FlushJob
                 its[best].Next();
                 continue;
             }
+            // OutputValidator::CanAdd (BuildTable, db/builder.cc): a key that sorts before the previous one written (an
+            // inconsistent user comparator) fails the flush with Corruption before the table builder sees it.
+            if (!first && icmp.Compare(key, lastKey.AsSpan(0, lastLen)) < 0) ThrowOutOfOrder();
             if (blobBuilder is not null && type == EntryType.Value)
             {
                 // CompactionIterator::ExtractLargeValueIfNeeded (flush runs through a CompactionIterator upstream).

@@ -96,6 +96,16 @@ public sealed class ReadOptions
     /// <see cref="Env.RateLimiterMode.AllIo"/> mode, and small metadata reads (footer, properties at table open) are not charged.
     /// </summary>
     public Env.IoPriority RateLimiterPriority { get; set; } = Env.IoPriority.Total;
+    /// <summary>
+    /// ReadOptions::table_filter: called with the properties of each table file an iterator is about to read; returning
+    /// false skips the table's entries (its range tombstones still apply). Only iterators are affected, not point lookups
+    /// (Get, MultiGet). It is called on the thread that creates or positions the iterator, each time the iterator opens a
+    /// table (a level iterator reopens a file it left), so it should be cheap and must not keep the properties object.
+    /// An exception it throws propagates to the iterator call that opened the table. Like upstream, iterator creation
+    /// fails with <see cref="StatusCode.InvalidArgument"/> when the column family's
+    /// <see cref="ColumnFamilyOptions.MinTombstonesForRangeConversion"/> is non-zero. Null (default): every table is read.
+    /// </summary>
+    public Func<Table.TableProperties, bool>? TableFilter { get; set; }
 }
 
 /// <summary>Options for write operations. Port of rocksdb::WriteOptions with upstream defaults. Not persisted.</summary>
