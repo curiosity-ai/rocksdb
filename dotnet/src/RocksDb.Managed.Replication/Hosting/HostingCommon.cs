@@ -316,8 +316,12 @@ public sealed class ProgressReporter : IAsyncDisposable
                     {
                         await _send(seq, ct).ConfigureAwait(false);
                     }
-                    catch (Exception e) when (e is not OperationCanceledException)
+                    catch (Exception) when (!ct.IsCancellationRequested)
                     {
+                        // Any failure of the send is a lost report, an OperationCanceledException of the transport's own
+                        // (a call timeout, a broken connection) included; only this reporter's own token ends the loop.
+                        // rocksdb-sharp's hosts likewise swallow every failure of the report call (Tests/ClusterTest/
+                        // ClusterNodeHost.cs: "try { await rclient.ReportLastSyncSequenceNumber(...); } catch { }").
                         // Not delivered: send the newest value again (nothing may follow this report for a long time).
                         if (_completed) return;
                         Interlocked.Exchange(ref _pending, 1);
