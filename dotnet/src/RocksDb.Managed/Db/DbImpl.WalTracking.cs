@@ -1,3 +1,5 @@
+using RocksDb.Managed.Util;
+
 namespace RocksDb.Managed.Db;
 
 /// <summary>
@@ -79,8 +81,7 @@ internal sealed partial class DbImpl
         }
         try
         {
-            ValueTask t = Versions.LogAndApplyAsync(null, new VersionEdit { WalDeletionBefore = minWalToKeep }, synchronous: true, CancellationToken.None);
-            t.GetAwaiter().GetResult();
+            SyncValueTask.GetResult(Versions.LogAndApplyAsync(null, new VersionEdit { WalDeletionBefore = minWalToKeep }, synchronous: true, CancellationToken.None));
             return true;
         }
         catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)

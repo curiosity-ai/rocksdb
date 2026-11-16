@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Wal;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
@@ -135,7 +136,7 @@ internal sealed partial class DbImpl
             if (synchronous)
             {
                 Debug.Assert(lead.IsCompleted);
-                lead.GetAwaiter().GetResult();
+                SyncValueTask.GetResult(lead);
             }
             else
             {
@@ -238,7 +239,7 @@ internal sealed partial class DbImpl
                                 // Requesting sync with two_write_queues is expected to be very rare (upstream calls
                                 // SyncWAL); the record is synced while the WAL write lock is held, after the closed WALs
                                 // (every logs_ entry, oldest first).
-                                if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
+                                if (_closedWalsToSync.Count > 0) SyncValueTask.GetResult(SyncClosedWalsAsync(synchronous: true));
                                 log.Sync();
                                 SyncWalDirIfNeeded();
                             }

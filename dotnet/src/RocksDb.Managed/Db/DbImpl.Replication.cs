@@ -1,4 +1,5 @@
 using RocksDb.Managed.Wal;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
@@ -591,7 +592,7 @@ internal sealed partial class DbImpl
                 {
                     // SyncWAL: every WAL in logs_, oldest first.
                     stage = FlushWalStage.SyncWals;
-                    if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
+                    if (_closedWalsToSync.Count > 0) SyncValueTask.GetResult(SyncClosedWalsAsync(synchronous: true));
                     log.Sync();
                     stage = FlushWalStage.SyncWalDir;
                     SyncWalDirIfNeeded();

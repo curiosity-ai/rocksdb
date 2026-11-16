@@ -1,3 +1,5 @@
+using RocksDb.Managed.Util;
+
 namespace RocksDb.Managed.Db;
 
 internal sealed partial class DbImpl
@@ -927,7 +929,7 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>Test helper (TEST_WaitForBackgroundWork): waits until no background job (flush and its purge, compaction) runs.</summary>
-    internal void WaitForBackgroundWorkForTest() => WaitForBackgroundWorkAsync(synchronous: true).GetAwaiter().GetResult();
+    internal void WaitForBackgroundWorkForTest() => SyncValueTask.GetResult(WaitForBackgroundWorkAsync(synchronous: true));
 
     /// <summary>Waits until no background job is running (used at shutdown).</summary>
     private async ValueTask WaitForBackgroundWorkAsync(bool synchronous)

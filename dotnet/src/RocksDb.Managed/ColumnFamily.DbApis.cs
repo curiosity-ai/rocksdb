@@ -146,7 +146,7 @@ public sealed partial class ColumnFamily
     /// not to overlap each other or be compacted and levels 1..<paramref name="targetLevel"/> to be empty (else
     /// InvalidArgument).
     /// </summary>
-    public void PromoteL0(int targetLevel) => _db.PromoteL0Async(_cfd, targetLevel, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    public void PromoteL0(int targetLevel) => SyncValueTask.GetResult(_db.PromoteL0Async(_cfd, targetLevel, synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="PromoteL0(int)"/>.</summary>
     public ValueTask PromoteL0Async(int targetLevel, CancellationToken cancellationToken = default) =>
@@ -162,7 +162,7 @@ public sealed partial class ColumnFamily
 
     /// <summary><see cref="DeleteFilesInRange(byte[], byte[], bool)"/> for several ranges (DeleteFilesInRanges).</summary>
     public void DeleteFilesInRanges(IReadOnlyList<KeyRangeOpt> ranges, bool includeEnd) =>
-        _db.DeleteFilesInRangesAsync(_cfd, ToTuples(ranges), includeEnd, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.DeleteFilesInRangesAsync(_cfd, ToTuples(ranges), includeEnd, synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="DeleteFilesInRanges(IReadOnlyList{KeyRangeOpt}, bool)"/>.</summary>
     public ValueTask DeleteFilesInRangesAsync(IReadOnlyList<KeyRangeOpt> ranges, bool includeEnd, CancellationToken cancellationToken = default) =>
@@ -182,7 +182,7 @@ public sealed partial class ColumnFamily
     /// tombstones.
     /// </summary>
     public void ClipColumnFamily(byte[] beginKey, byte[] endKey) =>
-        _db.ClipColumnFamilyAsync(_cfd, beginKey, endKey, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.ClipColumnFamilyAsync(_cfd, beginKey, endKey, synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="ClipColumnFamily(byte[], byte[])"/>.</summary>
     public ValueTask ClipColumnFamilyAsync(byte[] beginKey, byte[] endKey, CancellationToken cancellationToken = default) =>
@@ -241,7 +241,7 @@ public sealed partial class RocksDatabase
     /// </summary>
     public WalLock LockWal()
     {
-        _db.LockWalAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.LockWalAsync(synchronous: true, CancellationToken.None));
         return new WalLock(_db);
     }
 
@@ -257,7 +257,7 @@ public sealed partial class RocksDatabase
     /// with Incomplete (subcode ManualCompactionPaused) and this call returns once none is left; new ones fail the same
     /// way until <see cref="EnableManualCompaction"/> was called once per disable. Automatic compactions continue.
     /// </summary>
-    public void DisableManualCompaction() => _db.DisableManualCompactionAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    public void DisableManualCompaction() => SyncValueTask.GetResult(_db.DisableManualCompactionAsync(synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="DisableManualCompaction"/>.</summary>
     public ValueTask DisableManualCompactionAsync(CancellationToken cancellationToken = default) =>

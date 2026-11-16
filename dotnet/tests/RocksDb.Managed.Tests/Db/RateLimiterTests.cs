@@ -141,6 +141,78 @@ public sealed class RateLimiterTests
         Assert.AreEqual(10_000UL, stats.GetHistogramData(Histogram.RateLimiterWaitMicrosRead).Sum);
     }
 
+    /// <summary>The refill timer callbacks this flows into (the timer captures the execution context) block on it.</summary>
+    private static readonly AsyncLocal<ManualResetEventSlim?> s_timerGate = new();
+
+    /// <summary>
+    /// A synchronous request does not depend on the refill timer, whose callback needs a .NET thread pool thread (under
+    /// pool starvation it does not run): the waiting thread refills itself once the refill time has passed
+    /// (GenericRateLimiter::RequestImpl, util/rate_limiter.cc, duty 2), and its refills also grant async waiters. The
+    /// timer of this limiter is stuck in a test hook for the whole test (the hook blocks only callbacks that carry
+    /// <see cref="s_timerGate"/>, so limiters of tests running in parallel are not affected).
+    /// </summary>
+    [TestMethod]
+    public void SyncRequestsProgressWithoutTheRefillTimer()
+    {
+#if !DEBUG
+        Assert.Inconclusive("TestHooks are compiled only in DEBUG builds.");
+#else
+        // Not disposed: a released timer callback may still be returning from Wait.
+        var gate = new ManualResetEventSlim(false);
+        int timerCallbacks = 0;
+        RocksDb.Managed.Db.TestHooks.Set("GenericRateLimiter::OnTimer", () =>
+        {
+            if (s_timerGate.Value is { } g)
+            {
+                Interlocked.Increment(ref timerCallbacks);
+                g.Wait(TimeSpan.FromSeconds(60));
+            }
+        });
+        try
+        {
+            s_timerGate.Value = gate;
+            // 1 MB/s with 10 ms refills: 10 KB per refill; 30 bursts take about 0.3 s.
+            using var l = new GenericRateLimiter(1 << 20, 10_000, 10, RateLimiterMode.WritesOnly, autoTuned: false, 0);
+            s_timerGate.Value = null;
+            long burst = l.SingleBurstBytes;
+            const int requests = 30;
+            Task? asyncRequest = null;
+            Exception? failure = null;
+            var writer = new Thread(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < requests; i++)
+                    {
+                        l.Request(burst, IoPriority.Low);
+                        // An async waiter queued behind the sync ones is granted by their refills.
+                        if (i == 5) asyncRequest = l.RequestAsync(burst, IoPriority.High, CancellationToken.None).AsTask();
+                    }
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                }
+            }) { IsBackground = true };
+            writer.Start();
+            bool finished = writer.Join(TimeSpan.FromSeconds(30));
+            Assert.IsTrue(finished, "sync requests stalled while the refill timer could not run");
+            Assert.IsNull(failure, failure?.ToString());
+            Assert.IsNotNull(asyncRequest);
+            Assert.IsTrue(asyncRequest.Wait(TimeSpan.FromSeconds(30)), "async request not granted by the sync waiters' refills");
+            Assert.IsTrue(Volatile.Read(ref timerCallbacks) >= 1, "the refill timer was never armed");
+            Assert.AreEqual(requests * burst, l.GetTotalBytesThrough(IoPriority.Low));
+            Assert.AreEqual(burst, l.GetTotalBytesThrough(IoPriority.High));
+            Assert.AreEqual(0, l.GetTotalPendingRequests(IoPriority.Total));
+        }
+        finally
+        {
+            RocksDb.Managed.Db.TestHooks.Set("GenericRateLimiter::OnTimer", null);
+            gate.Set();
+        }
+#endif
+    }
+
     /// <summary>A microsecond clock that moves only when the test advances it.</summary>
     private sealed class ManualClock
     {
