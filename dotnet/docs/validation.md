@@ -2076,3 +2076,172 @@ Properties, memory and open:
 - Atomic flush (AtomicFlushMemTablesToOutputFiles / InstallMemtableAtomicFlushResults), concurrent as upstream: several atomic flush jobs may run at once, a new one scheduled once the previous one has picked; each job picks every column family's unpicked memtables up to the newest completed switch in one mutex hold; a job waits (atomic_flush_install_cv_, here the background signal) until its first memtable is the oldest in each of its column families, and aborts on a MANIFEST error, shutdown, or (non-recovery) a background error that stopped background work; one MANIFEST atomic group, memtables removed and super versions installed in the LogAndApply critical section; on failure every column family of the flush is rolled back (RollbackMemtableFlush without succeeding memtables). The error-recovery flush (force_atomic_flush) is an ordinary atomic flush, no longer exclusive. Deviations: recovery waits for running atomic flushes before it picks (closes the window between WaitForBackgroundWork and the pick, where an older flush that rolls back would leave the recovery flush waiting); no second SetBGError after an install-wait failure (it would fire OnBackgroundError twice); job ids per column family; global retry back-off. num-running-flushes now counts an atomic flush once, as upstream. Tests: ConcurrentAtomicFlushTests (ports of BgThreadNoWaitAfterManifestError, DBStuckAfterAtomicFlushError, AtomicFlushRollbackSomeJobs). Open, same in upstream: a failed non-atomic commit (RemoveMemTablesOrRestoreFlags) restores only its own batch; later completed results of that column family wait for its next non-atomic flush.
 - Best-efforts recovery (VersionEditHandlerPointInTime): table files are verified and loaded through the column families' table caches, as upstream. VerifyFile = VersionSet::VerifyFileMetadata: a size mismatch counts as missing; with verify_sst_unique_id_in_manifest the file is opened through TableCache::FindTable, so a wrong unique id is Corruption, i.e. missing. LoadTables of each point-in-time version = VersionBuilder::LoadTableHandlers via TableHandlerLoader (max_file_opening_threads, initial-load limit min(16, capacity/4), prefetch off); Corruption or PathNotFound skips the point in time. Statuses follow ApplyFileAddition: PathNotFound, NotFound and Corruption are missing, any other error fails that MANIFEST (before, an I/O error quietly counted as missing). Column families the DB does not open are not checked. The readers opened during recovery are adopted by the ColumnFamilyData (ColumnFamilyData.NewTableCache), so nothing is opened twice, and they survive a failed MANIFEST attempt. Deviations: blob files are verified by a direct open, not through BlobSource (it needs the DbId, known only after the replay); the size check uses the file's own path id where upstream uses cf_paths[0] (looks like an upstream bug); loaded readers are not pinned (pin_table_handle); intermediate_files_ (ManifestTailer only) not ported. Tests: BestEffortsRecoveryTableCacheTests.
 
+
+## Audit #7: failure modes and edge cases (2026-11-16)
+
+Six parallel reviews of what the port does on bad input and bad conditions: corrupt or truncated SST, blob, WAL,
+MANIFEST, CURRENT and OPTIONS bytes; I/O errors at every step of the write, flush, compaction and close paths; misuse of
+the public API (use after dispose, foreign handles, boundary arguments); transaction, WriteBatchWithIndex, backup and
+checkpoint failure paths; and the replication / switchover / Raft layer under transport faults. Every finding was checked
+against the C++ (file and function cited in the fix and the test) and, wherever the C API can reach the path, against
+native 11.12 in-process side by side (`tests/RocksDb.Managed.CompatTests/Audit7/`). Where native cannot be driven (no C
+API, undefined behaviour, or a native crash), the reason is stated. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit7*`,
+`tests/RocksDb.Managed.CompatTests/Audit7/`, `tests/RocksDb.Managed.Replication.Tests/Audit7ReplicationTests.cs`. Seeded
+fuzzers (`AUDIT7_TABLE_SEED` / `AUDIT7_TABLE_ROUNDS`, `AUDIT7_SEED`) log their seed.
+
+### Fixed
+
+Corrupt input (SST, blob, compression):
+
+- `SstFileReader.VerifyChecksum` decompressed blocks, without the table's dictionary: a valid LZ4 / ZSTD / zlib table with
+  a compression dictionary failed with Corruption. Now raw block + checksum only (`BlockBasedTable::VerifyChecksumInBlocks`,
+  BlockFetcher with decompress = false). Native `rocksdb_verify_checksum`: OK.
+- Block handles from a damaged footer or index: an offset of 2^63 or more reached the file layer as a negative offset
+  (ArgumentOutOfRangeException), a size near 2^32 overflowed (`OverflowException` in the cache tiers). Now IOError for an
+  offset above long.MaxValue (pread's EINVAL), truncated-read Corruption past the end, Corruption "block too large"; the
+  async tail prefetch compares offsets unsigned. Native (ingestion of the damaged file): same codes; native aborts
+  (`bad_alloc`) on a 2^40 size and segfaults on a wrapping one, the port returns Corruption.
+- A damaged stored uncompressed size: OutOfMemoryException above `Array.MaxLength`, ArgumentOutOfRangeException for a
+  snappy length above int.MaxValue, and ~2 GiB allocated (and pooled) per corrupt block below. Now Corruption when the
+  size exceeds `Array.MaxLength` or the codec's maximum expansion of the payload (snappy 22x, LZ4 256x + 64, deflate
+  1040x + 4 KiB, zstd 32768x + 128 KiB; no valid stream is rejected; native-written maximally compressible blocks read
+  back). Native: Corruption for all four codecs, except the LZ4 upstream bug below.
+- Plain table: a sub-index offset out of range threw ArgumentOutOfRangeException (C++: unchecked, undefined behaviour);
+  cuckoo: a damaged `rocksdb.num.entries` sized a `List` of up to int.MaxValue (C++: `reserve` throws). Both Corruption.
+
+Corrupt metadata (WAL, MANIFEST, OPTIONS):
+
+- DB open hung forever on a single bit flip of a WAL or MANIFEST record type to a recyclable type in a non-recycled log
+  (`log_reader.cc` `ReadPhysicalRecord`: `if (first_record_read_ && !recycled_) return kBadRecord;` without consuming
+  the header, and `ReadRecord` parses it again; same in `FragmentBufferedReader::TryReadFragment`). **Deliberate
+  deviation**: the record is dropped and reported as a checksum mismatch (its CRC covers the type byte), so
+  PointInTime / SkipAny keep the records before it and TolerateCorruptedTail / AbsoluteConsistency fail with Corruption.
+  Native 11.12 (child process): open hangs. Upstream issue draft: `upstream-issues/08-log-reader-recyclable-type-hang.md`.
+- A damaged level number in a MANIFEST new-file record (up to 2^31 - 1) built one level list per level: out of memory or
+  minutes of work. Now InvalidArgument "db has more levels than options.num_levels" at once for levels >= 4096 (C++:
+  `invalid_level_sizes_` then `CheckConsistencyForNumLevels`). Native: the same code for levels 7, 4096, 1e9, int.MaxValue.
+  Deviation: upstream would still open if a later edit deleted that file.
+- OPTIONS files: `options_file_version` overflow threw ArgumentOutOfRangeException (now wraps like `ParseVersionNumber`);
+  a torn last line without '\n' was parsed (`LineFileReader::ReadLine` drops it); unknown or malformed
+  `memtable_factory` / `table_factory` / `flush_block_policy_factory` ids were rejected (native ignores them,
+  `ignore_unsupported_options` defaults to true); `read_amp_bytes_per_bit` uses upstream's truncating ParseUint64 and
+  `block_protection_bytes_per_key` is a uint8. All compared with `rocksdb_load_latest_options`.
+
+Write path, background errors, close:
+
+- Close with a WAL that fails to close stopped half way: the MANIFEST writer stayed open, table caches and memtables were
+  not released, file handles leaked. Now as `CloseHelper`: each WAL is cleared (`ClearWriter`: only the buffer write-out
+  is reported, the file close is not), the first error is kept and thrown after the close completes; MANIFEST close
+  errors likewise.
+- Flush (and WaitForCompact) after `CancelAllBackgroundWork` threw ObjectDisposedException on an open DB; now
+  ShutdownInProgress (`WaitForFlushMemTables`). Native 11.12: "Shutdown in progress" for both.
+- A write stalled on stopped writes waited forever behind a soft background error that nothing would recover; now
+  Incomplete with the background error when no recovery is in progress (`DelayWrite`).
+- An operation racing the close (CompactRange, a slow-path read, `Iterator.Refresh` after Dispose) spun a core forever in
+  `GetReferencedSuperVersion` on the released super version; close now marks the column family closed first and the
+  loop throws ObjectDisposedException. Found by a randomized close race test (a few hangs per 40-60 runs). A failed
+  iterator Refresh / RefreshAsync / SetBounds now disposes the iterator and rethrows (before, it silently iterated
+  nothing); a foreign or released snapshot is rejected before the iterator's view is released.
+
+Public API:
+
+- Pooled public objects (`WriteBatch`, `WriteBatchWithIndex`, `PooledValue`): a stale second Dispose after the object was
+  rented again cleared the next renter's batch (or returned its buffer) while it was in use, losing its writes; two
+  Disposes without a rent in between handed the next renter a batch without a header. Each rent now returns a new
+  handle and only the inner state (rep buffer, index, value buffer) is pooled; Dispose takes it out once
+  (`Interlocked.Exchange`), later use throws ObjectDisposedException, a second Dispose does nothing, writing a disposed
+  batch throws instead of writing an empty batch. The engine's single-key writes use an internal pool never handed to
+  callers, so `db.Put` is unchanged. Cost (Release, bytes per operation): `WriteBatch.Rent` + Put + Dispose 0 -> 88,
+  WBWI 0 -> 152, `GetPooled` + Dispose 0 -> 32 (docs/allocations.md). No native counterpart (no pool; a C++ batch is
+  deleted once, rocksdb-sharp's Dispose is idempotent).
+- `DropColumnFamily`, `IngestExternalFiles` and `NewIterator` with another DB's column family handle: the drop went through
+  the wrong DB's MANIFEST and the memtables were released twice at close. Now InvalidArgument (C++: undefined behaviour).
+- Ingestion into a column family dropped during the ingestion's prepare: InvalidArgument "cannot ingest an external file
+  into a dropped CF" (`db_impl.cc`, IngestExternalFiles), was ColumnFamilyDropped.
+- A disposed `MultiGetBatch` ran as an empty batch; now ObjectDisposedException.
+
+Transactions:
+
+- TransactionDB direct writes on a column family with user timestamps: NotSupported (`FailIfCfEnablesTs`), was
+  InvalidArgument; WriteCommitted `Write(batch)` with timestamped keys: NotSupported (`FailIfBatchHasTs`), was unchecked.
+  Native: both NotSupported.
+- Transaction snapshots are released once neither the transaction nor a save point refers to them (C++: `shared_ptr`
+  with `ReleaseSnapshot` as deleter); before, every `SetSnapshot` stayed live until Dispose (100 calls, 100 snapshots).
+- A recovered prepared section with a DeleteRange / TimedPut / blob index fails the open with InvalidArgument
+  "DeleteRangeCF not implemented" etc. (the `WriteBatch::Handler` defaults reached by `RebuildFromWriteBatch`), was
+  NotSupported; every recovered transaction is disposed when one rebuild fails. Native: same message.
+
+Replication layer (reference: rocksdb-sharp):
+
+- `ProgressReporter`: a send failing with the transport's own OperationCanceledException (a call timeout) ended the loop
+  for good: a Raft leader could no longer commit that follower's entries, `WriteAck = Replica` answered NotReplicated,
+  archived WALs were never retired. Only the reporter's own token ends it now (rocksdb-sharp's hosts swallow any failure).
+- A cluster follower whose resync could not start (recording the log end failed) never followed a stable leader again;
+  it now re-attaches after the retry delay (rocksdb-sharp's `PerformResyncAsync` always ends with `EnsureFollowerStream`).
+- A resync whose close of the old database reported an error left the node "resyncing" for good; the close error is
+  logged and the restore goes on (native `rocksdb_close` reports nothing).
+
+### Upstream behaviour found (the port matches native unless noted)
+
+- LZ4 with a stored size of 0xFFFFFFFF: `LZ4_DecompressBlock` passes the size as int -1 and treats LZ4's -1 as success,
+  so native accepts 4 GiB of uninitialized memory as the block. The port returns Corruption. Not driven in-process by the
+  compat test (it crashed the test host).
+- Native aborts on footer handles with a 2^40 or wrapping size, and on a TimedPut WriteBatch record whose value is shorter
+  than 8 bytes (`ParsePackedValueWithWriteTime`, `std::length_error`); the port returns Corruption.
+- A backup restore whose deletion of a stale WAL in the destination fails reports success, and the next open replays
+  that WAL (`BackupEngineImpl::DeleteChildren` ignores errors). Port matches native (compat test with `chattr +i`).
+- Silent data loss without an error, in every recovery mode: a zeroed record header, a CRC-valid broken zstd WAL frame, a
+  removed or empty WAL, a whole record cut out (sequence gap). Port matches native.
+
+### Open
+
+- `GetUpdatesSince` stopped on a damaged recycled record below LastSequence ends with OK; native returns TryAgain "Create
+  a new iterator to fetch the new tail." (`wal_iterator_impl.cc` NextImpl). The managed iterator re-lists WALs by design
+  instead of TryAgain; in this case OK reads as "caught up". Ignored compat test
+  `GetUpdatesSinceStoppedBelowLastSequenceIsTryAgainLikeNative`.
+- OPTIONS values outside the grammar: `comparator=` and `blob_compression_opts=` (empty) are accepted (native rejects),
+  a malformed `file_checksum_gen_factory={` clears the factory (native ignores it), dotted names such as
+  `flush_block_policy_factory.=X` are rejected (native accepts). Ignored compat test
+  `EmptyRequiredOptionValuesRejectedLikeNative`.
+
+### Known deviations recorded by this audit
+
+- A malformed WriteBatch is validated before it is written to the WAL (native writes it, fails the memtable insert and
+  stops the DB with a background error; neither shows any of its keys).
+- New-WAL creation failure in SwitchMemtable is WAL-related (C++: not), so with manual_wal_flush a retryable error is fatal
+  instead of auto-recovered; `LogWriter.WriteBuffer` ignores the seen-error flag at close (native Close reports it);
+  DelayWrite with a hard error during a recovery throws at once (C++ waits); the shutdown flush is skipped with a
+  background error set (C++ attempts it and fails).
+- WriteUnprepared: a failed rollback of a started transaction keeps it (locks, unprep_seqs) for a retry; upstream
+  `Clear()`s it (read only, not drivable).
+- Replication: cancelling a write that waits on a held write gate throws OperationCanceledException (rocksdb-sharp:
+  false); `ReplicaFollower.FollowAsync` does not report its start position before its first chunk (a new replica is not
+  tracked for WAL retirement until then; recovers through a resync; not tested).
+- `db.NewIterator(foreignCf)` is InvalidArgument (C++: undefined behaviour). Ingestion into a column family dropped
+  before the call is ColumnFamilyDropped (main's `LogAndApply`); native 11.12 returns InvalidArgument.
+- IOError for a block offset above long.MaxValue carries no file name.
+
+### Verified
+
+- Mutation fuzz of block-based tables (format_version 2-8, every checksum type, every codec with and without a
+  dictionary, binary / hash / partitioned / first-key / trie indexes, data block hash index, separated key/value blocks,
+  all filter kinds, range deletions; sync, async and adaptive open; Get / MultiGet / iterators sync and async;
+  VerifyChecksum): only statuses escape, every operation terminates. Plain, cuckoo and blob file fuzz likewise; DB-level
+  fuzz with full checksums returns only correct values. Corrupt filter metadata reads as "may match" like native.
+- Differential WAL / MANIFEST damage against native (about 1,000-2,000 damaged copies per seed and row, four recovery modes,
+  legacy / recycled / zstd WALs) and 27 fixed damage scenarios, also read-only: same status and same recovered keys.
+  CURRENT variants, WriteBatch bytes (2,400+ mutated batches against native), VersionEdit decode fuzz, OPTIONS fuzz. A
+  failed open changes no file.
+- Transient I/O error sweep over every mutating file operation, four write modes, manual and automatic resume: no
+  acknowledged write lost after reopen. Close racing async writers, stalls, compactions and flushes: every call completes.
+  Canceled writes are all-or-nothing. Every call after close is ObjectDisposed. Failed compactions leave no orphan output.
+- API edge cases side by side with native: dropped column family handles, DeleteRange / CompactRange with reversed
+  bounds, open errors (missing DB, LOCK held, unlisted column family, error_if_exists), checkpoint into an existing
+  directory, SstFileWriter misuse, ingestion inputs, MultiGet with duplicate and empty keys, read-only and secondary
+  misuse.
+- Transaction state machines, save points (3000 nested), lock timeouts / cancellation / LockBatch failure, 2PC recovery
+  across reopens, optimistic conflicts, WBWI against a randomized model; backup and checkpoint with a fault at every
+  mutation; 40 random bit flips / truncations of backup files always Corruption on verify and restore.
+- Replication: plain follower against a transport that duplicates, loses and reorders chunks (each chunk applied once),
+  cancellation at chunk boundaries, GetUpdatesSince / WalTailer statuses, snapshot receiver validation, Raft term map and
+  log end durability, every catch block in Hosting / Switchover / Cluster.

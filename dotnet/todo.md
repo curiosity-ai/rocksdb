@@ -431,3 +431,15 @@ Still open from this round:
 - [ ] Readahead: 4 KiB window alignment; readahead on the async positioning paths (would give async_io real trimming)
 - [ ] Atomic flush job ids per column family (upstream: one per flush); a failed non-atomic commit leaves later completed results of that column family to its next flush (same as upstream)
 - [ ] Best-efforts recovery verifies blob files by a direct open (BlobSource needs the DbId); loaded readers are not pinned; ingestion's file_opening_threads not ported
+
+## Audit #7 (2026-11-16; docs/validation.md "Audit #7: failure modes and edge cases")
+
+- [x] Corrupt SST / blob / compressed input: only statuses escape (mutation fuzz of every table variant); VerifyChecksum without decompression; block handle offsets and sizes from damaged files; stored uncompressed sizes bounded by the codec's expansion; plain / cuckoo index bounds
+- [x] Corrupt WAL / MANIFEST / CURRENT / OPTIONS: differential damage fuzz against native; no hang on a recyclable type in a legacy log (deliberate deviation, upstream hangs; draft `docs/upstream-issues/08-...`); MANIFEST level bound; OPTIONS parsing on torn and odd input
+- [x] Write path: close completes and releases everything after a WAL close error; ShutdownInProgress after CancelAllBackgroundWork; stalled writes give up on an unrecovered background error; no spin for operations racing the close
+- [x] API: pooled public objects pool only their state (one handle per rent, disposed once); foreign column family handles rejected; disposed MultiGetBatch rejected; ingestion into a CF dropped mid-prepare
+- [x] Transactions: timestamp writes through TransactionDB NotSupported; snapshots released when unreferenced; recovered prepared sections the rebuild cannot take fail with InvalidArgument
+- [x] Replication: progress reporter survives transport cancellations; follower rejoins after a resync that could not start; resync survives a close error
+- [ ] GetUpdatesSince ends with OK where native returns TryAgain when stopped below LastSequence on a damaged recycled record (tailing design)
+- [ ] OPTIONS values outside the grammar (`comparator=`, empty `blob_compression_opts=`, malformed `file_checksum_gen_factory`, dotted names) differ from native
+- [ ] `BlockBasedTableReader.IterPool` hands out pooled `BlockIter` (a public type): not checked whether user code can hold a stale one

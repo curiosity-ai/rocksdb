@@ -15,7 +15,8 @@ facebook/rocksdb `main`.
 | [05-backup-gc-deletes-backups-it-cannot-load.md](05-backup-gc-deletes-backups-it-cannot-load.md) | BackupEngine garbage collection deletes the private and shared files of a backup whose meta file it cannot load (e.g. written by a newer version) |
 | [06-backup-gc-tmp-dir-empties-live-backup.md](06-backup-gc-tmp-dir-empties-live-backup.md) | BackupEngine garbage collection of a `private/<id>.tmp` directory deletes `private/<id>/`, the live backup |
 | [07-backup-restore-deletes-destination-before-validating.md](07-backup-restore-deletes-destination-before-validating.md) | A restore that fails on an unparsable file name has already deleted the destination database |
+| [08-log-reader-recyclable-type-hang.md](08-log-reader-recyclable-type-hang.md) | One flipped record type byte (a recyclable type in a non-recycled log) makes `log::Reader::ReadRecord` loop forever; `DB::Open` never returns |
 
-01-03 and 05-07 were reproduced with the C API programs they contain; 04 concerns a feature the released library does not have yet.
+01-03 and 05-07 were reproduced with the C API programs they contain, 08 with the NuGet package's library in a child process (validation.md, "Audit #7"); 04 concerns a feature the released library does not have yet.
 
 How the managed port handles each one is described in [validation.md](../validation.md), "Combinatorial round trips".
