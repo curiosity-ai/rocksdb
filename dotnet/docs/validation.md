@@ -2199,10 +2199,19 @@ Replication layer (reference: rocksdb-sharp):
   a new iterator to fetch the new tail." (`wal_iterator_impl.cc` NextImpl). The managed iterator re-lists WALs by design
   instead of TryAgain; in this case OK reads as "caught up". Ignored compat test
   `GetUpdatesSinceStoppedBelowLastSequenceIsTryAgainLikeNative`.
-- OPTIONS values outside the grammar: `comparator=` and `blob_compression_opts=` (empty) are accepted (native rejects),
-  a malformed `file_checksum_gen_factory={` clears the factory (native ignores it), dotted names such as
-  `flush_block_policy_factory.=X` are rejected (native accepts). Ignored compat test
-  `EmptyRequiredOptionValuesRejectedLikeNative`.
+### OPTIONS strictness (follow-up)
+
+The port may be stricter than native when reading OPTIONS files, never less strict (project rule). Fixed to that rule:
+an empty `comparator=` is InvalidArgument "Missing configurable object" (`OptionTypeInfo::Prepare` / `Validate`, no
+kAllowNull); `blob_compression_opts` takes the legacy ':' form like `compression_opts` and rejects an empty or malformed
+value ("unable to parse the specified CF option", `cf_options.cc` ParseCompressionOptions); a malformed
+`file_checksum_gen_factory={` keeps the factory set earlier (native ignores it as unsupported). The compat fuzz
+`MutatedOptionsFileAcceptedOrRejectedLikeNative` fails only when native rejects and the port accepts (240 seeds x 3,000
+mutations: none). Stricter than native, accepted by the rule: a malformed Customizable struct (`compression_manager={`),
+escaped characters in struct field names (native unescapes the whole value first), unbalanced braces in struct values,
+dotted names (`comparator.`, `filter_policy.`, ...; `OptionTypeInfo::Find` maps the prefix), a bare `memtable`, `int`
+options whose value or k/m/g shift overflows (native wraps), stricter integers in
+`max_bytes_for_level_multiplier_additional`. Resulting option values are not compared (the C API cannot read most back).
 
 ### Known deviations recorded by this audit
 

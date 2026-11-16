@@ -441,5 +441,5 @@ Still open from this round:
 - [x] Transactions: timestamp writes through TransactionDB NotSupported; snapshots released when unreferenced; recovered prepared sections the rebuild cannot take fail with InvalidArgument
 - [x] Replication: progress reporter survives transport cancellations; follower rejoins after a resync that could not start; resync survives a close error
 - [ ] GetUpdatesSince ends with OK where native returns TryAgain when stopped below LastSequence on a damaged recycled record (tailing design)
-- [ ] OPTIONS values outside the grammar (`comparator=`, empty `blob_compression_opts=`, malformed `file_checksum_gen_factory`, dotted names) differ from native
+- [x] OPTIONS parsing never less strict than native (empty `comparator=`, empty / malformed `blob_compression_opts`, malformed `file_checksum_gen_factory` fixed; stricter-than-native classes accepted by rule, listed in validation.md)
 - [ ] `BlockBasedTableReader.IterPool` hands out pooled `BlockIter` (a public type): not checked whether user code can hold a stale one
