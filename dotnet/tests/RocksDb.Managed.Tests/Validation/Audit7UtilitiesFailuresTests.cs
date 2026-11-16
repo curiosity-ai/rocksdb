@@ -528,6 +528,118 @@ public sealed class Audit7UtilitiesFailuresTests
         Assert.IsFalse(it.Valid);
     }
 
+    [TestMethod]
+    public void RandomizedWbwiSavePointsAndBoundedBaseDeltaIterationAgainstModel()
+    {
+        // WriteBatchWithIndex::RollbackToSavePoint (ReBuildIndex), GetFromBatchAndDB and BaseDeltaIterator with
+        // iterate_lower_bound / iterate_upper_bound (write_batch_with_index.cc, write_batch_with_index_internal.cc):
+        // random Put / Delete / Merge with nested save points, compared to a model after every rollback.
+        int seed = Environment.TickCount;
+        var rnd = new Random(seed);
+        for (int round = 0; round < 8; round++)
+        {
+            string ctx = "seed=" + seed + " round=" + round;
+            MemoryFileSystem fs = NewFs();
+            using RocksDatabase db = RocksDatabase.Open(DbDir, new DbOptions { CreateIfMissing = true, FileSystem = fs },
+                [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions { MergeOperator = new ConcatMerge() })]);
+            static string K(int i) => "k" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture);
+            var model = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            for (int i = 0; i < 40; i++)
+            {
+                string k = K(rnd.Next(60));
+                db.Put(B(k), B("b" + i));
+                model[k] = "b" + i;
+            }
+            if (round % 2 == 1) db.Flush();
+            using var wb = new WriteBatchWithIndex(Comparator.Bytewise, 0, round % 3 != 0, 0);
+            var saved = new Stack<SortedDictionary<string, string>>();
+            for (int op = 0; op < 150; op++)
+            {
+                string k = K(rnd.Next(60));
+                int r = rnd.Next(12);
+                if (r == 0)
+                {
+                    wb.SetSavePoint();
+                    saved.Push(new SortedDictionary<string, string>(model, StringComparer.Ordinal));
+                }
+                else if (r == 1)
+                {
+                    Assert.AreEqual(saved.Count > 0, wb.RollbackToSavePoint(), ctx);
+                    if (saved.Count > 0) model = saved.Pop();
+                    CheckWbwi(db, wb, model, rnd, ctx + " op=" + op);
+                }
+                else if (r == 2)
+                {
+                    Assert.AreEqual(saved.Count > 0, wb.PopSavePoint(), ctx);
+                    if (saved.Count > 0) saved.Pop();
+                }
+                else if (r < 6)
+                {
+                    wb.Put(B(k), B("p" + op));
+                    model[k] = "p" + op;
+                }
+                else if (r < 8)
+                {
+                    wb.Delete(B(k));
+                    model.Remove(k);
+                }
+                else
+                {
+                    wb.Merge(B(k), B("m" + op));
+                    model[k] = model.TryGetValue(k, out string? old) ? old + ",m" + op : "m" + op;
+                }
+            }
+            CheckWbwi(db, wb, model, rnd, ctx + " end");
+        }
+    }
+
+    private static void CheckWbwi(RocksDatabase db, WriteBatchWithIndex wb, SortedDictionary<string, string> model, Random rnd, string ctx)
+    {
+        foreach (KeyValuePair<string, string> kv in model) Assert.AreEqual(kv.Value, S(wb.GetFromBatchAndDB(db, B(kv.Key))), ctx + " get " + kv.Key);
+        int a = rnd.Next(65), b = rnd.Next(65);
+        if (a > b) (a, b) = (b, a);
+        string lo = "k" + a.ToString("D3", System.Globalization.CultureInfo.InvariantCulture);
+        string hi = "k" + b.ToString("D3", System.Globalization.CultureInfo.InvariantCulture);
+        var ro = new ReadOptions { IterateLowerBound = B(lo), IterateUpperBound = B(hi) };
+        var expected = new List<string>();
+        foreach (KeyValuePair<string, string> kv in model)
+        {
+            if (string.CompareOrdinal(kv.Key, lo) >= 0 && string.CompareOrdinal(kv.Key, hi) < 0) expected.Add(kv.Key + "=" + kv.Value);
+        }
+        using BaseDeltaIterator it = wb.NewIteratorWithBase(db.DefaultColumnFamily, db.NewIterator(ro), ro);
+        var fwd = new List<string>();
+        for (it.SeekToFirst(); it.Valid; it.Next()) fwd.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+        CollectionAssert.AreEqual(expected, fwd, ctx + " fwd [" + lo + "," + hi + ")");
+        var bwd = new List<string>();
+        for (it.SeekToLast(); it.Valid; it.Prev()) bwd.Add(S(it.Key.ToArray()) + "=" + S(it.Value.ToArray()));
+        bwd.Reverse();
+        CollectionAssert.AreEqual(expected, bwd, ctx + " bwd [" + lo + "," + hi + ")");
+    }
+
+    [TestMethod]
+    [Ignore("audit #7 open: a stale second Dispose of a rented WriteBatchWithIndex returns the next renter's batch to the pool (design: the pooled object is its own handle)")]
+    public void DisposingARentedWbwiTwiceDoesNotClearTheNextRentersBatch()
+    {
+        // No C++ counterpart (the pool is the port's): WriteBatchWithIndex.Dispose documents "disposing it again does
+        // nothing", but a second Dispose through a stale reference after the object was rented again clears the new
+        // renter's batch and puts it back in the pool while it is in use.
+        WriteBatchWithIndex first = WriteBatchWithIndex.Rent();
+        first.Put(B("a"), B("1"));
+        first.Dispose();
+        WriteBatchWithIndex second = WriteBatchWithIndex.Rent();
+        try
+        {
+            second.Put(B("b"), B("2"));
+            first.Dispose(); // stale double dispose (e.g. an explicit Dispose inside a using block)
+            Assert.AreEqual(1, second.Count, ReferenceEquals(first, second) ? "same pooled object" : "distinct objects");
+            Assert.AreEqual("2", S(second.GetFromBatch(B("b"))));
+        }
+        finally
+        {
+            second.Dispose();
+        }
+    }
+
     // ---- backup engine under faults -----------------------------------------------------------------------------
 
     private const string BackupDir = "/a7backup";
@@ -599,6 +711,95 @@ public sealed class Audit7UtilitiesFailuresTests
                 Assert.IsFalse(child.EndsWith(".tmp", StringComparison.Ordinal), "k=" + k + " " + child);
             }
             Assert.IsFalse(Array.Exists(fs.Inner.GetChildren(BackupDir + "/meta").ToArray(), static c => c.StartsWith('.')), "k=" + k);
+        }
+    }
+
+    [TestMethod]
+    public void BackupsAndCheckpointsTakenWhileTheDbIsWritingArePrefixConsistent()
+    {
+        // BackupEngineImpl::CreateNewBackupWithMetadata / CheckpointImpl::CreateCheckpoint take the live files with file
+        // deletions disabled and the WALs after FlushWAL: a writer that writes key i only after key i-1 must leave a
+        // gap-free prefix in every restored backup and checkpoint, with or without the flush.
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbDir, NewOptions(fs));
+        using var stop = new CancellationTokenSource();
+        int written = 0;
+        Task writer = Task.Run(() =>
+        {
+            for (int i = 0; !stop.IsCancellationRequested && i < 200_000; i++)
+            {
+                db.Put(Key(i), Value(i, 1));
+                Volatile.Write(ref written, i + 1);
+                if (i % 5000 == 4999) db.Flush();
+            }
+        });
+        using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(BackupDir), fs))
+        {
+            for (int b = 0; b < 6; b++)
+            {
+                while (Volatile.Read(ref written) < (b + 1) * 500 && !writer.IsCompleted) Thread.Yield();
+                be.CreateNewBackup(db, flushBeforeBackup: b % 2 == 0);
+                db.CreateCheckpoint("/cp" + b);
+            }
+            stop.Cancel();
+            writer.GetAwaiter().GetResult();
+            foreach (BackupInfo bi in be.GetBackupInfo())
+            {
+                be.VerifyBackup(bi.BackupId, verifyWithChecksum: true);
+                be.RestoreDbFromBackup(bi.BackupId, "/r" + bi.BackupId, "/r" + bi.BackupId, new RestoreOptions());
+            }
+        }
+        var dirs = new List<string>();
+        for (int b = 0; b < 6; b++) dirs.Add("/cp" + b);
+        for (uint id = 1; id <= 6; id++) dirs.Add("/r" + id);
+        foreach (string d in dirs)
+        {
+            using RocksDatabase r = RocksDatabase.Open(d, new DbOptions { FileSystem = fs });
+            using Iterator it = r.NewIterator();
+            int n = 0;
+            for (it.SeekToFirst(); it.Valid; it.Next())
+            {
+                CollectionAssert.AreEqual(Key(n), it.Key.ToArray(), d + ": gap at " + n);
+                CollectionAssert.AreEqual(Value(n, 1), it.Value.ToArray(), d);
+                n++;
+            }
+            Assert.IsTrue(n > 0, d);
+        }
+    }
+
+    [TestMethod]
+    public void BackupsAndCheckpointsCarryOutstandingPreparedTransactions()
+    {
+        // DBImpl::GetLiveFilesStorageInfo with allow_2pc: the WALs to copy start at the minimum log number to keep,
+        // which includes WALs with outstanding prepared sections (MinLogNumberToKeep / FindMinPrepLogReferencedByMemTable),
+        // so a backup or checkpoint taken while a transaction is prepared recovers it as prepared.
+        MemoryFileSystem fs = NewFs();
+        using (TransactionDatabase db = OpenTxnDb(fs))
+        {
+            Transaction t = db.BeginTransaction(new WriteOptions { Sync = true });
+            t.SetName("p");
+            t.Put(B("prepared"), B("1"));
+            t.Prepare();
+            for (int round = 0; round < 3; round++)
+            {
+                for (int i = 0; i < 100; i++) db.Put(Key(i), Value(i, round));
+                db.Database.Flush();
+            }
+            using (BackupEngine be = BackupEngine.Open(new BackupEngineOptions(BackupDir), fs)) be.CreateNewBackup(db.Database, flushBeforeBackup: true);
+            db.Database.CreateCheckpoint("/cp");
+        }
+        using (BackupEngineReadOnly ro = BackupEngineReadOnly.Open(new BackupEngineOptions(BackupDir), fs)) ro.RestoreDbFromBackup(1, "/r", "/r", new RestoreOptions());
+        foreach (string d in new[] { "/r", "/cp" })
+        {
+            var o = new TransactionDbOptions { TransactionLockTimeout = s_short, DefaultLockTimeout = s_short };
+            using TransactionDatabase r = TransactionDatabase.Open(d, new DbOptions { FileSystem = fs }, o);
+            Transaction? p = r.GetTransactionByName("p");
+            Assert.IsNotNull(p, d);
+            Assert.AreEqual(TransactionState.Prepared, p.State, d);
+            Assert.IsNull(r.Database.Get(B("prepared")), d);
+            CollectionAssert.AreEqual(Value(5, 2), r.Database.Get(Key(5)), d);
+            p.Commit();
+            Assert.AreEqual("1", GetString(r.Database, "prepared"), d);
         }
     }
 
