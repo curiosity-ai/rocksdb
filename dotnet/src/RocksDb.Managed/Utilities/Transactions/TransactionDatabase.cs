@@ -187,17 +187,19 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
 
     private void RebuildRecoveredTransactions()
     {
-        foreach (RecoveredTransaction r in _db.Impl.TakeRecoveredTransactions())
+        List<RecoveredTransaction> recovered = _db.Impl.TakeRecoveredTransactions();
+        try
         {
-            try
+            foreach (RecoveredTransaction r in recovered)
             {
                 PessimisticTransaction txn = NewTransaction(new WriteOptions { Sync = true }, new TransactionOptions { SkipConcurrencyControl = true });
                 txn.RebuildPrepared(r);
             }
-            finally
-            {
-                r.Dispose();
-            }
+        }
+        finally
+        {
+            // Also when a rebuild fails (the open fails): every recovered transaction gives its batches back.
+            foreach (RecoveredTransaction r in recovered) r.Dispose();
         }
     }
 

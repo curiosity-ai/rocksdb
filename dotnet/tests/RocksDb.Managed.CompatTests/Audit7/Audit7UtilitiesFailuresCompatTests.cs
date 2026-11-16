@@ -161,4 +161,35 @@ public sealed unsafe class Audit7UtilitiesFailuresCompatTests
             }
         }
     }
+
+    /// <summary>
+    /// PessimisticTransactionDB::Initialize -> TransactionBaseImpl::RebuildFromWriteBatch: a prepared section holding a
+    /// DeleteRange (written by the managed port through Transaction.WriteBatch) makes the native TransactionDB open fail
+    /// with InvalidArgument "DeleteRangeCF not implemented"; the managed open fails the same way.
+    /// </summary>
+    [TestMethod]
+    public void PreparedSectionWithDeleteRangeFailsTheOpenLikeNative()
+    {
+        using var dir = new TempDir("a7-prep-dr");
+        string path = Path.Combine(dir.Path, "db");
+        using (TransactionDatabase db = TransactionDatabase.Open(path, new DbOptions { CreateIfMissing = true }))
+        {
+            Transaction t = db.BeginTransaction(new WriteOptions { Sync = true });
+            t.SetName("dr");
+            t.Put(U("a"), U("1"));
+            t.WriteBatch.DeleteRange(U("b"), U("c"));
+            t.Prepare();
+        }
+        var options = new RocksDbSharp.DbOptions();
+        IntPtr txnDbOptions = N.rocksdb_transactiondb_options_create();
+        IntPtr handle = N.rocksdb_transactiondb_open(options.Handle, txnDbOptions, path, out IntPtr err);
+        string? nativeError = TakeError(err);
+        if (handle != IntPtr.Zero) N.rocksdb_transactiondb_close(handle);
+        N.rocksdb_transactiondb_options_destroy(txnDbOptions);
+        Assert.AreEqual("Invalid argument: DeleteRangeCF not implemented", nativeError);
+
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => TransactionDatabase.Open(path, new DbOptions()).Dispose());
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code, e.Message);
+        Assert.AreEqual(nativeError, e.Message);
+    }
 }

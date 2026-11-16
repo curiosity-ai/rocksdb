@@ -393,6 +393,25 @@ public sealed class Audit7UtilitiesFailuresTests
         }
     }
 
+    [TestMethod]
+    public void RecoveredPreparedSectionWithARecordTheRebuildCannotTakeFailsTheOpenWithInvalidArgument()
+    {
+        // PessimisticTransactionDB::Initialize -> TransactionBaseImpl::RebuildFromWriteBatch: the handler overrides
+        // Put / PutEntity / Delete / SingleDelete / Merge only; a DeleteRange record falls back to
+        // WriteBatch::Handler::DeleteRangeCF = InvalidArgument("DeleteRangeCF not implemented") and the open fails.
+        MemoryFileSystem fs = NewFs();
+        using (TransactionDatabase db = OpenTxnDb(fs))
+        {
+            Transaction t = db.BeginTransaction(new WriteOptions { Sync = true });
+            t.SetName("dr");
+            t.Put(B("a"), B("1"));
+            t.WriteBatch.DeleteRange(B("b"), B("c"));
+            t.Prepare();
+        }
+        RocksDbException e = Fails(StatusCode.InvalidArgument, () => OpenTxnDb(fs).Dispose());
+        StringAssert.Contains(e.Message, "DeleteRangeCF not implemented");
+    }
+
     // ---- optimistic -----------------------------------------------------------------------------------------------
 
     [TestMethod]

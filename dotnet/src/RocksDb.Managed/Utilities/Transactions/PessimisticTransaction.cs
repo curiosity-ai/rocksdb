@@ -872,16 +872,19 @@ internal class PessimisticTransaction : Transaction
     {
         public bool Continue() => true;
         public void Put(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => batch.Put(columnFamilyId, key, value);
+        // TransactionBaseImpl::RebuildFromWriteBatch's handler does not override TimedPutCF / DeleteRangeCF /
+        // PutBlobIndexCF: the WriteBatch::Handler defaults (include/rocksdb/write_batch.h) fail with InvalidArgument and
+        // so does the open (PessimisticTransactionDB::Initialize).
         public void TimedPut(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong writeUnixTime) =>
-            ThrowHelper.NotSupported("TimedPut in a recovered transaction is not supported");
+            ThrowHelper.InvalidArgument("TimedPutCF not implemented");
         public void PutEntity(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity) => batch.PutEntitySerialized(columnFamilyId, key, entity);
         public void Delete(uint columnFamilyId, ReadOnlySpan<byte> key) => batch.Delete(columnFamilyId, key);
         public void SingleDelete(uint columnFamilyId, ReadOnlySpan<byte> key) => batch.SingleDelete(columnFamilyId, key);
         public void DeleteRange(uint columnFamilyId, ReadOnlySpan<byte> beginKey, ReadOnlySpan<byte> endKey) =>
-            ThrowHelper.NotSupported("DeleteRange in a transaction is not supported");
+            ThrowHelper.InvalidArgument("DeleteRangeCF not implemented");
         public void Merge(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) => batch.Merge(columnFamilyId, key, value);
         public void PutBlobIndex(uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> blobIndex) =>
-            ThrowHelper.NotSupported("Blob files are not supported yet");
+            ThrowHelper.InvalidArgument("PutBlobIndexCF not implemented");
         public void LogData(ReadOnlySpan<byte> blob) => batch.PutLogData(blob);
         public void MarkBeginPrepare(bool unprepare) { }
         public void MarkEndPrepare(ReadOnlySpan<byte> xid) { }
