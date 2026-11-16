@@ -212,7 +212,7 @@ public sealed class ClusterPartitionTests
             Task<bool> write = leader.WriteCommittedAsync(U("contested"), U("x"), TimeSpan.FromSeconds(3), CancellationToken.None).AsTask();
             await gates[follower].Blocked.WaitAsync(TimeSpan.FromSeconds(10));
             Assert.AreEqual(followerLatest, c[follower].Db.GetLatestSequenceNumber(), "the chunk is not applied yet");
-            RequestVoteResult vote = c[follower].HandleRequestVote(new RequestVotePayload(term + 1, candidate, followerLatest, leader.Node.GetTermForSeq(followerLatest)));
+            RequestVoteResult vote = await c[follower].HandleRequestVoteAsync(new RequestVotePayload(term + 1, candidate, followerLatest, leader.Node.GetTermForSeq(followerLatest)), CancellationToken.None);
             Assert.IsTrue(vote.VoteGranted, "the follower votes for the candidate in term " + (term + 1));
             gates[follower].Release();
 

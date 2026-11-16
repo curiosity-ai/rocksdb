@@ -389,16 +389,16 @@ public sealed class Audit4ReplicationProtocolTests
             lock (_held) _held.TryGetValue(request.CandidateId, out gate);
             lock (_voteAnswers) _voteRequests[request.CandidateId] = _voteRequests.GetValueOrDefault(request.CandidateId) + 1;
             if (gate != null) await gate.Task.WaitAsync(cancellationToken);
-            RequestVoteResult r = Nodes[peer.NodeId].HandleRequestVote(request);
+            RequestVoteResult r = await Nodes[peer.NodeId].HandleRequestVoteAsync(request, CancellationToken.None);
             lock (_voteAnswers) _voteAnswers[request.CandidateId] = _voteAnswers.GetValueOrDefault(request.CandidateId) + 1;
             return r;
         }
 
-        public Task<AppendEntriesResult?> SendHeartbeatAsync(ClusterMember peer, HeartbeatPayload payload, CancellationToken cancellationToken)
+        public async Task<AppendEntriesResult?> SendHeartbeatAsync(ClusterMember peer, HeartbeatPayload payload, CancellationToken cancellationToken)
         {
-            AppendEntriesResult r = Nodes[peer.NodeId].HandleAppendEntries(payload);
+            AppendEntriesResult r = await Nodes[peer.NodeId].HandleAppendEntriesAsync(payload, CancellationToken.None);
             Interlocked.Increment(ref _heartbeatAnswers);
-            return Task.FromResult<AppendEntriesResult?>(r);
+            return r;
         }
 
         public int Leaders(long term)
@@ -459,10 +459,10 @@ public sealed class Audit4ReplicationProtocolTests
 
         // Directly: same last term but shorter is refused, at least as long is granted.
         long term = n1.CurrentTerm;
-        Assert.IsFalse(n1.HandleRequestVote(new RequestVotePayload(term, "n2", 4, 2)).VoteGranted, "a shorter log of the same last term got the vote");
-        Assert.IsFalse(n1.HandleRequestVote(new RequestVotePayload(term, "n2", 100, 1)).VoteGranted, "a longer log of an older last term got the vote");
-        Assert.IsTrue(n1.HandleRequestVote(new RequestVotePayload(term, "n2", 5, 2)).VoteGranted);
-        Assert.IsFalse(n1.HandleRequestVote(new RequestVotePayload(term, "n3", 9, 3)).VoteGranted, "a second vote in the same term");
+        Assert.IsFalse((await n1.HandleRequestVoteAsync(new RequestVotePayload(term, "n2", 4, 2), CancellationToken.None)).VoteGranted, "a shorter log of the same last term got the vote");
+        Assert.IsFalse((await n1.HandleRequestVoteAsync(new RequestVotePayload(term, "n2", 100, 1), CancellationToken.None)).VoteGranted, "a longer log of an older last term got the vote");
+        Assert.IsTrue((await n1.HandleRequestVoteAsync(new RequestVotePayload(term, "n2", 5, 2), CancellationToken.None)).VoteGranted);
+        Assert.IsFalse((await n1.HandleRequestVoteAsync(new RequestVotePayload(term, "n3", 9, 3), CancellationToken.None)).VoteGranted, "a second vote in the same term");
 
         trio.Time["n1"].ElapseElectionTimeout();
         await WaitUntilAsync(() => n1.Role == RaftRole.Leader, "n1 to be elected");
@@ -495,11 +495,11 @@ public sealed class Audit4ReplicationProtocolTests
             return true;
         }, "both followers to confirm sequence 5");
         // A progress report for it changes nothing either (and evaluates the commit rule synchronously).
-        Assert.IsTrue(n1.RecordFollowerProgress("n2", 5, 3));
-        Assert.IsTrue(n1.RecordFollowerProgress("n3", 5, 3));
+        Assert.IsTrue(await n1.RecordFollowerProgressAsync("n2", 5, 3, CancellationToken.None));
+        Assert.IsTrue(await n1.RecordFollowerProgressAsync("n3", 5, 3, CancellationToken.None));
         Assert.AreEqual(0UL, n1.CommitSeq, "an entry of term 2 was committed in term 3 by counting replicas");
 
-        Assert.IsTrue(n1.RecordFollowerProgress("n2", 6, 3));
+        Assert.IsTrue(await n1.RecordFollowerProgressAsync("n2", 6, 3, CancellationToken.None));
         Assert.AreEqual(6UL, n1.CommitSeq, "a quorum holds the term-3 entry: it and everything before it is committed");
     }
 
@@ -534,8 +534,8 @@ public sealed class Audit4ReplicationProtocolTests
 
         // n3 restarts: its vote of term 2 is on disk.
         await trio.RestartAsync("n3");
-        Assert.IsFalse(trio.Nodes["n3"].HandleRequestVote(new RequestVotePayload(2, "n2", 4, 1)).VoteGranted, "a node voted twice in one term after a restart");
-        Assert.IsTrue(trio.Nodes["n3"].HandleRequestVote(new RequestVotePayload(2, "n1", 4, 1)).VoteGranted, "the same candidate may be answered again");
+        Assert.IsFalse((await trio.Nodes["n3"].HandleRequestVoteAsync(new RequestVotePayload(2, "n2", 4, 1), CancellationToken.None)).VoteGranted, "a node voted twice in one term after a restart");
+        Assert.IsTrue((await trio.Nodes["n3"].HandleRequestVoteAsync(new RequestVotePayload(2, "n1", 4, 1), CancellationToken.None)).VoteGranted, "the same candidate may be answered again");
     }
 
     /// <summary>
@@ -553,17 +553,99 @@ public sealed class Audit4ReplicationProtocolTests
         long term = n1.CurrentTerm;
         ulong commit = n2.CommitSeq;
 
-        RequestVoteResult vote = n2.HandleRequestVote(new RequestVotePayload(term + 5, "stranger", 1000, term + 5));
+        RequestVoteResult vote = await n2.HandleRequestVoteAsync(new RequestVotePayload(term + 5, "stranger", 1000, term + 5), CancellationToken.None);
         Assert.IsFalse(vote.VoteGranted, "a node outside the member list got a vote");
         Assert.AreEqual(term, n2.CurrentTerm, "a node outside the member list moved the term");
-        Assert.AreEqual(term, n1.HandleRequestVote(new RequestVotePayload(term + 5, "stranger", 1000, term + 5)).Term);
+        Assert.AreEqual(term, (await n1.HandleRequestVoteAsync(new RequestVotePayload(term + 5, "stranger", 1000, term + 5), CancellationToken.None)).Term);
         Assert.AreEqual(RaftRole.Leader, n1.Role, "a node outside the member list deposed the leader");
 
-        AppendEntriesResult beat = n2.HandleAppendEntries(new HeartbeatPayload(term + 5, "stranger", 0, 0, 1000, ClusterMode.Cluster));
+        AppendEntriesResult beat = await n2.HandleAppendEntriesAsync(new HeartbeatPayload(term + 5, "stranger", 0, 0, 1000, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsFalse(beat.Success);
         Assert.AreEqual(term, n2.CurrentTerm);
         Assert.AreEqual("n1", n2.CurrentLeaderId);
         Assert.AreEqual(commit, n2.CommitSeq);
+    }
+
+    /// <summary>Grants every vote; heartbeats get no answer.</summary>
+    private sealed class VoteGrantingTransport : IPeerTransport
+    {
+        public Task<RequestVoteResult?> SendRequestVoteAsync(ClusterMember peer, RequestVotePayload request, CancellationToken cancellationToken) =>
+            Task.FromResult<RequestVoteResult?>(new RequestVoteResult(request.Term, true));
+
+        public Task<AppendEntriesResult?> SendHeartbeatAsync(ClusterMember peer, HeartbeatPayload payload, CancellationToken cancellationToken) =>
+            Task.FromResult<AppendEntriesResult?>(null);
+    }
+
+    /// <summary>
+    /// A new leader writes the first entry of its term while holding the node's gate. That write used to be a
+    /// synchronous Put inside a lock: with the WAL sync stalled (a write stall, or the write queued behind an async write
+    /// group whose finish needs a thread-pool thread), every vote and heartbeat handler - and the transport thread
+    /// running it - blocked on the lock with no timeout: the node stopped answering, could not step down, and the thread
+    /// pool starved. Now the write is awaited: the handlers queue without blocking their callers, the role accessors
+    /// and Dispose answer, and once the write completes the queued heartbeat of a higher term deposes the new leader.
+    /// </summary>
+    [TestMethod]
+    public async Task RaftHandlersDoNotBlockThreadsWhileANewLeaderWritesItsFirstEntry()
+    {
+        var gated = new GatedFileSystem(new MemoryFileSystem());
+        await using RocksDatabase db = await RocksDatabase.OpenAsync("/db", DbOpts(gated));
+        var state = new RaftPersistentState(new MemoryFileSystem(), "/raft");
+        state.SetMode(ClusterMode.Cluster);
+        var time = new ManualTime();
+        var config = new RaftConfig("n1", "mem://n1", [new ClusterMember("n2", "mem://n2")]) { TimeProvider = time, SyncLogWrites = true };
+        var roles = new List<RaftRole>();
+        await using var node = new RaftClusterNode(config, state, db, new VoteGrantingTransport());
+        node.RoleChanged += (_, e) =>
+        {
+            lock (roles) roles.Add(e.Role);
+        };
+        ulong before = db.GetLatestSequenceNumber();
+        node.Start();
+        gated.Arm();
+        List<Task> pending;
+        long term;
+        try
+        {
+            // The election is won at once (n2 grants its vote); the no-op entry's WAL sync then stalls, gate held.
+            time.ElapseElectionTimeout();
+            await gated.Blocked.WaitAsync(TestUtil.Timeout);
+            term = node.CurrentTerm;
+
+            // On a thread of its own, so that a handler that blocks its caller fails the test instead of hanging it.
+            // More calls than the thread pool keeps threads for: blocked handlers would have starved it.
+            pending = await Task.Run(() =>
+            {
+                var calls = new List<Task>();
+                for (int i = 0; i < 2 * Environment.ProcessorCount + 32; i++)
+                {
+                    calls.Add(node.HandleAppendEntriesAsync(new HeartbeatPayload(term + 1, "n2", 0, 0, 0, ClusterMode.Cluster), CancellationToken.None).AsTask());
+                    calls.Add(node.HandleRequestVoteAsync(new RequestVotePayload(term + 1, "n2", 0, 0), CancellationToken.None).AsTask());
+                }
+                calls.Add(node.HandleObservedLeaderAsync("n2", term + 1, CancellationToken.None).AsTask());
+                calls.Add(node.CheckFollowerLogConsistencyAsync(0, 0, CancellationToken.None).AsTask());
+                calls.Add(node.RecordFollowerProgressAsync("n2", 0, term, CancellationToken.None).AsTask());
+                return calls;
+            }).WaitAsync(TestUtil.Timeout);
+
+            Assert.IsFalse(pending.Exists(static t => t.IsCompleted), "a handler ran while the new leader's first entry was being written");
+            Assert.AreEqual(RaftRole.Candidate, node.Role);
+            Assert.IsNull(node.CurrentLeaderId);
+            Assert.IsFalse(node.IsResyncing);
+            Assert.AreEqual(before, db.GetLatestSequenceNumber(), "the no-op entry is not visible before its sync");
+            // Dispose (which used to take the lock to wake commit waiters) returns as well.
+            await Task.Run(node.Dispose).WaitAsync(TestUtil.Timeout);
+        }
+        finally
+        {
+            gated.Release();
+        }
+
+        await Task.WhenAll(pending).WaitAsync(TestUtil.Timeout);
+        Assert.AreEqual(before + 1, db.GetLatestSequenceNumber(), "the no-op entry of term " + term);
+        Assert.AreEqual(RaftRole.Follower, node.Role, "the queued heartbeat of a higher term did not depose the new leader");
+        Assert.AreEqual("n2", node.CurrentLeaderId);
+        Assert.AreEqual(term + 1, node.CurrentTerm);
+        lock (roles) CollectionAssert.AreEqual(new[] { RaftRole.Candidate, RaftRole.Leader, RaftRole.Follower }, roles);
     }
 
     // ---------------------------------------------------------------------------------------------------

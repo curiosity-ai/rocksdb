@@ -168,7 +168,7 @@ public sealed class BuildingBlockTests
     /// new entry)) even though leaderCommit and the follower's latest sequence are both higher.
     /// </summary>
     [TestMethod]
-    public void FollowerCommitIndexStopsAtTheLastEntryKnownToMatchTheLeader()
+    public async Task FollowerCommitIndexStopsAtTheLastEntryKnownToMatchTheLeader()
     {
         using var dir = new TempDir("raft-commit");
         using RocksDatabase db = RocksDatabase.Open(dir.Sub("db"), new DbOptions { CreateIfMissing = true });
@@ -183,19 +183,19 @@ public sealed class BuildingBlockTests
         using var node = new RaftClusterNode(cfg, state, db, new NullPeerTransport());
 
         // New leader n2 (term 3) has entries 1..5 of term 1 followed by its own term-3 entries 6..7, committed up to 7.
-        AppendEntriesResult r = node.HandleAppendEntries(new HeartbeatPayload(3, "n2", 5, 1, 7, ClusterMode.Cluster));
+        AppendEntriesResult r = await node.HandleAppendEntriesAsync(new HeartbeatPayload(3, "n2", 5, 1, 7, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsTrue(r.Success);
         Assert.AreEqual(5UL, node.CommitSeq, "the divergent tail past PrevLogSeq was marked committed");
 
         // Probing further back never lowers the commit index.
-        r = node.HandleAppendEntries(new HeartbeatPayload(3, "n2", 3, 1, 7, ClusterMode.Cluster));
+        r = await node.HandleAppendEntriesAsync(new HeartbeatPayload(3, "n2", 3, 1, 7, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsTrue(r.Success);
         Assert.AreEqual(5UL, node.CommitSeq);
 
         // A heartbeat whose PrevLogSeq is inside the divergent tail fails the term check and asks for a resync.
         bool resync = false;
         node.ResyncRequired += (_, _) => resync = true;
-        r = node.HandleAppendEntries(new HeartbeatPayload(3, "n2", 7, 3, 7, ClusterMode.Cluster));
+        r = await node.HandleAppendEntriesAsync(new HeartbeatPayload(3, "n2", 7, 3, 7, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsFalse(r.Success);
         Assert.AreEqual(AppendEntriesRejectReason.TermMismatch, r.Reason);
         Assert.IsTrue(resync);

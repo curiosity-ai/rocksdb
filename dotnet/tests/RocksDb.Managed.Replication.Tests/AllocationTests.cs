@@ -41,6 +41,12 @@ public sealed class AllocationTests
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
+    private static T CompletedResult<T>(ValueTask<T> task)
+    {
+        Assert.IsTrue(task.IsCompletedSuccessfully, "completes synchronously while the gate is free");
+        return task.Result;
+    }
+
     private static async Task<double> MeasureAllThreadsAsync(Func<int, ValueTask> op, int warmup, int ops)
     {
         for (int i = 0; i < warmup; i++) await op(i);
@@ -265,7 +271,7 @@ public sealed class AllocationTests
             db.Put(Key(k++), Value100);
             ulong latest = db.GetLatestSequenceNumber();
             long before = GC.GetAllocatedBytesForCurrentThread();
-            node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
+            await node.RecordFollowerProgressAsync("n2", latest, node.CurrentTerm, CancellationToken.None);
             if (i >= 100) bytes += GC.GetAllocatedBytesForCurrentThread() - before;
             Assert.AreEqual(latest, node.CommitSeq);
         }
@@ -276,7 +282,7 @@ public sealed class AllocationTests
         double baseline = await MeasureAllThreadsAsync([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int i) =>
         {
             db.Put(Key(k++), Value100);
-            node.RecordFollowerProgress("n2", db.GetLatestSequenceNumber(), node.CurrentTerm);
+            await node.RecordFollowerProgressAsync("n2", db.GetLatestSequenceNumber(), node.CurrentTerm, CancellationToken.None);
             await Task.CompletedTask;
         }, 300, 1000);
         double waitBytes = await MeasureAllThreadsAsync([AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))] async ValueTask (int i) =>
@@ -284,7 +290,7 @@ public sealed class AllocationTests
             db.Put(Key(k++), Value100);
             ulong latest = db.GetLatestSequenceNumber();
             ValueTask<bool> committed = node.WaitForCommitAsync(latest, node.CurrentTerm, cts.Token);
-            node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
+            await node.RecordFollowerProgressAsync("n2", latest, node.CurrentTerm, CancellationToken.None);
             Assert.IsTrue(await committed);
         }, 300, 1000);
         waitBytes -= baseline;
@@ -311,38 +317,39 @@ public sealed class AllocationTests
         Task<bool> waiting = node.WaitForCommitAsync(seq, node.CurrentTerm, CancellationToken.None).AsTask();
         Task<bool> waiting2 = node.WaitForCommitAsync(seq + 10, node.CurrentTerm, CancellationToken.None).AsTask();
         Assert.IsFalse(waiting.IsCompleted);
-        node.RecordFollowerProgress("n2", seq, node.CurrentTerm);
+        await node.RecordFollowerProgressAsync("n2", seq, node.CurrentTerm, CancellationToken.None);
         Assert.IsTrue(await waiting.WaitAsync(TestUtil.Timeout));
         Assert.IsFalse(waiting2.IsCompleted, "a later sequence is not committed yet");
         // A higher term deposes the leader: the wait ends with false.
-        node.HandleAppendEntries(new HeartbeatPayload(5, "n2", 0, 0, 0, ClusterMode.Bootstrap));
+        await node.HandleAppendEntriesAsync(new HeartbeatPayload(5, "n2", 0, 0, 0, ClusterMode.Bootstrap), CancellationToken.None);
         Assert.AreEqual(RaftRole.Follower, node.Role);
         Assert.IsFalse(await waiting2.WaitAsync(TestUtil.Timeout));
     }
 
     [TestMethod]
-    public void HeartbeatAnswersAreReusedWhileNothingChanges()
+    public async Task HeartbeatAnswersAreReusedWhileNothingChanges()
     {
         var fs = new MemoryFileSystem();
         using RocksDatabase db = OpenQuiet(fs, "/n2", archive: false);
         using RaftClusterNode node = NewNode(fs, db, "n2", bootstrapPrimary: false);
         db.Put(Key(0), Value100);
         var beat = new HeartbeatPayload(1, "n1", 0, 0, 0, ClusterMode.Bootstrap);
-        AppendEntriesResult first = node.HandleAppendEntries(beat);
+        AppendEntriesResult first = await node.HandleAppendEntriesAsync(beat, CancellationToken.None);
         Assert.IsTrue(first.Success);
         Assert.AreEqual(1UL, first.LastSeq);
-        Assert.AreSame(first, node.HandleAppendEntries(beat), "same term and tail: same answer");
-        long bytes = MeasureThread(_ => node.HandleAppendEntries(beat), 10, 1000);
+        Assert.AreSame(first, await node.HandleAppendEntriesAsync(beat, CancellationToken.None), "same term and tail: same answer");
+        // Uncontended, the handler completes synchronously: no state machine box, no task.
+        long bytes = MeasureThread(_ => CompletedResult(node.HandleAppendEntriesAsync(beat, CancellationToken.None)), 10, 1000);
         if (Optimized) Assert.AreEqual(0L, bytes, "1000 idle heartbeats");
         db.Put(Key(1), Value100);
-        AppendEntriesResult moved = node.HandleAppendEntries(beat);
+        AppendEntriesResult moved = await node.HandleAppendEntriesAsync(beat, CancellationToken.None);
         Assert.AreNotSame(first, moved);
         Assert.AreEqual(2UL, moved.LastSeq);
-        AppendEntriesResult newTerm = node.HandleAppendEntries(new HeartbeatPayload(2, "n1", 0, 0, 0, ClusterMode.Bootstrap));
+        AppendEntriesResult newTerm = await node.HandleAppendEntriesAsync(new HeartbeatPayload(2, "n1", 0, 0, 0, ClusterMode.Bootstrap), CancellationToken.None);
         Assert.AreEqual(2L, newTerm.Term);
         Assert.IsTrue(newTerm.Success);
         // A rejection is never confused with the cached success.
-        AppendEntriesResult behind = node.HandleAppendEntries(new HeartbeatPayload(2, "n1", 100, 2, 0, ClusterMode.Bootstrap));
+        AppendEntriesResult behind = await node.HandleAppendEntriesAsync(new HeartbeatPayload(2, "n1", 100, 2, 0, ClusterMode.Bootstrap), CancellationToken.None);
         Assert.IsFalse(behind.Success);
         Assert.AreEqual(AppendEntriesRejectReason.Behind, behind.Reason);
     }
@@ -379,9 +386,9 @@ public sealed class AllocationTests
         for (int i = 0; i < 5; i++)
         {
             ValueTask<bool> w = host.WriteCommittedAsync(Key(20 + i), Value100, TimeSpan.FromSeconds(30), CancellationToken.None);
-            await WaitUntilAsync(() =>
+            await WaitUntilAsync(async () =>
             {
-                host.HandleReportProgress("n2", host.Db.GetLatestSequenceNumber(), host.Node.CurrentTerm);
+                await host.HandleReportProgressAsync("n2", host.Db.GetLatestSequenceNumber(), host.Node.CurrentTerm, CancellationToken.None);
                 return host.Node.CommitSeq == host.Db.GetLatestSequenceNumber();
             }, "commit");
             Assert.IsTrue(await w);

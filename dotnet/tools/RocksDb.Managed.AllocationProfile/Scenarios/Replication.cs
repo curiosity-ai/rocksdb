@@ -551,24 +551,23 @@ internal static partial class Scenarios
 
         private ClusterNodeHost Require => Target ?? throw new IOException(nodeId + " is not running");
 
-        public Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) =>
-            Task.FromResult(Target?.HandleRequestVote(request));
+        public async Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) =>
+            Target is { } t ? await t.HandleRequestVoteAsync(request, cancellationToken).ConfigureAwait(false) : null;
 
-        public Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) =>
-            Task.FromResult(Target?.HandleHeartbeat(payload));
+        public async Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) =>
+            Target is { } t ? await t.HandleHeartbeatAsync(payload, cancellationToken).ConfigureAwait(false) : null;
 
         public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.GetStatus());
 
-        public Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
-            Task.FromResult(Target?.HandleCheckLogConsistency(latestSeq, termAtLatest));
+        public async Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
+            Target is { } t ? await t.HandleCheckLogConsistencyAsync(latestSeq, termAtLatest, cancellationToken).ConfigureAwait(false) : null;
 
         public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
             Require.StreamUpdatesAsync(followerId, startSeq, cancellationToken);
 
-        public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
+        public async Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
         {
-            Target?.HandleReportProgress(followerId, appliedThrough, leaderTerm);
-            return Task.CompletedTask;
+            if (Target is { } t) await t.HandleReportProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken).ConfigureAwait(false);
         }
 
         public Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>
@@ -773,7 +772,7 @@ internal static partial class Scenarios
         byte[] value = ScenarioContext.Value(ScenarioContext.ValueSize);
 
         list.Add(S("raft.record-progress", "raft", PathKind.Hot,
-            "leader: Put + RecordFollowerProgress(n2, latest) (quorum commit advances every op)", ctx =>
+            "leader: Put + RecordFollowerProgressAsync(n2, latest) (quorum commit advances every op)", ctx =>
         {
             RocksDatabase db = ctx.OpenDb("db", ReplDbOptions(archive: false));
             RaftClusterNode node = NewRaftNode(ctx, db, "n1", bootstrapPrimary: true);
@@ -785,13 +784,13 @@ internal static partial class Scenarios
                 {
                     db.Put(keys[c.Next()], value);
                     ulong latest = db.GetLatestSequenceNumber();
-                    node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
+                    Completed(node.RecordFollowerProgressAsync("n2", latest, node.CurrentTerm, CancellationToken.None));
                     if (node.CommitSeq != latest) throw new InvalidOperationException("commit did not advance");
                 }
             }));
         }));
         list.Add(S("raft.wait-commit", "raft", PathKind.Hot,
-            "leader: Put, pending WaitForCommitAsync(seq, term, ct), RecordFollowerProgress completes it", ctx =>
+            "leader: Put, pending WaitForCommitAsync(seq, term, ct), RecordFollowerProgressAsync completes it", ctx =>
         {
             RocksDatabase db = ctx.OpenDb("db", ReplDbOptions(archive: false));
             RaftClusterNode node = NewRaftNode(ctx, db, "n1", bootstrapPrimary: true);
@@ -805,12 +804,12 @@ internal static partial class Scenarios
                     db.Put(keys[c.Next()], value);
                     ulong latest = db.GetLatestSequenceNumber();
                     ValueTask<bool> committed = node.WaitForCommitAsync(latest, node.CurrentTerm, cts.Token);
-                    node.RecordFollowerProgress("n2", latest, node.CurrentTerm);
+                    await node.RecordFollowerProgressAsync("n2", latest, node.CurrentTerm, CancellationToken.None);
                     if (!await committed) throw new InvalidOperationException("not committed");
                 }
             }));
         }));
-        list.Add(S("raft.handle-heartbeat", "raft", PathKind.Warm, "follower: HandleAppendEntries(heartbeat) (accepted, commit unchanged)", ctx =>
+        list.Add(S("raft.handle-heartbeat", "raft", PathKind.Warm, "follower: HandleAppendEntriesAsync(heartbeat) (accepted, commit unchanged)", ctx =>
         {
             RocksDatabase db = ctx.OpenDb("db", ReplDbOptions(archive: false));
             RaftClusterNode node = NewRaftNode(ctx, db, "n2", bootstrapPrimary: false);
@@ -820,19 +819,29 @@ internal static partial class Scenarios
             {
                 for (int i = 0; i < n; i++)
                 {
-                    if (!node.HandleAppendEntries(beat).Success) throw new InvalidOperationException("rejected");
+                    if (!Completed(node.HandleAppendEntriesAsync(beat, CancellationToken.None)).Success) throw new InvalidOperationException("rejected");
                 }
             }));
         }));
-        list.Add(S("raft.observed-leader", "raft", PathKind.Hot, "follower: HandleObservedLeader(leader, term) per stream message", ctx =>
+        list.Add(S("raft.observed-leader", "raft", PathKind.Hot, "follower: HandleObservedLeaderAsync(leader, term) per stream message", ctx =>
         {
             RocksDatabase db = ctx.OpenDb("db", ReplDbOptions(archive: false));
             RaftClusterNode node = NewRaftNode(ctx, db, "n2", bootstrapPrimary: false);
-            node.HandleObservedLeader("n1", 1);
+            Completed(node.HandleObservedLeaderAsync("n1", 1, CancellationToken.None));
             return Done(Runner.Sync(n =>
             {
-                for (int i = 0; i < n; i++) node.HandleObservedLeader("n1", 1);
+                for (int i = 0; i < n; i++) Completed(node.HandleObservedLeaderAsync("n1", 1, CancellationToken.None));
             }));
         }));
+    }
+
+    // The node's handlers complete synchronously while its gate is free, which is the case these scenarios measure.
+    private static T Completed<T>(ValueTask<T> task) =>
+        task.IsCompletedSuccessfully ? task.Result : throw new InvalidOperationException("the handler did not complete synchronously");
+
+    private static void Completed(ValueTask task)
+    {
+        if (!task.IsCompletedSuccessfully) throw new InvalidOperationException("the handler did not complete synchronously");
+        task.GetAwaiter().GetResult();
     }
 }

@@ -271,13 +271,13 @@ public sealed class Audit4ReplicationTests
         ulong seq = leader.Db.GetLatestSequenceNumber();
 
         // The late report: same follower, a position the leader's log has reached, but for the earlier term.
-        Assert.IsFalse(leader.HandleReportProgress(follower, seq, firstTerm), "a report for term " + firstTerm + " was accepted in term " + leader.Node.CurrentTerm);
+        Assert.IsFalse(await leader.HandleReportProgressAsync(follower, seq, firstTerm, CancellationToken.None), "a report for term " + firstTerm + " was accepted in term " + leader.Node.CurrentTerm);
         Assert.AreEqual(committed, leader.Node.CommitSeq, "an entry held by one node of three was committed");
         // A position past the leader's own log cannot come from a follower of this leadership either.
-        Assert.IsFalse(leader.HandleReportProgress(follower, seq + 100, leader.Node.CurrentTerm));
+        Assert.IsFalse(await leader.HandleReportProgressAsync(follower, seq + 100, leader.Node.CurrentTerm, CancellationToken.None));
         Assert.AreEqual(committed, leader.Node.CommitSeq);
         // The same report for the current term is what a real follower sends.
-        Assert.IsTrue(leader.HandleReportProgress(follower, seq, leader.Node.CurrentTerm));
+        Assert.IsTrue(await leader.HandleReportProgressAsync(follower, seq, leader.Node.CurrentTerm, CancellationToken.None));
         Assert.AreEqual(seq, leader.Node.CommitSeq);
     }
 
@@ -381,7 +381,7 @@ public sealed class Audit4ReplicationTests
         var config = new RaftConfig("n1", "mem://n1", [new ClusterMember("n2", "mem://n2")]) { BootstrapPrimary = true };
         await using var node = new RaftClusterNode(config, state, db, new NoTransport());
         Assert.AreEqual(RaftRole.Leader, node.Role);
-        node.BeginResync();
+        await node.BeginResyncAsync(CancellationToken.None);
         Assert.AreEqual(RaftRole.Follower, node.Role);
         Assert.IsNull(node.CurrentLeaderId);
     }

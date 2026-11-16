@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace RocksDb.Managed.Cluster;
@@ -10,17 +11,26 @@ namespace RocksDb.Managed.Cluster;
 /// and the Bootstrap -> Cluster transition.
 /// <para>
 /// The host owns the network, the database and the replication stream. It routes incoming RPCs to
-/// <see cref="HandleRequestVote"/>, <see cref="HandleAppendEntries"/>, <see cref="HandleObservedLeader"/> and
-/// <see cref="CheckFollowerLogConsistency"/>, reports follower progress to the leader through
-/// <see cref="RecordFollowerProgress"/>, and gives this class an <see cref="IPeerTransport"/> for outgoing RPCs.
+/// <see cref="HandleRequestVoteAsync"/>, <see cref="HandleAppendEntriesAsync"/>, <see cref="HandleObservedLeaderAsync"/>
+/// and <see cref="CheckFollowerLogConsistencyAsync"/>, reports follower progress to the leader through
+/// <see cref="RecordFollowerProgressAsync"/>, and gives this class an <see cref="IPeerTransport"/> for outgoing RPCs.
 /// </para>
 /// <para>
 /// Managed differences: <see cref="WaitForCommitAsync"/> lets a leader acknowledge a write once it is committed without
 /// polling <see cref="CommitSeq"/>; timers and delays use <see cref="RaftConfig.TimeProvider"/>;
 /// <see cref="DisposeAsync"/> waits for the heartbeat loop so no RPC is sent after disposal.
 /// </para>
-/// Events are raised while the node's internal lock is held: handlers must be quick and must not block on work that
-/// calls back into this node from another thread (schedule such work instead).
+/// <para>
+/// The node's state is guarded by an async gate (a <see cref="SemaphoreSlim"/>), not a thread lock, because a new leader
+/// awaits the write of its term's first entry (<see cref="LeaderNoOpKey"/>) while holding it: a write stall must leave
+/// the other RPC handlers waiting asynchronously rather than blocking thread-pool threads.
+/// </para>
+/// Events (<see cref="RoleChanged"/>, <see cref="LeaderChanged"/>, <see cref="ModeChanged"/>,
+/// <see cref="LeadershipFailed"/>) are raised while the gate is held, with no await between a state change and its
+/// event, so they stay ordered with the state changes. The gate is not reentrant: handlers must be quick and must not
+/// wait for a call into this node that takes the gate (schedule such work instead). <see cref="Role"/>,
+/// <see cref="CurrentLeaderId"/>, <see cref="IsResyncing"/>, <see cref="CurrentTerm"/>, <see cref="Mode"/> and
+/// <see cref="CommitSeq"/> do not take it and may be read there.
 /// </summary>
 public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
 {
@@ -31,22 +41,32 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// </summary>
     public static ReadOnlySpan<byte> LeaderNoOpKey => "__raft_noop"u8;
 
+    private static readonly byte[] s_leaderNoOpKey = LeaderNoOpKey.ToArray();
+
     private readonly RaftConfig _config;
     private readonly RaftPersistentState _state;
     private readonly IPeerTransport _transport;
     private readonly ElectionTimer _electionTimer;
-    private readonly Lock _gate = new();
+    // Guards the node's state; see the class remarks for why it is a semaphore. Never disposed: nothing reads its
+    // AvailableWaitHandle, so disposing would release nothing, and a late waiter (an RPC handler racing DisposeAsync)
+    // must not get an ObjectDisposedException.
+    private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, PeerState> _peers;
     private readonly CancellationTokenSource _cts = new();
     private readonly TimeProvider _time;
 
     private RocksDatabase _db;
-    private RaftRole _role;
-    private string? _currentLeaderId;
+    // _role, _currentLeaderId and _resyncing are written only under _gate. They are volatile so that Role,
+    // CurrentLeaderId and IsResyncing can read them without the gate: each is one word (never torn), and the value read
+    // is the state at some instant - all a caller outside the gate could get anyway, since the state may change as soon
+    // as the gate is released. So those accessors never wait behind a new leader awaiting its first write, and event
+    // handlers (raised under the gate) can read them.
+    private volatile RaftRole _role;
+    private volatile string? _currentLeaderId;
     private ulong _commitSeq;
     private CancellationTokenSource? _leaderCts;
     private Task _leaderLoop = Task.CompletedTask;
-    private bool _resyncing;
+    private volatile bool _resyncing;
     private int _bootstrapInSyncFollowers;
     // Woken whenever the commit index advances or leadership ends (WaitForCommitAsync). Signalled under _gate.
     private readonly RocksDb.Managed.Util.AsyncBroadcastSignal _commitChanged = new();
@@ -125,35 +145,20 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     public string NodeId => _config.NodeId;
     public RaftConfig Config => _config;
 
-    public RaftRole Role
-    {
-        get
-        {
-            lock (_gate) return _role;
-        }
-    }
+    /// <summary>A snapshot of the node's role (read without the node's gate).</summary>
+    public RaftRole Role => _role;
 
     public long CurrentTerm => _state.CurrentTerm;
 
-    public string? CurrentLeaderId
-    {
-        get
-        {
-            lock (_gate) return _currentLeaderId;
-        }
-    }
+    /// <summary>A snapshot of the leader this node knows of (read without the node's gate).</summary>
+    public string? CurrentLeaderId => _currentLeaderId;
 
     public ClusterMode Mode => _state.Mode;
     public ulong CommitSeq => Volatile.Read(ref _commitSeq);
     public IReadOnlyCollection<PeerState> Peers => [.. _peers.Values];
 
-    public bool IsResyncing
-    {
-        get
-        {
-            lock (_gate) return _resyncing;
-        }
-    }
+    /// <summary>A snapshot of whether the node is in resync mode (read without the node's gate).</summary>
+    public bool IsResyncing => _resyncing;
 
     public int BootstrapInSyncCount => Volatile.Read(ref _bootstrapInSyncFollowers);
 
@@ -162,12 +167,22 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// <summary>The serialized term map (sent to a follower that restored a snapshot of this node).</summary>
     public string SerializeTerms() => _state.Terms.Serialize();
 
+    /// <summary>
+    /// Starts the heartbeat loop (bootstrap primary) or the election timer. Synchronous: it is called once, before this
+    /// node campaigns, so the only other gate holders are RPC handlers, whose critical sections never await - the
+    /// blocking wait for the gate is as short as the old lock was.
+    /// </summary>
     public void Start()
     {
-        lock (_gate)
+        _gate.Wait();
+        try
         {
             if (_role == RaftRole.Leader) StartLeaderLoopLocked();
             else _electionTimer.Start();
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -176,7 +191,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         _cts.Cancel();
         _electionTimer.Dispose();
-        lock (_gate) _commitChanged.SignalAll();
+        // Without the gate (Dispose must not wait behind a leader awaiting a write): the exchange above is a full fence
+        // before SignalAll reads its waiter list, and WaitForCommitAsync re-reads _disposed after registering (Register
+        // fences), so a waiter either sees the disposal or is woken here.
+        _commitChanged.SignalAll();
     }
 
     /// <summary>Stops the node and waits for its heartbeat loop to finish.</summary>
@@ -184,7 +202,16 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     {
         Dispose();
         Task loop;
-        lock (_gate) loop = _leaderLoop;
+        // Under the gate: an election already past its _disposed check may still be starting a loop.
+        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            loop = _leaderLoop;
+        }
+        finally
+        {
+            _gate.Release();
+        }
         try
         {
             await loop.ConfigureAwait(false);
@@ -196,11 +223,24 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
 
     // ===== Incoming RPC handlers =====
 
-    public RequestVoteResult HandleRequestVote(RequestVotePayload request)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<RequestVoteResult> HandleRequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return HandleRequestVoteLocked(request);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private RequestVoteResult HandleRequestVoteLocked(RequestVotePayload request)
+    {
         (long term, string candidateId, ulong lastLogSeq, long lastLogTerm) = request;
-        lock (_gate)
         {
             // Only a member can become leader of this cluster. A request from anyone else (a node configured for another
             // cluster, a member list that was changed on one node only) must neither get a vote - a majority here does
@@ -246,6 +286,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         }
     }
 
+<<<<<<< HEAD
     /// <summary>
     /// The vote of a member whose log is gone or being replaced: killed or powered off during a snapshot restore (which
     /// deletes the old files before the new CURRENT arrives), or resyncing right now. Refusing every vote in that state
@@ -267,7 +308,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// <see cref="HandleRequestVote"/> for a member that has no database yet and so no <see cref="RaftClusterNode"/>:
+    /// <see cref="HandleRequestVoteAsync"/> for a member that has no database yet and so no <see cref="RaftClusterNode"/>:
     /// the host is pulling its initial snapshot. Same rules (membership, terms, the persisted vote, Bootstrap mode), with
     /// <see cref="IsUpToDateWithoutLog"/> as the log comparison. REQUIRES: the caller serialises calls, and stops calling
     /// before it creates the node for <paramref name="state"/>.
@@ -295,11 +336,31 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     }
 
     public AppendEntriesResult HandleAppendEntries(HeartbeatPayload heartbeat)
+=======
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<AppendEntriesResult> HandleAppendEntriesAsync(HeartbeatPayload heartbeat, CancellationToken cancellationToken)
+>>>>>>> worktree-agent-a91bec1cc19aae85f
     {
         ArgumentNullException.ThrowIfNull(heartbeat);
         AppendEntriesResult result;
-        bool conflict = false;
-        lock (_gate)
+        bool conflict;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            result = HandleAppendEntriesLocked(heartbeat, out conflict);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+        if (conflict) ResyncRequired?.Invoke(this, EventArgs.Empty);
+        return result;
+    }
+
+    private AppendEntriesResult HandleAppendEntriesLocked(HeartbeatPayload heartbeat, out bool conflict)
+    {
+        AppendEntriesResult result;
+        conflict = false;
         {
             // A heartbeat of a node that is not a member is not this cluster's leader speaking (see HandleRequestVote):
             // it must not move the term, reset the election timer or set the commit index.
@@ -350,7 +411,6 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 result = last;
             }
         }
-        if (conflict) ResyncRequired?.Invoke(this, EventArgs.Empty);
         return result;
     }
 
@@ -358,15 +418,21 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// Followers call this for every message of the WAL stream: the leader tags its node id and current term on every
     /// chunk it streams.
     /// </summary>
-    public void HandleObservedLeader(string leaderId, long term)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    public async ValueTask HandleObservedLeaderAsync(string leaderId, long term, CancellationToken cancellationToken)
     {
-        lock (_gate)
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
             if (term < _state.CurrentTerm) return;
             // A leader can never be replaced within its own term; only a strictly higher term may depose us.
             if (term == _state.CurrentTerm && _role == RaftRole.Leader) return;
             if (term > _state.CurrentTerm) _state.UpdateTermAndVote(term, null);
             BecomeFollowerLocked(leaderId);
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -375,9 +441,12 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// the leader confirms that entry exists identically in its own log. A follower whose tail diverged (e.g. a deposed
     /// leader with uncommitted writes) is told to rebuild itself from a snapshot.
     /// </summary>
-    public LogConsistencyResult CheckFollowerLogConsistency(ulong followerLatestSeq, long followerTermAtLatest)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<LogConsistencyResult> CheckFollowerLogConsistencyAsync(ulong followerLatestSeq, long followerTermAtLatest,
+        CancellationToken cancellationToken)
     {
-        lock (_gate)
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
             if (_role != RaftRole.Leader || _resyncing) return new LogConsistencyResult(false, false, _state.CurrentTerm);
             if (followerLatestSeq == 0) return new LogConsistencyResult(true, true, _state.CurrentTerm);
@@ -387,6 +456,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             bool consistent = _state.Terms.GetTermForSeq(followerLatestSeq) == followerTermAtLatest;
             return new LogConsistencyResult(true, consistent, _state.CurrentTerm);
         }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     // ===== Resync lifecycle (host-driven) =====
@@ -395,9 +468,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// Puts the node into resync mode: the election timer is paused and vote / append handling answers conservatively
     /// without touching the database, so the host can dispose and rebuild it.
     /// </summary>
-    public void BeginResync()
+    public async ValueTask BeginResyncAsync(CancellationToken cancellationToken)
     {
-        lock (_gate)
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
             _resyncing = true;
             // A node whose log is about to be replaced cannot lead (or win a pending election): as a leader it would
@@ -406,17 +480,26 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             if (_role != RaftRole.Follower) BecomeFollowerLocked(null);
             _electionTimer.Pause();
         }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     /// <summary>Completes a resync with the freshly restored database instance.</summary>
-    public void CompleteResync(RocksDatabase db)
+    public async ValueTask CompleteResyncAsync(RocksDatabase db, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(db);
-        lock (_gate)
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
             _db = db;
             _resyncing = false;
             if (_role != RaftRole.Leader) _electionTimer.Reset();
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -430,10 +513,12 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// elections) may name entries the follower has since discarded in a resync, and counting it could commit an entry
     /// that fewer than a quorum hold.
     /// </summary>
-    public bool RecordFollowerProgress(string nodeId, ulong matchSeq, long leaderTerm)
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<bool> RecordFollowerProgressAsync(string nodeId, ulong matchSeq, long leaderTerm, CancellationToken cancellationToken)
     {
         if (!_peers.TryGetValue(nodeId, out PeerState? peer)) return false;
-        lock (_gate)
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
             if (_resyncing || _role != RaftRole.Leader || leaderTerm != _state.CurrentTerm) return false;
             // A follower of this leadership holds a prefix of this log, never more.
@@ -442,6 +527,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             TryAdvanceCommitLocked();
             MaybePromoteToClusterLocked();
             return true;
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
@@ -471,13 +560,24 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         while (true)
         {
             RocksDb.Managed.Util.AsyncBroadcastSignal.Waiter changed;
-            lock (_gate)
+            await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                bool leading = _role == RaftRole.Leader && _state.CurrentTerm == term && _disposed == 0;
+                bool leading = _role == RaftRole.Leader && _state.CurrentTerm == term && Volatile.Read(ref _disposed) == 0;
                 if (CommitSeq >= sequence) return leading || _state.Terms.GetTermForSeq(sequence) == term;
                 if (!leading) return false;
-                // Registered under _gate, where every signal is raised: no wake-up can be missed.
+                // Registered under _gate, where every signal but Dispose's is raised: none of those can be missed.
                 changed = _commitChanged.Register();
+            }
+            finally
+            {
+                _gate.Release();
+            }
+            // Dispose signals without the gate: re-check after registering (see Dispose).
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                _commitChanged.Unregister(changed);
+                continue;
             }
             await _commitChanged.WaitAsync(changed, cancellationToken).ConfigureAwait(false);
         }
@@ -558,7 +658,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         LeaderChanged?.Invoke(this, new LeaderChangedEventArgs(null, _state.CurrentTerm));
     }
 
-    private void BecomeLeaderLocked()
+    private async ValueTask BecomeLeaderLockedAsync()
     {
         ulong nextSeq = _db.GetLatestSequenceNumber() + 1;
         try
@@ -567,9 +667,12 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             // Replicate one entry from the new term right away so the commit index can advance past entries inherited
             // from previous terms (§5.4.2).
             // Synced like every log entry: the leader counts its own latest sequence towards the quorum.
+            // Awaited with the gate held, so the transition stays atomic (nothing observes the node between winning
+            // the election and writing its first entry), but a stalled write only queues the other handlers
+            // asynchronously instead of blocking their threads. Not cancellable, like the synchronous write was.
             byte[] noop = Encoding.UTF8.GetBytes(_state.CurrentTerm.ToString(CultureInfo.InvariantCulture));
-            if (_config.SyncLogWrites) _db.Put(WriteOptions.SyncWrites, LeaderNoOpKey, noop);
-            else _db.Put(LeaderNoOpKey, noop);
+            if (_config.SyncLogWrites) await _db.PutAsync(WriteOptions.SyncWrites, s_leaderNoOpKey, noop, CancellationToken.None).ConfigureAwait(false);
+            else await _db.PutAsync(s_leaderNoOpKey, noop, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception e) when (e is RocksDbException or ObjectDisposedException or IOException)
         {
@@ -623,12 +726,17 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 long term;
                 ulong commit;
                 ClusterMode leaderMode;
-                lock (_gate)
+                await _gate.WaitAsync(ct).ConfigureAwait(false);
+                try
                 {
                     if (_role != RaftRole.Leader) break;
                     commit = _commitSeq;
                     term = _state.CurrentTerm;
                     leaderMode = _state.Mode;
+                }
+                finally
+                {
+                    _gate.Release();
                 }
                 foreach (PeerState peer in _peers.Values)
                 {
@@ -657,7 +765,9 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             }
             if (resp.Term > _state.CurrentTerm)
             {
-                lock (_gate)
+                // Not cancellable, as the lock was not: a higher term must depose this node even once the loop ended.
+                await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
                 {
                     if (resp.Term > _state.CurrentTerm)
                     {
@@ -665,11 +775,16 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                         BecomeFollowerLocked(null);
                     }
                 }
+                finally
+                {
+                    _gate.Release();
+                }
                 return;
             }
             if (resp.Success)
             {
-                lock (_gate)
+                await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
                 {
                     if (_role != RaftRole.Leader || _state.CurrentTerm != beat.Term) return;
                     // Only the prefix ending at PrevLogSeq has been validated against our log; anything past it is
@@ -677,6 +792,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                     peer.OnAppendSucceeded(beat.PrevLogSeq);
                     TryAdvanceCommitLocked();
                     MaybePromoteToClusterLocked();
+                }
+                finally
+                {
+                    _gate.Release();
                 }
             }
             else if (resp.Reason == AppendEntriesRejectReason.Behind)
@@ -696,12 +815,30 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         }
     }
 
-    private void OnElectionTimeout()
+    // The timer callback must not block its thread on the gate (a new leader may hold it across a write): the campaign
+    // waits for the gate asynchronously, and still starts inside the callback, as before, whenever the gate is free.
+    private void OnElectionTimeout() => _ = OnElectionTimeoutAsync();
+
+    private async Task OnElectionTimeoutAsync()
+    {
+        try
+        {
+            await StartCampaignAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // As in ElectionTimer.SafeTimeout: a failed election attempt (or a disposal while waiting for the gate) must
+            // not surface as an unobserved task exception; the next timeout retries.
+        }
+    }
+
+    private async Task StartCampaignAsync()
     {
         long electionTerm;
         ulong lastLogSeq;
         long lastLogTerm;
-        lock (_gate)
+        await _gate.WaitAsync(_cts.Token).ConfigureAwait(false);
+        try
         {
             if (_role == RaftRole.Leader || _resyncing || _disposed != 0) return;
             if (_state.Mode == ClusterMode.Bootstrap)
@@ -718,26 +855,32 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             lastLogTerm = _state.Terms.GetTermForSeq(lastLogSeq);
             _electionTimer.Reset();
         }
+        finally
+        {
+            _gate.Release();
+        }
         _ = Task.Run(() => RunElectionAsync(electionTerm, lastLogSeq, lastLogTerm));
     }
 
     private async Task RunElectionAsync(long term, ulong lastLogSeq, long lastLogTerm)
     {
         List<ClusterMember> peers;
-        lock (_gate)
+        await _gate.WaitAsync(_cts.Token).ConfigureAwait(false);
+        try
         {
             if (_role != RaftRole.Candidate || _state.CurrentTerm != term) return;
             peers = new List<ClusterMember>(_peers.Count);
             foreach (PeerState p in _peers.Values) peers.Add(p.Member);
         }
+        finally
+        {
+            _gate.Release();
+        }
         int votes = 1; // self
         int needed = _config.Quorum;
         if (votes >= needed)
         {
-            lock (_gate)
-            {
-                if (_role == RaftRole.Candidate && _state.CurrentTerm == term && !_resyncing && _disposed == 0) BecomeLeaderLocked();
-            }
+            await TryBecomeLeaderAsync(term).ConfigureAwait(false);
             return;
         }
         var tasks = new List<Task<RequestVoteResult?>>(peers.Count);
@@ -750,7 +893,8 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             if (resp == null) continue;
             if (resp.Term > term)
             {
-                lock (_gate)
+                await _gate.WaitAsync(_cts.Token).ConfigureAwait(false);
+                try
                 {
                     if (resp.Term > _state.CurrentTerm)
                     {
@@ -758,19 +902,34 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                         BecomeFollowerLocked(null);
                     }
                 }
+                finally
+                {
+                    _gate.Release();
+                }
                 return;
             }
             if (resp.VoteGranted && ++votes >= needed)
             {
-                lock (_gate)
-                {
-                    // Still candidate for this term?
-                    if (_role == RaftRole.Candidate && _state.CurrentTerm == term && !_resyncing && _disposed == 0) BecomeLeaderLocked();
-                }
+                await TryBecomeLeaderAsync(term).ConfigureAwait(false);
                 return;
             }
         }
         // Election failed; the election timer fires again.
+    }
+
+    private async Task TryBecomeLeaderAsync(long term)
+    {
+        await _gate.WaitAsync(_cts.Token).ConfigureAwait(false);
+        try
+        {
+            // Still candidate for this term?
+            if (_role == RaftRole.Candidate && _state.CurrentTerm == term && !_resyncing && _disposed == 0)
+                await BecomeLeaderLockedAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     private async Task<RequestVoteResult?> RequestVoteSafeAsync(ClusterMember peer, long term, ulong lastLogSeq, long lastLogTerm)

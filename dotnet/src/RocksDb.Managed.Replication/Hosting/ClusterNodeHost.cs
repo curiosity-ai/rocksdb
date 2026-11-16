@@ -413,25 +413,26 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     // ---------------------------------------------------------------------------------------------------
     // Incoming RPCs
 
-    public RequestVoteResult HandleRequestVote(RequestVotePayload request)
+    public ValueTask<RequestVoteResult> HandleRequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken)
     {
         RaftClusterNode? node = Volatile.Read(ref _node);
-        if (node != null) return node.HandleRequestVote(request);
+        if (node != null) return node.HandleRequestVoteAsync(request, cancellationToken);
         lock (_votesWithoutNodeGate)
         {
             // Pulling the initial snapshot: there is no node yet, but this member still has a vote, or a cluster whose
             // majority is restoring at once can never elect the leader they wait for (RaftClusterNode.IsUpToDateWithoutLog).
             node = Volatile.Read(ref _node);
-            if (node != null) return node.HandleRequestVote(request);
+            if (node != null) return node.HandleRequestVoteAsync(request, cancellationToken);
             RaftPersistentState? state = _state;
-            if (state == null) return new RequestVoteResult(0, false);
-            return RaftClusterNode.HandleRequestVoteWithoutLog(state, IsPeer, request);
+            if (state == null) return new ValueTask<RequestVoteResult>(new RequestVoteResult(0, false));
+            return new ValueTask<RequestVoteResult>(RaftClusterNode.HandleRequestVoteWithoutLog(state, IsPeer, request));
         }
     }
 
     private bool IsPeer(string nodeId) => nodeId != _cfg.NodeId && Member(nodeId) != null;
 
-    public AppendEntriesResult HandleHeartbeat(HeartbeatPayload payload) => _node.HandleAppendEntries(payload);
+    public ValueTask<AppendEntriesResult> HandleHeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) =>
+        _node.HandleAppendEntriesAsync(payload, cancellationToken);
 
     public ClusterNodeStatus GetStatus()
     {
@@ -451,15 +452,16 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             _node.BootstrapInSyncCount, _resyncing, Resyncs);
     }
 
-    public ClusterAttachResult HandleCheckLogConsistency(ulong followerLatestSeq, long followerTermAtLatest)
+    public async ValueTask<ClusterAttachResult> HandleCheckLogConsistencyAsync(ulong followerLatestSeq, long followerTermAtLatest,
+        CancellationToken cancellationToken)
     {
-        LogConsistencyResult r = _node.CheckFollowerLogConsistency(followerLatestSeq, followerTermAtLatest);
+        LogConsistencyResult r = await _node.CheckFollowerLogConsistencyAsync(followerLatestSeq, followerTermAtLatest, cancellationToken).ConfigureAwait(false);
         return new ClusterAttachResult(r.IsLeader, r.Consistent, r.Term, r.IsLeader ? _node.SerializeTerms() : string.Empty);
     }
 
-    /// <summary>A follower's progress report; false when it was not for this node's current leadership (see <see cref="RaftClusterNode.RecordFollowerProgress"/>).</summary>
-    public bool HandleReportProgress(string followerId, ulong appliedThrough, long leaderTerm) =>
-        _node.RecordFollowerProgress(followerId, appliedThrough, leaderTerm);
+    /// <summary>A follower's progress report; false when it was not for this node's current leadership (see <see cref="RaftClusterNode.RecordFollowerProgressAsync"/>).</summary>
+    public ValueTask<bool> HandleReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken) =>
+        _node.RecordFollowerProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken);
 
     public string HandleGetTerms() => _node.SerializeTerms();
 
@@ -550,7 +552,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     }
 
     // ---------------------------------------------------------------------------------------------------
-    // Role / leader changes (raised under the node's lock: only schedule work here)
+    // Role / leader changes (raised under the node's gate, which is not reentrant: only schedule work here)
 
     private void OnRoleChanged(object? sender, RoleChangedEventArgs e)
     {
@@ -677,7 +679,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                         return;
                     }
                     stalled = false;
-                    _node.HandleObservedLeader(m.SourceId, m.SourceTerm);
+                    await _node.HandleObservedLeaderAsync(m.SourceId, m.SourceTerm, ct).ConfigureAwait(false);
                     // A deposed leader's chunk (we already are in a later term): Raft rejects stale AppendEntries.
                     if (m.SourceTerm < _node.CurrentTerm) break;
                     // The attach check compared our log with the leader's log of followTerm. A chunk of another term
@@ -810,7 +812,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         await _resyncGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            _node.BeginResync();
+            await _node.BeginResyncAsync(_cts.Token).ConfigureAwait(false);
             Task? follower;
             lock (_followerLock)
             {
@@ -845,7 +847,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                     }
                     await PullSnapshotAsync(leader, _cts.Token).ConfigureAwait(false);
                     _db = await OpenDatabaseAsync(_cts.Token).ConfigureAwait(false);
-                    _node.CompleteResync(_db);
+                    // Not cancellable: the database is open and has to reach the node (or be closed by DisposeAsync).
+                    await _node.CompleteResyncAsync(_db, CancellationToken.None).ConfigureAwait(false);
                     _resyncPolicy.OnRebuilt(_db.GetLatestSequenceNumber());
                     _dbGate.Reopen();
                     Interlocked.Increment(ref _resyncs);
