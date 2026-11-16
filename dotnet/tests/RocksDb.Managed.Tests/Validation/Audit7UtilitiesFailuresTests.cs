@@ -631,12 +631,11 @@ public sealed class Audit7UtilitiesFailuresTests
     }
 
     [TestMethod]
-    [Ignore("audit #7 open: a stale second Dispose of a rented WriteBatchWithIndex returns the next renter's batch to the pool (design: the pooled object is its own handle)")]
     public void DisposingARentedWbwiTwiceDoesNotClearTheNextRentersBatch()
     {
-        // No C++ counterpart (the pool is the port's): WriteBatchWithIndex.Dispose documents "disposing it again does
-        // nothing", but a second Dispose through a stale reference after the object was rented again clears the new
-        // renter's batch and puts it back in the pool while it is in use.
+        // No C++ counterpart (the pool is the port's): a second Dispose through a stale reference after the next Rent
+        // must not reach the new renter. Fixed in audit #7: the handed-out object is new per rent and only its inner
+        // state is pooled, taken out exactly once by Dispose.
         WriteBatchWithIndex first = WriteBatchWithIndex.Rent();
         first.Put(B("a"), B("1"));
         first.Dispose();
