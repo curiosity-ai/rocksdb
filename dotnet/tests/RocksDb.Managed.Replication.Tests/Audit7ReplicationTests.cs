@@ -216,6 +216,144 @@ public sealed class Audit7ReplicationTests
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // Raft cluster: a resync that cannot start
+
+    /// <summary>Forwards to an inner file system; while <see cref="FailLogEnd"/> is set, writing raft.logend fails.</summary>
+    private sealed class LogEndFailingFileSystem(IFileSystem inner) : IFileSystem
+    {
+        public volatile bool FailLogEnd;
+        public int Failures;
+
+        private void Check(string path)
+        {
+            if (FailLogEnd && path.Contains("raft.logend", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref Failures);
+                throw new RocksDbException(StatusCode.IOError, "IO error: injected failure writing " + path);
+            }
+        }
+
+        public IWritableFile CreateWritable(string path, bool truncate = true)
+        {
+            Check(path);
+            return inner.CreateWritable(path, truncate);
+        }
+
+        public IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options)
+        {
+            Check(path);
+            return inner.CreateWritable(path, truncate, options);
+        }
+
+        public IWritableFile ReopenWritable(string path, WritableFileOptions options) => inner.ReopenWritable(path, options);
+        public IWritableFile ReuseWritable(string path, string oldPath, WritableFileOptions options) => inner.ReuseWritable(path, oldPath, options);
+        public IRandomAccessFile OpenRandomAccess(string path) => inner.OpenRandomAccess(path);
+        public IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options) => inner.OpenRandomAccess(path, options);
+        public ISequentialFile OpenSequential(string path) => inner.OpenSequential(path);
+        public ISequentialFile OpenSequential(string path, SequentialFileOptions options) => inner.OpenSequential(path, options);
+        public bool FileExists(string path) => inner.FileExists(path);
+        public long GetFileSize(string path) => inner.GetFileSize(path);
+        public void DeleteFile(string path) => inner.DeleteFile(path);
+        public void RenameFile(string source, string target) => inner.RenameFile(source, target);
+        public void CreateDirectoryIfMissing(string path) => inner.CreateDirectoryIfMissing(path);
+        public IEnumerable<string> GetChildren(string directory) => inner.GetChildren(directory);
+        public IDisposable LockFile(string path) => inner.LockFile(path);
+        public void SyncDirectory(string path) => inner.SyncDirectory(path);
+        public bool DirectoryExists(string path) => inner.DirectoryExists(path);
+        public void DeleteDirectory(string path) => inner.DeleteDirectory(path);
+        public void LinkFile(string source, string target) => inner.LinkFile(source, target);
+        public DateTimeOffset GetFileModificationTime(string path) => inner.GetFileModificationTime(path);
+        public long GetFreeSpace(string path) => inner.GetFreeSpace(path);
+        public void WriteAt(string path, long offset, ReadOnlySpan<byte> data) => inner.WriteAt(path, offset, data);
+    }
+
+    /// <summary>Forwards to an inner client; while <see cref="DuplicateNext"/> is set, the next whole chunk of a WAL stream arrives twice.</summary>
+    private sealed class DuplicatingClusterClient(IClusterNodeClient inner) : IClusterNodeClient
+    {
+        public volatile bool DuplicateNext;
+
+        public string NodeId => inner.NodeId;
+        public Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) => inner.RequestVoteAsync(request, cancellationToken);
+        public Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) => inner.HeartbeatAsync(payload, cancellationToken);
+        public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => inner.GetStatusAsync(cancellationToken);
+        public Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
+            inner.CheckLogConsistencyAsync(followerId, latestSeq, termAtLatest, cancellationToken);
+
+        public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await foreach (WalStreamMessage m in inner.StreamUpdatesAsync(followerId, startSeq, cancellationToken))
+            {
+                yield return m;
+                if (!m.ResyncRequired && !m.IsFragment && DuplicateNext)
+                {
+                    DuplicateNext = false;
+                    yield return m;
+                }
+            }
+        }
+
+        public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken) =>
+            inner.ReportProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken);
+        public Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>
+            inner.GetFileHashesAsync(candidates, cancellationToken);
+        public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
+            inner.StreamSnapshotAsync(verifiedInventory, cancellationToken);
+        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => inner.GetTermsAsync(cancellationToken);
+    }
+
+    private static async Task WriteCommittedAsync(ClusterHarness c, int from, int to)
+    {
+        for (int i = from; i < to; i++)
+        {
+            while (true)
+            {
+                ClusterNodeHost leader = await c.WaitForLeaderAsync(null);
+                if (await leader.WriteCommittedAsync(U(K(i)), U(V(i, 0)), TimeSpan.FromSeconds(5), CancellationToken.None)) break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A follower whose stream showed a divergence (here: a chunk delivered twice) ends its stream and asks for a resync.
+    /// When the resync cannot start - the log end it must record before dropping its log cannot be written - the node
+    /// keeps its database, as it should, but nothing ever attached it to the leader again: no stream ran until the
+    /// leader changed, and the follower stayed behind for good under a stable leader. Reference: rocksdb-sharp's
+    /// Tests/ClusterTest/ClusterNodeHost.PerformResyncAsync always ends a resync with <c>EnsureFollowerStream</c> (its
+    /// BeginResync cannot fail; the durable log end is a managed addition), so the node rejoins.
+    /// </summary>
+    [TestMethod]
+    public async Task FollowerWhoseResyncCannotStartFollowsTheLeaderAgain()
+    {
+        var shared = new MemoryFileSystem();
+        LogEndFailingFileSystem? n3Fs = null;
+        DuplicatingClusterClient? n3ToN1 = null;
+        await using var c = new ClusterHarness(3, shared)
+        {
+            WrapFileSystem = (id, fs) => id == "n3" ? n3Fs = new LogEndFailingFileSystem(fs) : fs,
+            WrapClient = (id, peer, client) => id == "n3" && peer == "n1" ? n3ToN1 = new DuplicatingClusterClient(client) : client,
+        };
+        ClusterNodeHost n1 = await c.StartAsync("n1");
+        for (int i = 0; i < 50; i++) Assert.IsTrue(await n1.TryWriteAsLeaderAsync(U(K(i)), U(V(i, 0)), CancellationToken.None));
+        await c.StartAsync("n2");
+        ClusterNodeHost n3 = await c.StartAsync("n3");
+        await WaitUntilAsync(() => c.Statuses().TrueForAll(s => s.Mode == ClusterMode.Cluster), "every node in Cluster mode\n" + c.LogText);
+        await WriteCommittedAsync(c, 50, 60);
+        await c.AssertConvergedAsync(n1);
+
+        n3Fs!.FailLogEnd = true;
+        n3ToN1!.DuplicateNext = true;
+        await WriteCommittedAsync(c, 60, 80);
+        await WaitUntilAsync(() => c.LogText.Contains("n3: resync not started", StringComparison.Ordinal), "n3's failed resync\n" + c.LogText);
+        Assert.AreEqual(0, n3.Resyncs);
+
+        // The disk works again: n3 must rejoin (and rebuild, since its stream showed a divergence) without a leader change.
+        n3Fs.FailLogEnd = false;
+        await WriteCommittedAsync(c, 80, 100);
+        Assert.AreEqual("n1", (await c.WaitForLeaderAsync(null)).NodeId);
+        await c.AssertConvergedAsync(n1);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // Reference behavior (recorded, not changed)
 
     /// <summary>
