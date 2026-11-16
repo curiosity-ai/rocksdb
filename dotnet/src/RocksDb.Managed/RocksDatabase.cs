@@ -172,6 +172,9 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void DropColumnFamily(ColumnFamily columnFamily)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        // A handle of another DB would be dropped through this DB's MANIFEST and write thread (upstream: undefined
+        // behaviour, the handle is static_cast to ColumnFamilyHandleImpl).
+        CheckOwnColumnFamily(columnFamily);
         SyncValueTask.GetResult(_db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None));
         ReleaseHandle(columnFamily);
     }
@@ -200,6 +203,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public async ValueTask DropColumnFamilyAsync(ColumnFamily columnFamily, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         await _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: false, cancellationToken).ConfigureAwait(false);
         ReleaseHandle(columnFamily);
     }
@@ -208,12 +212,16 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     // Batches, snapshots, flush, properties
     // =====================================================================================================
 
-    /// <summary>A pooled, empty write batch; disposing it returns it to the pool.</summary>
+    /// <summary>
+    /// An empty write batch whose buffer comes from a pool (<see cref="WriteBatch.Rent"/>); disposing it returns the buffer.
+    /// After Dispose the batch throws <see cref="ObjectDisposedException"/>; a second Dispose does nothing.
+    /// </summary>
     public WriteBatch CreateWriteBatch() => WriteBatch.Rent();
 
     /// <summary>
-    /// A pooled, empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> (<see cref="WriteBatchWithIndex.Rent()"/>);
-    /// disposing it returns it to the pool.
+    /// An empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> whose index state and buffer come from pools
+    /// (<see cref="WriteBatchWithIndex.Rent()"/>); disposing it returns them, and the batch throws
+    /// <see cref="ObjectDisposedException"/> afterwards.
     /// </summary>
     public WriteBatchWithIndex CreateWriteBatchWithIndex() => WriteBatchWithIndex.Rent();
 
@@ -375,6 +383,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public Iterator NewIterator(ColumnFamily columnFamily, ReadOptions? options)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         return columnFamily.NewIterator(options);
     }
     /// <summary>Creates an iterator over the default column family; table files are opened asynchronously.</summary>

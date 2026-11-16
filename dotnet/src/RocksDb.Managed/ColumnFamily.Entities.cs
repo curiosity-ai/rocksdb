@@ -17,7 +17,7 @@ public sealed partial class ColumnFamily
     public void PutEntity(WriteOptions? options, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
     {
         if (_cfd.TimestampSize != 0) ThrowCfHasTimestamp(); // DBImpl::PutEntity: FailIfCfHasTs
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             b.PutEntity(_cfd.Id, key, columns);
@@ -25,7 +25,7 @@ public sealed partial class ColumnFamily
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
@@ -38,7 +38,7 @@ public sealed partial class ColumnFamily
         CancellationToken cancellationToken = default)
     {
         if (_cfd.TimestampSize != 0) ThrowCfHasTimestamp(); // DBImpl::PutEntity: FailIfCfHasTs
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             b.PutEntity(_cfd.Id, key.Span, columns.Span);
@@ -46,7 +46,7 @@ public sealed partial class ColumnFamily
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
@@ -125,6 +125,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         batch.EntityRun = true;
+        batch.ThrowIfDisposed();
         if (batch.Count == 0) return;
         SyncValueTask.GetResult(_db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None));
     }
@@ -135,6 +136,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         batch.EntityRun = true;
+        batch.ThrowIfDisposed();
         if (batch.Count == 0) return ValueTask.CompletedTask;
         return _db.MultiGetAsync(_cfd, options, batch, synchronous: false, cancellationToken);
     }

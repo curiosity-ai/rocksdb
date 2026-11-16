@@ -90,6 +90,12 @@ internal sealed class IteratorCore
     private static void RefreshNotAllowed() =>
         throw new RocksDbException(StatusCode.NotSupported, "Not implemented: Creating renew iterator is not allowed.");
 
+    /// <summary>
+    /// True when this is a graph core whose view was released and not rebuilt: a Refresh / SetBounds rebuild failed (the
+    /// database was closed, a table file could not be opened, the call was canceled). The stack is parked then.
+    /// </summary>
+    internal bool IsUnbuilt => _graph is not null && !_graph.IsBuilt;
+
     private IteratorGraph RefreshableGraph()
     {
         IteratorGraph? g = _graph;
@@ -105,6 +111,8 @@ internal sealed class IteratorCore
     public void Refresh(Snapshot? snapshot)
     {
         IteratorGraph g = RefreshableGraph();
+        // Validated before the view is released, so a bad snapshot leaves the iterator as it was.
+        g.ValidateSnapshot(snapshot);
         if (!g.TryRefreshInPlace(snapshot))
         {
             g.Release();
@@ -117,6 +125,7 @@ internal sealed class IteratorCore
     public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken)
     {
         IteratorGraph g = RefreshableGraph();
+        g.ValidateSnapshot(snapshot);
         cancellationToken.ThrowIfCancellationRequested();
         if (g.TryRefreshInPlace(snapshot))
         {

@@ -267,7 +267,15 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
         if ((uint)index >= (uint)_count) ThrowIndex();
     }
 
-    private static void ThrowIndex() => throw new ArgumentOutOfRangeException("index");
+    // A disposed batch has no keys: report the disposal rather than an index out of range.
+    private void ThrowIndex()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        throw new ArgumentOutOfRangeException("index");
+    }
+
+    /// <summary>Throws <see cref="ObjectDisposedException"/> once the batch was disposed (checked before a run).</summary>
+    internal void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 
     private void ResetResults()
     {

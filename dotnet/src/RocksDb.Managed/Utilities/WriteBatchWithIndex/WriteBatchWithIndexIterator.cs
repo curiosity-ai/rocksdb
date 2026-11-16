@@ -13,7 +13,9 @@ namespace RocksDb.Managed;
 public sealed class WriteBatchWithIndexIterator
 {
     private readonly WriteBatchWithIndex _wbwi;
-    private readonly WriteBatchEntryIndex _index;
+    // Read through the batch on each use: once the batch is disposed (its index state may serve another batch) this
+    // throws ObjectDisposedException.
+    private WriteBatchEntryIndex _index => _wbwi.Index;
     private uint _cf;
     private Comparator _cmp;
     private ReadOnlyMemory<byte>? _lower;
@@ -24,7 +26,6 @@ public sealed class WriteBatchWithIndexIterator
     internal WriteBatchWithIndexIterator(WriteBatchWithIndex wbwi, uint cf, Comparator cmp, ReadOnlyMemory<byte>? lower, ReadOnlyMemory<byte>? upper)
     {
         _wbwi = wbwi;
-        _index = wbwi.Index;
         _cf = cf;
         _cmp = cmp;
         _lower = lower;

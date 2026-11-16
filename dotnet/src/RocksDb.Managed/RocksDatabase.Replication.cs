@@ -289,6 +289,7 @@ public sealed partial class RocksDatabase
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         return _db.IngestExternalFilesAsync(columnFamily.Data, files, options, synchronous: false, cancellationToken);
     }
 
@@ -300,6 +301,7 @@ public sealed partial class RocksDatabase
     public void IngestExternalFiles(ColumnFamily columnFamily, IReadOnlyList<string> files, IngestExternalFileOptions options)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         ValueTask t = _db.IngestExternalFilesAsync(columnFamily.Data, files, options, synchronous: true, CancellationToken.None);
         if (!t.IsCompleted) t.AsTask().GetAwaiter().GetResult();
         else t.GetAwaiter().GetResult();
@@ -312,6 +314,7 @@ public sealed partial class RocksDatabase
     public ValueTask IngestExternalFilesAsync(ColumnFamily columnFamily, IngestExternalFileArg arg, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         return _db.IngestExternalFilesAsync(columnFamily.Data, arg, synchronous: false, cancellationToken);
     }
 
@@ -319,6 +322,7 @@ public sealed partial class RocksDatabase
     public void IngestExternalFiles(ColumnFamily columnFamily, IngestExternalFileArg arg)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         ValueTask t = _db.IngestExternalFilesAsync(columnFamily.Data, arg, synchronous: true, CancellationToken.None);
         if (!t.IsCompleted) t.AsTask().GetAwaiter().GetResult();
         else t.GetAwaiter().GetResult();

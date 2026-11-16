@@ -171,8 +171,11 @@ public sealed class WritePathAllocationTests
         long rented = Rented(3000), baseline = Reused(3000);
         reused.Dispose();
 #if !DEBUG
-        // new WriteBatchWithIndex() per batch: ~1.1 KB each (3.3 MB here). The memtable arena grows in blocks.
-        Assert.IsTrue(rented <= Slack && baseline <= Slack, "rented " + rented + " B, reused " + baseline + " B");
+        // new WriteBatchWithIndex() per batch: ~1.1 KB each (3.3 MB here). The memtable arena grows in blocks. A rented
+        // batch allocates its WriteBatchWithIndex and WriteBatch objects (the index state and the buffer are pooled, so a
+        // reference kept after Dispose cannot reach the next renter): at most PerRent bytes each.
+        const long PerRent = 256;
+        Assert.IsTrue(rented <= Slack + 3000 * PerRent && baseline <= Slack, "rented " + rented + " B, reused " + baseline + " B");
 #else
         _ = rented;
         _ = baseline;
@@ -206,8 +209,10 @@ public sealed class WritePathAllocationTests
         // The next renter gets the batch empty, without the column family comparator of the previous user, in the
         // mode it asks for.
         using WriteBatchWithIndex again = WriteBatchWithIndex.Rent(overwriteKey: true);
-        Assert.AreSame(b, again, "single-threaded rent after return reuses the batch");
-        Assert.AreSame(inner, again.WriteBatch);
+        // Only the index state and the buffer are pooled: the objects are new, and the old ones stay disposed.
+        Assert.AreNotSame(b, again);
+        Assert.AreNotSame(inner, again.WriteBatch);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => inner.Put(B("y"), B("4")));
         Assert.IsTrue(again.OverwriteKey);
         Assert.AreEqual(0, again.Count);
         Assert.IsFalse(again.RollbackToSavePoint(), "no save point survives the return");

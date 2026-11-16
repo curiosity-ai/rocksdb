@@ -4,65 +4,65 @@ namespace RocksDb.Managed;
 
 /// <summary>
 /// A value returned by <see cref="ColumnFamily.GetPooled(ReadOnlySpan{byte})"/>: the bytes live in a buffer rented
-/// from <see cref="RocksArrayPool{T}.Shared"/> and the object itself is pooled. Dispose exactly once; neither the object
-/// nor <see cref="Memory"/> may be used afterwards.
+/// from <see cref="RocksArrayPool{T}.Shared"/>. <see cref="Dispose"/> returns the buffer exactly once (later calls do
+/// nothing); afterwards every member throws <see cref="ObjectDisposedException"/>, and memory obtained from
+/// <see cref="Memory"/> / <see cref="Span"/> before must no longer be used. The object itself is not pooled, so a
+/// reference kept after Dispose never reaches another value's buffer.
 /// </summary>
 public sealed class PooledValue : IDisposable
 {
-    private static readonly PooledValue?[] s_pool = new PooledValue?[Math.Min(256, Environment.ProcessorCount * 8)];
+    private byte[]? _buffer;
+    private readonly int _length;
 
-    private byte[] _buffer = [];
-    private int _length;
-    private bool _rented;
+    private PooledValue(byte[] buffer, int length)
+    {
+        _buffer = buffer;
+        _length = length;
+    }
 
-    private PooledValue() { }
+    private byte[] Buffer
+    {
+        get
+        {
+            byte[]? b = Volatile.Read(ref _buffer);
+            if (b is null) ThrowDisposed();
+            return b;
+        }
+    }
 
     /// <summary>The value bytes.</summary>
-    public ReadOnlyMemory<byte> Memory => new(_buffer, 0, _length);
+    public ReadOnlyMemory<byte> Memory => new(Buffer, 0, _length);
     /// <summary>The value bytes.</summary>
-    public ReadOnlySpan<byte> Span => new(_buffer, 0, _length);
+    public ReadOnlySpan<byte> Span => new(Buffer, 0, _length);
     /// <summary>Length of the value in bytes.</summary>
-    public int Length => _length;
+    public int Length
+    {
+        get
+        {
+            _ = Buffer;
+            return _length;
+        }
+    }
 
     /// <summary>Copies the value into a new array.</summary>
     public byte[] ToArray() => Span.ToArray();
 
     internal static PooledValue Create(ReadOnlySpan<byte> value)
     {
-        PooledValue? v = null;
-        PooledValue?[] pool = s_pool;
-        for (int i = 0; i < pool.Length; i++)
-        {
-            PooledValue? c = pool[i];
-            if (c is not null && Interlocked.CompareExchange(ref pool[i], null, c) == c)
-            {
-                v = c;
-                break;
-            }
-        }
-        v ??= new PooledValue();
-        v._buffer = RocksArrayPool<byte>.Shared.Rent(Math.Max(value.Length, 1));
-        v._length = value.Length;
-        v._rented = true;
-        value.CopyTo(v._buffer);
-        return v;
+        byte[] buffer = RocksArrayPool<byte>.Shared.Rent(Math.Max(value.Length, 1));
+        value.CopyTo(buffer);
+        return new PooledValue(buffer, value.Length);
     }
 
-    /// <summary>Returns the buffer and this object to their pools.</summary>
+    /// <summary>Returns the buffer to its pool (once; thread-safe, later calls do nothing).</summary>
     public void Dispose()
     {
-        if (!_rented) return;
-        _rented = false;
-        byte[] b = _buffer;
-        _buffer = [];
-        _length = 0;
-        RocksArrayPool<byte>.Shared.Return(b);
-        PooledValue?[] pool = s_pool;
-        for (int i = 0; i < pool.Length; i++)
-        {
-            if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], this, null) is null) return;
-        }
+        byte[]? b = Interlocked.Exchange(ref _buffer, null);
+        if (b is not null) RocksArrayPool<byte>.Shared.Return(b);
     }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(PooledValue));
 }
 
 /// <summary>Reads a value in place (zero-copy): <paramref name="value"/> is only valid during the call.</summary>

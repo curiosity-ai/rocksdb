@@ -101,6 +101,8 @@ internal sealed partial class DbImpl
         UserWriteCallback? userCallback, bool synchronous, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
+        // A disposed batch (possibly back in the pool, emptied) is not silently written as an empty one.
+        batch.ThrowIfDisposed();
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
         if (_queryTracer is not null) MaybeTraceWrite(options, batch, txn);

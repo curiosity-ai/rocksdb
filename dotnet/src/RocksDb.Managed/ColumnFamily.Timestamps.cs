@@ -42,7 +42,7 @@ public sealed partial class ColumnFamily
     private void WriteOneWithTimestamp(WriteOptions? options, Op op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> timestamp, ReadOnlySpan<byte> value)
     {
         FailIfTsMismatchCf(_cfd, timestamp.Length);
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             EncodeWithTimestamp(b, op, key, timestamp, value);
@@ -50,7 +50,7 @@ public sealed partial class ColumnFamily
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
@@ -59,7 +59,7 @@ public sealed partial class ColumnFamily
         ReadOnlyMemory<byte> value, CancellationToken ct)
     {
         FailIfTsMismatchCf(_cfd, timestamp.Length);
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             EncodeWithTimestamp(b, op, key.Span, timestamp.Span, value.Span);
@@ -67,7 +67,7 @@ public sealed partial class ColumnFamily
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
