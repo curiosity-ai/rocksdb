@@ -220,6 +220,20 @@ public sealed class Audit7UtilitiesFailuresTests
             Assert.ThrowsExactly<TaskCanceledException>(() => w.PutAsync(B("k"), B("w"), cts.Token).AsTask().GetAwaiter().GetResult());
             Assert.AreEqual(0L, w.NumKeys);
         }
+        // PessimisticTransaction::LockBatch: a batch write that cannot lock one of its keys unlocks the keys it already
+        // locked ("if (!s.ok()) txn_db_impl_->UnLock(this, *keys_to_unlock)") and writes nothing.
+        using (var batch = new WriteBatch())
+        {
+            batch.Put(B("a"), B("b1")).Put(B("k"), B("b1")).Put(B("z"), B("b1"));
+            Fails(StatusCode.TimedOut, () => db.Write(null, batch));
+        }
+        Assert.IsNull(db.Database.Get(B("a")));
+        using (Transaction w = db.BeginTransaction(s_wo, new TransactionOptions { LockTimeout = TimeSpan.Zero }))
+        {
+            w.Put(B("a"), B("w"));
+            w.Put(B("z"), B("w"));
+            w.Rollback();
+        }
         holder.Commit();
         using (Transaction w = db.BeginTransaction(s_wo, new TransactionOptions { LockTimeout = TimeSpan.Zero }))
         {
