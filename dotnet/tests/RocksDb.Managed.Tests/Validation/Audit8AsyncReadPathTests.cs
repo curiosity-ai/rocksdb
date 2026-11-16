@@ -43,7 +43,10 @@ public sealed class Audit8AsyncReadPathTests
         /// <summary>Async reads that completed asynchronously.</summary>
         public long AsyncReads => Interlocked.Read(ref _asyncReads);
 
-        private async ValueTask<int> ReadSlowAsync(IRandomAccessFile file, long offset, Memory<byte> destination)
+        /// <summary>When set, an async read whose token was cancelled while it waited fails with OperationCanceledException.</summary>
+        public bool HonorCancellation { get; set; }
+
+        private async ValueTask<int> ReadSlowAsync(IRandomAccessFile file, long offset, Memory<byte> destination, CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref _asyncReads);
             TaskCompletionSource? gate = Gate;
@@ -60,6 +63,7 @@ public sealed class Audit8AsyncReadPathTests
             {
                 await Task.Yield();
             }
+            if (HonorCancellation) cancellationToken.ThrowIfCancellationRequested();
             return file.Read(offset, destination.Span);
         }
 
@@ -69,7 +73,7 @@ public sealed class Audit8AsyncReadPathTests
             public int Read(long offset, Span<byte> destination) => file.Read(offset, destination);
 
             public ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default) =>
-                fs.Asynchronous ? fs.ReadSlowAsync(file, offset, destination) : file.ReadAsync(offset, destination, cancellationToken);
+                fs.Asynchronous ? fs.ReadSlowAsync(file, offset, destination, cancellationToken) : file.ReadAsync(offset, destination, cancellationToken);
 
             public void Dispose() => file.Dispose();
         }
@@ -722,5 +726,280 @@ public sealed class Audit8AsyncReadPathTests
         it2.Dispose();
         t.Cache.EraseUnreferencedEntries();
         Assert.AreEqual(0, t.Cache.PinnedUsage, "nothing stays pinned once every iterator is disposed");
+    }
+
+    // ------------------------------------------------------------------ ScanAsync lifecycle
+
+    private static List<string> SyncRange(ColumnFamily cf, ReadOptions? o, byte[] start, byte[] end)
+    {
+        var expected = new List<string>();
+        using Iterator it = cf.NewIterator(o);
+        foreach (KeyValueRef kv in it.Range(start, end)) expected.Add(Hex(kv.Key) + "=" + Hex(kv.Value));
+        return expected;
+    }
+
+    /// <summary>
+    /// Pins: ScanAsync on a tailing iterator (ReadOptions.Tailing) sees writes made after the iterator was created, also
+    /// once a flush installed a new super version, like a Seek / Next of the sync range enumerator on it (the scan used to
+    /// move the DB iterator directly, skipping the tailing renewal, and returned the stale state).
+    /// </summary>
+    [TestMethod]
+    public void TailingScanAsyncSeesWritesAfterFlush()
+    {
+        var fs = new AsyncReadFileSystem(NewFs());
+        using TestDb t = BuildPlainDb(fs);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        var tailing = new ReadOptions { Tailing = true, TotalOrderSeek = true };
+        using Iterator sync = cf.NewIterator(tailing);
+        using Iterator async = cf.NewIterator(tailing);
+        sync.SeekToFirst();
+        Run(async.SeekToFirstAsync());
+        cf.Put(K(500), B("new"));
+        t.Db.Flush();
+        // Written to the memtable the flush installed: not in the super version the iterators were built on.
+        cf.Put(K(10), B("changed"));
+        cf.Put(K(600), B("newer"));
+        var expected = new List<string>();
+        foreach (KeyValueRef kv in sync.Range(K(0), K(1000))) expected.Add(Hex(kv.Key) + "=" + Hex(kv.Value));
+        var actual = new List<string>();
+        Run(Collect(async.ScanAsync(K(0), K(1000)), actual));
+        Assert.AreEqual(402, expected.Count);
+        Assert.AreEqual(Hex(K(10)) + "=" + Hex(B("changed")), expected[10]);
+        CollectionAssert.AreEqual(expected, actual);
+    }
+
+    /// <summary>
+    /// Pins the ScanAsync enumerator contract: breaking out early leaves the iterator usable for the next scan, DisposeAsync
+    /// twice is a no-op, MoveNextAsync after DisposeAsync returns false, a second GetAsyncEnumerator throws
+    /// InvalidOperationException, a token from WithCancellation cancels at the next MoveNextAsync with
+    /// OperationCanceledException (also when cancelled mid-scan), and a scan after a cancelled one returns everything.
+    /// </summary>
+    [TestMethod]
+    public void ScanAsyncEnumeratorLifecycle()
+    {
+        var fs = new AsyncReadFileSystem(NewFs());
+        using TestDb t = BuildPlainDb(fs);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        List<string> expected = SyncRange(cf, null, K(100), K(200));
+        using Iterator it = cf.NewIterator(null);
+        Run(LifecycleAsync(it, expected, t));
+    }
+
+    private static async ValueTask LifecycleAsync(Iterator it, List<string> expected, TestDb t)
+    {
+        // Break out early.
+        int n = 0;
+        await foreach (KeyValue kv in it.ScanAsync(K(100), K(200)).ConfigureAwait(false))
+        {
+            if (++n == 5) break;
+        }
+        // GetAsyncEnumerator twice, DisposeAsync twice, MoveNextAsync after dispose.
+        IAsyncEnumerable<KeyValue> scan = it.ScanAsync(K(100), K(200));
+        IAsyncEnumerator<KeyValue> e = scan.GetAsyncEnumerator();
+        Assert.ThrowsExactly<InvalidOperationException>(() => scan.GetAsyncEnumerator());
+        Assert.IsTrue(await e.MoveNextAsync().ConfigureAwait(false));
+        Assert.AreEqual(expected[0], Hex(e.Current.KeySpan) + "=" + Hex(e.Current.ValueSpan));
+        await e.DisposeAsync().ConfigureAwait(false);
+        await e.DisposeAsync().ConfigureAwait(false);
+        Assert.IsFalse(await e.MoveNextAsync().ConfigureAwait(false));
+        // Cancelled before the first MoveNextAsync.
+        using (var cts = new CancellationTokenSource())
+        {
+            cts.Cancel();
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
+            {
+                await foreach (KeyValue kv in it.ScanAsync(K(100), K(200)).WithCancellation(cts.Token).ConfigureAwait(false)) { }
+            }).ConfigureAwait(false);
+        }
+        // Cancelled mid-scan, with reads going to the file.
+        t.Cache.EraseUnreferencedEntries();
+        using (var cts = new CancellationTokenSource())
+        {
+            int seen = 0;
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
+            {
+                await foreach (KeyValue kv in it.ScanAsync(K(100), K(200)).WithCancellation(cts.Token).ConfigureAwait(false))
+                {
+                    if (++seen == 10) cts.Cancel();
+                }
+            }).ConfigureAwait(false);
+            Assert.AreEqual(10, seen);
+        }
+        var all = new List<string>();
+        await Collect(it.ScanAsync(K(100), K(200)), all).ConfigureAwait(false);
+        CollectionAssert.AreEqual(expected, all);
+    }
+
+    // ------------------------------------------------------------------ cancellation and errors
+
+    /// <summary>
+    /// Pins: a point read, MultiGet (batch and caller-buffer forms), MultiGetEntity and an iterator move cancelled while
+    /// their file read waits fail with OperationCanceledException (not wrapped), leave no block pinned in the cache and no
+    /// pooled object in use (the same reads succeed right after and return what the sync API returns).
+    /// </summary>
+    [TestMethod]
+    public void CancellationWhileAReadWaitsSurfacesOperationCanceled()
+    {
+        var fs = new AsyncReadFileSystem(NewFs()) { HonorCancellation = true };
+        using TestDb t = BuildPlainDb(fs);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        byte[][] keys = [K(3), K(150), K(399), K(1000)];
+        var ops = new (string Name, Func<CancellationToken, Task> Op)[]
+        {
+            ("GetAsync", ct => cf.GetAsync(null, K(150), ct).AsTask()),
+            ("GetPooledAsync", async ct => { using PooledValue? v = await cf.GetPooledAsync(null, K(150), ct).ConfigureAwait(false); }),
+            ("TryGetAsync", ct => cf.TryGetAsync(null, K(150), new ArrayBufferWriter<byte>(), ct).AsTask()),
+            ("GetEntityAsync", ct => cf.TryGetEntityAsync(null, K(150), new WideColumns(), ct).AsTask()),
+            ("MultiGetAsync", async ct =>
+            {
+                using var b = new MultiGetBatch();
+                foreach (byte[] k in keys) b.Add(k);
+                await cf.MultiGetAsync(null, b, ct).ConfigureAwait(false);
+            }),
+            ("MultiGetEntityAsync", async ct =>
+            {
+                using var b = new MultiGetBatch();
+                foreach (byte[] k in keys) b.Add(k);
+                await cf.MultiGetEntityAsync(null, b, ct).ConfigureAwait(false);
+            }),
+            ("MultiGetAsync(buffers)", ct => cf.MultiGetAsync(null, new ReadOnlyMemory<byte>[] { K(3), K(150), K(399) }, new ArrayBufferWriter<byte>(),
+                new Range[3], new MultiGetStatus[3], ct).AsTask()),
+            ("SeekAsync", async ct =>
+            {
+                using Iterator it = cf.NewIterator(null);
+                await it.SeekAsync(K(150), ct).ConfigureAwait(false);
+            }),
+        };
+        foreach ((string name, Func<CancellationToken, Task> op) in ops)
+        {
+            t.Cache.EraseUnreferencedEntries();
+            using var cts = new CancellationTokenSource();
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            fs.GateReached = reached;
+            fs.Gate = gate;
+            Task task = op(cts.Token);
+            WaitReached(reached);
+            fs.Gate = null;
+            cts.Cancel();
+            gate.SetResult();
+            Assert.IsTrue(((IAsyncResult)task).AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(20)), name + " completed");
+            Assert.IsTrue(task.IsCanceled || task.Exception?.InnerException is OperationCanceledException,
+                name + ": " + task.Status + " " + task.Exception?.InnerException);
+            t.Cache.EraseUnreferencedEntries();
+            Assert.AreEqual(0, t.Cache.PinnedUsage, name + ": nothing pinned after the cancelled read");
+            Task again = op(CancellationToken.None);
+            Assert.IsTrue(((IAsyncResult)again).AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(20)), name + " ran again");
+            again.GetAwaiter().GetResult();
+        }
+        Assert.AreEqual(Hex(cf.Get(K(150))!), Hex(Run(cf.GetAsync(K(150)))!));
+    }
+
+    /// <summary>
+    /// Pins: a corrupted data block fails Get / MultiGet / iterator moves with RocksDbException(Corruption) through the
+    /// async API as through the sync API (same type and status code, never an AggregateException), with the async reads
+    /// completing on other threads.
+    /// </summary>
+    [TestMethod]
+    public void CorruptionSurfacesWithTheSameStatusOnAsyncPaths()
+    {
+        var fs = new AsyncReadFileSystem(NewFs());
+        using TestDb t = BuildPlainDb(fs);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        string sst = "";
+        foreach (string f in fs.GetChildren(DbPath))
+        {
+            if (f.EndsWith(".sst", StringComparison.Ordinal)) sst = DbPath + "/" + Path.GetFileName(f);
+        }
+        Assert.AreNotEqual("", sst);
+        // Flip bytes inside the first data block (blocks start at offset 0).
+        fs.WriteAt(sst, 40, B("XXXXXXXX"));
+        t.Cache.EraseUnreferencedEntries();
+        byte[] key = K(0);
+        string s = GetSync(cf, null, key);
+        Assert.AreEqual("RocksDbException:" + StatusCode.Corruption, s);
+        t.Cache.EraseUnreferencedEntries();
+        Assert.AreEqual(s, GetAsyncOutcome(cf, null, key));
+        Assert.AreEqual(s, GetPooledAsyncOutcome(cf, null, key));
+        Assert.AreEqual(s, EntityAsync(cf, null, key));
+        using var bs = new MultiGetBatch();
+        using var ba = new MultiGetBatch();
+        bs.Add(key).Add(K(399));
+        ba.Add(key).Add(K(399));
+        Assert.AreEqual(MultiGetOutcome(cf, null, bs, false, async: false), MultiGetOutcome(cf, null, ba, false, async: true));
+        using Iterator si = cf.NewIterator(null);
+        using Iterator ai = cf.NewIterator(null);
+        string se = MoveOutcome(si, Move.First, key, async: false);
+        Assert.AreEqual("RocksDbException:" + StatusCode.Corruption, se);
+        Assert.AreEqual(se, MoveOutcome(ai, Move.First, key, async: true));
+        Assert.IsTrue(fs.AsyncReads > 0);
+    }
+
+    // ------------------------------------------------------------------ concurrency
+
+    /// <summary>
+    /// Pins: many concurrent async readers (GetAsync, GetPooledAsync, MultiGetAsync, ScanAsync on their own iterators)
+    /// whose file reads complete on other threads and out of order get the sync results; pooled contexts, batches and
+    /// values are not shared between them.
+    /// </summary>
+    [TestMethod]
+    public void ConcurrentAsyncReadersGetTheSyncResults()
+    {
+        int seed = Environment.TickCount;
+        var fs = new AsyncReadFileSystem(NewFs());
+        using TestDb t = BuildDb(seed, fs, partitioned: seed % 2 == 0);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        var expected = new string[KeySpace];
+        for (int i = 0; i < KeySpace; i++) expected[i] = GetSync(cf, null, K(i));
+        List<string> scanExpected = SyncRange(cf, null, K(100), K(400));
+        var tasks = new List<Task>();
+        for (int w = 0; w < 16; w++)
+        {
+            int worker = w;
+            tasks.Add(Task.Run(async () =>
+            {
+                var rnd = new Random(seed + worker);
+                using var batch = new MultiGetBatch();
+                for (int round = 0; round < 60; round++)
+                {
+                    if (rnd.Next(20) == 0) t.Cache.EraseUnreferencedEntries();
+                    int k = rnd.Next(KeySpace);
+                    switch (worker % 4)
+                    {
+                        case 0:
+                            byte[]? v = await cf.GetAsync(K(k)).ConfigureAwait(false);
+                            Assert.AreEqual(expected[k], v is null ? "null" : Hex(v), "seed=" + seed + " GetAsync " + k);
+                            break;
+                        case 1:
+                            using (PooledValue? pv = await cf.GetPooledAsync(K(k)).ConfigureAwait(false))
+                            {
+                                Assert.AreEqual(expected[k], pv is null ? "null" : Hex(pv.Span), "seed=" + seed + " GetPooledAsync " + k);
+                            }
+                            break;
+                        case 2:
+                            batch.Clear();
+                            for (int j = 0; j < 8; j++) batch.Add(K((k + j * 37) % KeySpace));
+                            await cf.MultiGetAsync(batch).ConfigureAwait(false);
+                            for (int j = 0; j < 8; j++)
+                            {
+                                int kk = (k + j * 37) % KeySpace;
+                                string got = batch.GetStatus(j) == MultiGetStatus.Found ? Hex(batch.GetValue(j)) : "null";
+                                Assert.AreEqual(expected[kk], got, "seed=" + seed + " MultiGetAsync " + kk);
+                            }
+                            break;
+                        default:
+                            if (round % 10 != 0) break;
+                            var got2 = new List<string>();
+                            using (Iterator it = await cf.NewIteratorAsync(null).ConfigureAwait(false))
+                            {
+                                await Collect(it.ScanAsync(K(100), K(400)), got2).ConfigureAwait(false);
+                            }
+                            CollectionAssert.AreEqual(scanExpected, got2, "seed=" + seed + " ScanAsync");
+                            break;
+                    }
+                }
+            }));
+        }
+        Assert.IsTrue(Task.WaitAll(tasks.ToArray(), TimeSpan.FromSeconds(60)), "readers finished");
     }
 }
