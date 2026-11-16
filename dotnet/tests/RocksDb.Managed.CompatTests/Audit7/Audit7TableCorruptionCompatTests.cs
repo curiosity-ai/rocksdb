@@ -303,9 +303,20 @@ public sealed unsafe class Audit7TableCorruptionCompatTests
             varint.AsSpan(0, len).CopyTo(bytes.AsSpan((int)first.Offset));
             File.WriteAllBytes(sst, bytes);
 
+            // Upstream behavior: LZ4_DecompressBlock passes static_cast<int>(uncompressed_size) as the output capacity,
+            // so a claimed 0xFFFFFFFF becomes -1, LZ4_decompress_safe_continue fails with -1, and "uncompressed_size !=
+            // expected_uncompressed_size" is false: native accepts 4 GiB of uninitialized memory as the block. Parsing
+            // that in-process is undefined behavior (it crashed the test host with SIGSEGV when run alongside other
+            // tests), so native is not driven for that case; the managed port keeps Corruption.
+            bool nativeUnsafe = t == CompressionType.LZ4 && claimed == 0xFFFFFFFF;
             var nativeResults = new List<string>();
-            using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(NativeOptions(NativeCompression(t), 5, (char)1, 0, bloom: false), dir.Path))
+            if (nativeUnsafe)
             {
+                nativeResults.Add("not run (upstream reads uninitialized memory)");
+            }
+            else
+            {
+                using RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(NativeOptions(NativeCompression(t), 5, (char)1, 0, bloom: false), dir.Path);
                 var ro = new RocksDbSharp.ReadOptions().SetVerifyChecksums(false).SetFillCache(false);
                 nativeResults.Add(NativeGet(db, ro, K(0)));
             }
@@ -318,11 +329,7 @@ public sealed unsafe class Audit7TableCorruptionCompatTests
             string pair = what + ": " + string.Join(",", nativeResults) + " vs " + string.Join(",", managedResults);
             Console.WriteLine(pair);
             Assert.AreEqual("Corruption", managedResults[0], pair);
-            // Upstream behavior: LZ4_DecompressBlock passes static_cast<int>(uncompressed_size) as the output capacity,
-            // so a claimed 0xFFFFFFFF becomes -1, LZ4_decompress_safe_continue fails with -1, and "uncompressed_size !=
-            // expected_uncompressed_size" is false: native accepts 4 GiB of uninitialized memory as the block (here it
-            // parsed as a block without the key). The managed port keeps Corruption.
-            if (t == CompressionType.LZ4 && claimed == 0xFFFFFFFF) continue;
+            if (nativeUnsafe) continue;
             CollectionAssert.AreEqual(nativeResults, managedResults, pair);
         }
     }
