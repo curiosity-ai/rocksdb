@@ -193,7 +193,7 @@ public sealed class BlockBasedTableOptions : PersistedOptions<BlockBasedTableOpt
         .Enum("index_shortening", OptionEnumMaps.IndexShortening, static o => o.IndexShortening, static (o, v) => o.IndexShortening = v)
         .Enum("optimize_key_common_prefix", OptionEnumMaps.OptimizeKeyCommonPrefix, static o => o.OptimizeKeyCommonPrefix,
             static (o, v) => o.OptimizeKeyCommonPrefix = v)
-        .UInt32("read_amp_bytes_per_bit", static o => o.ReadAmpBytesPerBit, static (o, v) => o.ReadAmpBytesPerBit = v)
+        .UInt32Truncated("read_amp_bytes_per_bit", static o => o.ReadAmpBytesPerBit, static (o, v) => o.ReadAmpBytesPerBit = v)
         .Bool("verify_compression", static o => o.VerifyCompression, static (o, v) => o.VerifyCompression = v)
         .Enum("prepopulate_block_cache", OptionEnumMaps.PrepopulateBlockCache, static o => o.PrepopulateBlockCache, static (o, v) => o.PrepopulateBlockCache = v)
         .UInt64("max_auto_readahead_size", static o => o.MaxAutoReadaheadSize, static (o, v) => o.MaxAutoReadaheadSize = v)
