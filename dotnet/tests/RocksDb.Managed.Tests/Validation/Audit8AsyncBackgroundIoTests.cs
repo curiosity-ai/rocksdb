@@ -933,6 +933,67 @@ public sealed class Audit8AsyncBackgroundIoTests
         }
     }
 
+    /// <summary>
+    /// Pins DisposeAsync racing in-flight async control calls (DBImpl::CloseHelper: CancelAllBackgroundWork, then wait for
+    /// the background jobs): a running CompactRangeAsync, a FlushAsync waiting for its flush and a WaitForCompactAsync each
+    /// end (success, ObjectDisposedException or ShutdownInProgress), never hang, DisposeAsync completes once the blocked
+    /// jobs finish, and the LOCK is released (the DB reopens with the flushed data).
+    /// </summary>
+    [TestMethod]
+    public void DisposeAsyncRacingControlCallsReleasesEveryone()
+    {
+        var fs = new YieldingFileSystem(NewFs());
+        using var compactionGate = new ManualResetEventSlim(false);
+        using var flushGate = new ManualResetEventSlim(true);
+        int compactions = 0;
+        TestHooks.Set("DBImpl::RunCompaction:Start", () =>
+        {
+            if (Interlocked.Increment(ref compactions) == 1) compactionGate.Wait(Deadline);
+        });
+        TestHooks.Set("DBImpl::FlushMemTables:Start", () => flushGate.Wait(Deadline));
+        WithDeadline(Task.Run(async () =>
+        {
+            RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true });
+            for (int f = 0; f < 3; f++)
+            {
+                for (int i = 0; i < 50; i++) await db.PutAsync(Key(i), Value(i, f));
+                await db.FlushAsync();
+            }
+            Task compaction = db.CompactRangeAsync().AsTask();
+            while (Volatile.Read(ref compactions) == 0) await Task.Delay(1);
+            flushGate.Reset();
+            await db.PutAsync(B("late"), B("1"));
+            Task flush = db.FlushAsync().AsTask();
+            Task wait = db.WaitForCompactAsync().AsTask();
+            Task dispose = db.DisposeAsync().AsTask();
+            await Task.Delay(50);
+            Assert.IsFalse(dispose.IsCompleted, "close waits for the running jobs");
+            flushGate.Set();
+            compactionGate.Set();
+            await dispose.WaitAsync(Deadline);
+            foreach ((Task t, string what) in new[] { (compaction, "CompactRangeAsync"), (flush, "FlushAsync"), (wait, "WaitForCompactAsync") })
+            {
+                try
+                {
+                    await t.WaitAsync(Deadline);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (RocksDbException e) when (e.Code is StatusCode.ShutdownInProgress or StatusCode.Incomplete)
+                {
+                }
+                catch (TimeoutException)
+                {
+                    Assert.Fail(what + " was not released by the close");
+                }
+            }
+        }), "DisposeAsync racing control calls");
+        using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs));
+        Assert.AreEqual("value-49-2" + new string('x', 49), GetString(reopened, "key000049"));
+        Assert.AreEqual("1", GetString(reopened, "late"));
+    }
+
     private static byte[] ReadAll(IFileSystem fs, string path)
     {
         using IRandomAccessFile f = fs.OpenRandomAccess(path);
