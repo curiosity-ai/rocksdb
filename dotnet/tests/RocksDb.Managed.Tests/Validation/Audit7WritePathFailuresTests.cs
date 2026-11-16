@@ -270,4 +270,240 @@ public sealed class Audit7WritePathFailuresTests
         Assert.AreEqual("1", GetString(reopened, "flushed"));
         Assert.AreEqual("2", GetString(reopened, "inwal"));
     }
+    /// <summary>The outcome of one asynchronous write in the race tests.</summary>
+    private enum Outcome
+    {
+        Pending,
+        Committed,
+        Disposed,
+        Canceled,
+        Failed,
+    }
+
+    /// <summary>
+    /// DBImpl::CloseHelper racing with everything that waits inside the DB: asynchronous writers in the group-commit queue,
+    /// writers stalled by stopped writes (DBImpl::DelayWrite stops waiting once shutting_down_ is set), manual
+    /// CompactRange calls (RunManualCompaction: ShutdownInProgress), and Flush(wait) (WaitForFlushMemTables). Every call
+    /// completes (nothing hangs), with success or ObjectDisposed / ShutdownInProgress, and every write that returned
+    /// success is in the DB after the reopen.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task CloseRacingWritersStallsCompactionsAndFlushesCompletesEveryCall(bool stopWrites)
+    {
+        int seed = Environment.TickCount;
+        Console.WriteLine("seed=" + seed);
+        var rnd = new Random(seed);
+        for (int round = 0; round < 6; round++)
+        {
+            MemoryFileSystem fs = NewFs();
+            var cfo = new ColumnFamilyOptions { WriteBufferSize = 8 << 10, Level0FileNumCompactionTrigger = 2 };
+            using var gate = new ManualResetEventSlim(!stopWrites);
+            if (stopWrites)
+            {
+                // Writes stop after two L0 files (GetWriteStallConditionAndCause) and every compaction waits at its start
+                // until the close began, so the writers are stalled when it does.
+                cfo.Level0SlowdownWritesTrigger = 2;
+                cfo.Level0StopWritesTrigger = 2;
+                TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait(Timeout));
+            }
+            RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+            const int Writers = 8, PerWriter = 1000;
+            var outcomes = new Outcome[Writers, PerWriter];
+            var unexpected = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+            var tasks = new List<Task>();
+            for (int w = 0; w < Writers; w++)
+            {
+                int writer = w;
+                tasks.Add(Task.Run(async () =>
+                {
+                    for (int i = 0; i < PerWriter; i++)
+                    {
+                        try
+                        {
+                            await db.PutAsync(Key(writer * PerWriter + i), Value(writer * PerWriter + i, 0));
+                            outcomes[writer, i] = Outcome.Committed;
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            outcomes[writer, i] = Outcome.Disposed;
+                        }
+                        catch (RocksDbException e) when (e.Code == StatusCode.ShutdownInProgress)
+                        {
+                            outcomes[writer, i] = Outcome.Failed;
+                        }
+                        catch (Exception e)
+                        {
+                            unexpected.Enqueue(e);
+                            return;
+                        }
+                    }
+                }));
+            }
+            for (int c = 0; c < 2; c++)
+            {
+                tasks.Add(Task.Run(async () =>
+                {
+                    for (int i = 0; i < 50; i++)
+                    {
+                        try
+                        {
+                            await db.CompactRangeAsync();
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            return;
+                        }
+                        catch (RocksDbException e) when (e.Code == StatusCode.ShutdownInProgress)
+                        {
+                            return;
+                        }
+                        catch (Exception e)
+                        {
+                            unexpected.Enqueue(e);
+                            return;
+                        }
+                    }
+                }));
+            }
+            tasks.Add(Task.Run(async () =>
+            {
+                for (int i = 0; i < 50; i++)
+                {
+                    try
+                    {
+                        await db.FlushAsync();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return;
+                    }
+                    catch (RocksDbException e) when (e.Code == StatusCode.ShutdownInProgress)
+                    {
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        unexpected.Enqueue(e);
+                        return;
+                    }
+                }
+            }));
+            await Task.Delay(rnd.Next(0, 15));
+            Task close = db.DisposeAsync().AsTask();
+            await Task.Delay(rnd.Next(0, 5));
+            gate.Set();
+            Assert.IsTrue(close.Wait(Timeout), "seed=" + seed + " round " + round + ": close hung");
+            Assert.IsTrue(Task.WaitAll(tasks.ToArray(), Timeout), "seed=" + seed + " round " + round + ": a call racing the close hung");
+            Assert.IsTrue(unexpected.IsEmpty, "seed=" + seed + ": " + string.Join("\n", unexpected));
+            int committed = 0, disposed = 0;
+            foreach (Outcome o in outcomes)
+            {
+                if (o == Outcome.Committed) committed++;
+                else if (o == Outcome.Disposed) disposed++;
+            }
+            Console.WriteLine("round " + round + ": committed=" + committed + " disposed=" + disposed);
+            using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+            for (int w = 0; w < Writers; w++)
+            {
+                for (int i = 0; i < PerWriter; i++)
+                {
+                    if (outcomes[w, i] != Outcome.Committed) continue;
+                    CollectionAssert.AreEqual(Value(w * PerWriter + i, 0), reopened.Get(Key(w * PerWriter + i)),
+                        "seed=" + seed + " round " + round + ": acknowledged write " + (w * PerWriter + i) + " lost");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// A write's CancellationToken (managed extension; DBImpl::WriteImpl has none) never leaves a half-applied write: a
+    /// write that throws OperationCanceledException is not in the DB, one that returned is. Writes are stopped
+    /// (DBImpl::DelayWrite) while tokens fire, then a manual compaction ends the stop. Also a token canceled before the
+    /// call.
+    /// </summary>
+    [TestMethod]
+    public async Task CanceledWritesAreAllOrNothing()
+    {
+        int seed = Environment.TickCount;
+        Console.WriteLine("seed=" + seed);
+        var rnd = new Random(seed);
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions
+        {
+            WriteBufferSize = 8 << 10, Level0FileNumCompactionTrigger = 2, Level0SlowdownWritesTrigger = 2, Level0StopWritesTrigger = 2,
+        };
+        // The compaction that would end the write stop waits at its start until the tokens fired.
+        using var gate = new ManualResetEventSlim(false);
+        TestHooks.Set("DBImpl::RunCompaction:Start", () => gate.Wait(Timeout));
+        await using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        using (var pre = new CancellationTokenSource())
+        {
+            pre.Cancel();
+            bool canceled = false;
+            try
+            {
+                await db.PutAsync(B("pre"), B("1"), pre.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                canceled = true;
+            }
+            Assert.AreEqual(canceled ? null : "1", GetString(db, "pre"), "pre-canceled write half applied");
+        }
+        // Two L0 files: writes stop.
+        for (int f = 0; f < 2; f++)
+        {
+            db.Put(Key(100000), Value(f, 1)); // overlapping files: no trivial move
+            db.Flush();
+        }
+        const int Writers = 16;
+        var outcomes = new Outcome[Writers];
+        var sources = new CancellationTokenSource[Writers];
+        var tasks = new Task[Writers];
+        for (int w = 0; w < Writers; w++)
+        {
+            int writer = w;
+            sources[w] = new CancellationTokenSource();
+            tasks[w] = Task.Run(async () =>
+            {
+                try
+                {
+                    await db.PutAsync(Key(writer), Value(writer, 2), sources[writer].Token);
+                    outcomes[writer] = Outcome.Committed;
+                }
+                catch (OperationCanceledException)
+                {
+                    outcomes[writer] = Outcome.Canceled;
+                }
+            });
+        }
+        await Task.Delay(50);
+        // Only the writer leading the stalled group observes its token (the others wait in the queue); cancel a random
+        // half first, then the rest, while writes are still stopped.
+        for (int w = 0; w < Writers; w++)
+        {
+            if (rnd.Next(2) == 0) sources[w].Cancel();
+        }
+        await Task.Delay(20);
+        for (int w = 0; w < Writers; w++) sources[w].Cancel();
+        await Task.Delay(20);
+        gate.Set();
+        Assert.IsTrue(Task.WaitAll(tasks, Timeout), "seed=" + seed + ": writes did not finish");
+        int canceledCount = 0;
+        for (int w = 0; w < Writers; w++)
+        {
+            byte[]? v = db.Get(Key(w));
+            if (outcomes[w] == Outcome.Committed) CollectionAssert.AreEqual(Value(w, 2), v, "seed=" + seed + ": committed write " + w + " missing");
+            else
+            {
+                canceledCount++;
+                Assert.IsNull(v, "seed=" + seed + ": canceled write " + w + " was applied");
+            }
+            sources[w].Dispose();
+        }
+        Console.WriteLine("canceled=" + canceledCount);
+        Assert.IsTrue(canceledCount > 0, "no write was canceled");
+    }
 }
