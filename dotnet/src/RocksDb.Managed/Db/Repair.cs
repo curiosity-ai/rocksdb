@@ -320,7 +320,7 @@ internal sealed class Repairer
                 PersistUserDefinedTimestamps = _defaultCfOptions.PersistUserDefinedTimestamps,
             };
             if (_options.WriteDbIdToManifest) newDb.DbId = FileNames.GenerateUniqueId();
-            writer.AddEditAsync(newDb, 0, sync: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            writer.AddEdit(newDb, 0, sync: false);
             uint maxCf = 0;
             foreach ((uint id, string name) in cfs)
             {
@@ -337,7 +337,7 @@ internal sealed class Repairer
                         MaxColumnFamily = maxCf,
                     };
                     add.AddColumnFamily(name);
-                    writer.AddEditAsync(add, 0, sync: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+                    writer.AddEdit(add, 0, sync: false);
                 }
                 List<TableInfo> files = _tables.FindAll(t => t.ColumnFamilyId == id);
                 if (files.Count == 0) continue;
@@ -365,11 +365,11 @@ internal sealed class Repairer
                     edit.AddFile(0, t.Meta);
                 }
                 edit.LastSequence = maxSequence;
-                writer.AddEditAsync(edit, 0, sync: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+                writer.AddEdit(edit, 0, sync: false);
             }
-            log.SyncAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            log.Sync();
         }
-        FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+        FileNames.SetCurrentFile(_fs, _dbname, manifestNumber, syncDirectory: true);
     }
 
     /// <summary>

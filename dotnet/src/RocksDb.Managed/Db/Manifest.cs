@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Util;
@@ -22,10 +23,19 @@ public interface IManifestRecordReader
 /// SEAM: accepts MANIFEST records and frames them in the log format. The production implementation is
 /// <see cref="ManifestLogWriter"/>, an adapter over <c>Wal.LogWriter</c> (db/log_writer.cc) writing to an <see cref="IWritableFile"/>.
 /// </summary>
+/// <remarks>
+/// The synchronous members are what the synchronous DB APIs (and the background flush/compaction threads) use, the
+/// asynchronous ones what the async APIs use. An implementation must not complete the synchronous members by blocking
+/// on asynchronous work: the synchronous API never waits for thread-pool work.
+/// </remarks>
 public interface IManifestRecordWriter
 {
+    /// <summary>Appends one record. The caller may reuse <paramref name="record"/>'s buffer after the call returns.</summary>
+    void AddRecord(ReadOnlySpan<byte> record);
     /// <summary>Appends one record. The caller may reuse <paramref name="record"/>'s buffer after completion.</summary>
     ValueTask AddRecordAsync(ReadOnlyMemory<byte> record, CancellationToken cancellationToken);
+    /// <summary>Flushes and fsyncs the underlying file (SyncManifest).</summary>
+    void Sync();
     /// <summary>Flushes and fsyncs the underlying file (SyncManifest).</summary>
     ValueTask SyncAsync(CancellationToken cancellationToken);
 }
@@ -612,21 +622,39 @@ public sealed class ManifestWriter
     public Func<ulong>? FileSizeProvider { get; init; }
 
     /// <summary>Encodes and appends one edit (optionally syncing).</summary>
-    public async ValueTask AddEditAsync(VersionEdit edit, int timestampSize, bool sync, CancellationToken cancellationToken)
+    public void AddEdit(VersionEdit edit, int timestampSize, bool sync) =>
+        Complete(AddEditAsync(edit, timestampSize, sync, synchronous: true, CancellationToken.None));
+
+    /// <summary>Encodes and appends one edit (optionally syncing).</summary>
+    public ValueTask AddEditAsync(VersionEdit edit, int timestampSize, bool sync, CancellationToken cancellationToken) =>
+        AddEditAsync(edit, timestampSize, sync, synchronous: false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="AddEdit"/> and <see cref="AddEditAsync(VersionEdit, int, bool, CancellationToken)"/>: with
+    /// <paramref name="synchronous"/> only the sink's synchronous members are used and the returned task is complete.
+    /// </summary>
+    internal async ValueTask AddEditAsync(VersionEdit edit, int timestampSize, bool sync, bool synchronous, CancellationToken cancellationToken)
     {
-        await AddRecordAsync(edit, timestampSize, cancellationToken).ConfigureAwait(false);
-        if (sync) await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
+        await AddRecordAsync(edit, timestampSize, synchronous, cancellationToken).ConfigureAwait(false);
+        if (sync) await SyncSinkAsync(synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Appends edits as one atomic group (kInAtomicGroup with descending remaining-entry counts), then syncs.</summary>
-    public async ValueTask AddAtomicGroupAsync(IReadOnlyList<VersionEdit> edits, int timestampSize, CancellationToken cancellationToken)
+    public void AddAtomicGroup(IReadOnlyList<VersionEdit> edits, int timestampSize) =>
+        Complete(AddAtomicGroupAsync(edits, timestampSize, synchronous: true, CancellationToken.None));
+
+    /// <summary>Appends edits as one atomic group (kInAtomicGroup with descending remaining-entry counts), then syncs.</summary>
+    public ValueTask AddAtomicGroupAsync(IReadOnlyList<VersionEdit> edits, int timestampSize, CancellationToken cancellationToken) =>
+        AddAtomicGroupAsync(edits, timestampSize, synchronous: false, cancellationToken);
+
+    private async ValueTask AddAtomicGroupAsync(IReadOnlyList<VersionEdit> edits, int timestampSize, bool synchronous, CancellationToken cancellationToken)
     {
         for (int i = 0; i < edits.Count; i++)
         {
             edits[i].MarkAtomicGroup((uint)(edits.Count - 1 - i));
-            await AddRecordAsync(edits[i], timestampSize, cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(edits[i], timestampSize, synchronous, cancellationToken).ConfigureAwait(false);
         }
-        await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
+        await SyncSinkAsync(synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -635,35 +663,45 @@ public sealed class ManifestWriter
     /// then the committed OPTIONS file number), followed by the LogAndApply-style edit carrying next_file_number and
     /// max_column_family. Syncs at the end.
     /// </summary>
-    public async ValueTask WriteSnapshotAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, CancellationToken cancellationToken)
+    public void WriteSnapshot(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize) =>
+        Complete(WriteSnapshotAsync(state, timestampSize, synchronous: true, CancellationToken.None));
+
+    /// <inheritdoc cref="WriteSnapshot"/>
+    public ValueTask WriteSnapshotAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, CancellationToken cancellationToken) =>
+        WriteSnapshotAsync(state, timestampSize, synchronous: false, cancellationToken);
+
+    private async ValueTask WriteSnapshotAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, bool synchronous,
+        CancellationToken cancellationToken)
     {
-        await WriteCurrentStateAsync(state, timestampSize, cancellationToken).ConfigureAwait(false);
+        await WriteCurrentStateAsync(state, timestampSize, synchronous, cancellationToken).ConfigureAwait(false);
         // A self-contained MANIFEST needs next_file_number (and max_column_family); VersionSet stamps them on the edits
         // of the batch that follows the state instead, as ProcessManifestWrites does.
         var tail = new VersionEdit { NextFileNumber = state.NextFileNumber, LastSequence = state.LastSequence, MaxColumnFamily = state.MaxColumnFamily };
         if (state.PrevLogNumber != 0) tail.PrevLogNumber = state.PrevLogNumber;
-        await AddRecordAsync(tail, 0, cancellationToken).ConfigureAwait(false);
-        await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
+        await AddRecordAsync(tail, 0, synchronous, cancellationToken).ConfigureAwait(false);
+        await SyncSinkAsync(synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// VersionSet::WriteCurrentStateToManifest: the records of the current state, without next_file_number and
-    /// max_column_family (the caller's edits that follow carry them). Not synced.
+    /// max_column_family (the caller's edits that follow carry them). Not synced. With <paramref name="synchronous"/>
+    /// only the sink's synchronous members are used and the returned task is complete.
     /// </summary>
-    internal async ValueTask WriteCurrentStateAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, CancellationToken cancellationToken)
+    internal async ValueTask WriteCurrentStateAsync(RecoveredVersionState state, Func<ColumnFamilyVersion, int> timestampSize, bool synchronous,
+        CancellationToken cancellationToken)
     {
         if (state.DbId is not null)
         {
-            await AddRecordAsync(new VersionEdit { DbId = state.DbId }, 0, cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(new VersionEdit { DbId = state.DbId }, 0, synchronous, cancellationToken).ConfigureAwait(false);
         }
         if (state.Wals.Count > 0)
         {
             var wals = new VersionEdit();
             foreach (KeyValuePair<ulong, ulong?> w in state.Wals) wals.WalAdditions.Add(new WalAddition(w.Key, w.Value));
-            await AddRecordAsync(wals, 0, cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(wals, 0, synchronous, cancellationToken).ConfigureAwait(false);
         }
         // Always written (possibly empty when min_log_number_to_keep is 0), like the C++ code.
-        await AddRecordAsync(new VersionEdit { WalDeletionBefore = state.MinLogNumberToKeep }, 0, cancellationToken).ConfigureAwait(false);
+        await AddRecordAsync(new VersionEdit { WalDeletionBefore = state.MinLogNumberToKeep }, 0, synchronous, cancellationToken).ConfigureAwait(false);
 
         foreach (ColumnFamilyVersion cf in state.ColumnFamilies.Values)
         {
@@ -675,7 +713,7 @@ public sealed class ManifestWriter
             }
             desc.ComparatorName = cf.ComparatorName ?? Comparator.Bytewise.Name;
             desc.PersistUserDefinedTimestamps = cf.PersistUserDefinedTimestamps;
-            await AddRecordAsync(desc, 0, cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(desc, 0, synchronous, cancellationToken).ConfigureAwait(false);
 
             var files = new VersionEdit { ColumnFamily = cf.Id };
             foreach ((int level, FileMetaData f) in cf.AllFiles()) files.NewFiles.Add(new NewFileEntry(level, f));
@@ -689,11 +727,11 @@ public sealed class ManifestWriter
             if (cf.Id == 0 && state.MinLogNumberToKeep != 0) files.MinLogNumberToKeep = state.MinLogNumberToKeep;
             if (cf.FullHistoryTsLow is { Length: > 0 }) files.FullHistoryTsLow = cf.FullHistoryTsLow;
             files.LastSequence = state.LastSequence;
-            await AddRecordAsync(files, timestampSize(cf), cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(files, timestampSize(cf), synchronous, cancellationToken).ConfigureAwait(false);
         }
         if (state.CommittedOptionsFileNumber is ulong opts)
         {
-            await AddRecordAsync(new VersionEdit { CommittedOptionsFileNumber = opts }, 0, cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(new VersionEdit { CommittedOptionsFileNumber = opts }, 0, synchronous, cancellationToken).ConfigureAwait(false);
         }
         if (FileSizeProvider is { } size)
         {
@@ -703,15 +741,24 @@ public sealed class ManifestWriter
             // record's own size (~15 bytes for the VersionEdit payload + log record header).
             const ulong EstimatedRecordOverhead = 15;
             var lcm = new VersionEdit { LastCompactedManifestFileSize = size() + EstimatedRecordOverhead };
-            await AddRecordAsync(lcm, 0, cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(lcm, 0, synchronous, cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private ValueTask AddRecordAsync(VersionEdit edit, int timestampSize, CancellationToken cancellationToken)
+    private ValueTask AddRecordAsync(VersionEdit edit, int timestampSize, bool synchronous, CancellationToken cancellationToken)
     {
         _buffer.Clear();
         if (!edit.TryEncodeTo(_buffer, timestampSize)) ThrowHelper.Corruption("Unable to Encode VersionEdit:" + edit);
-        return _sink.AddRecordAsync(_buffer.WrittenMemory, cancellationToken);
+        if (!synchronous) return _sink.AddRecordAsync(_buffer.WrittenMemory, cancellationToken);
+        _sink.AddRecord(_buffer.WrittenSpan);
+        return default;
+    }
+
+    private ValueTask SyncSinkAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        if (!synchronous) return _sink.SyncAsync(cancellationToken);
+        _sink.Sync();
+        return default;
     }
 
     /// <summary>
@@ -719,14 +766,33 @@ public sealed class ManifestWriter
     /// syncs once at the end, like one ProcessManifestWrites batch. With <paramref name="atomicGroup"/> and more than one
     /// edit they are marked as an atomic group (kInAtomicGroup with descending remaining-entry counts).
     /// </summary>
-    public async ValueTask AddEditsAsync(IReadOnlyList<VersionEdit> edits, IReadOnlyList<int> timestampSizes, bool atomicGroup, CancellationToken cancellationToken)
+    public void AddEdits(IReadOnlyList<VersionEdit> edits, IReadOnlyList<int> timestampSizes, bool atomicGroup) =>
+        Complete(AddEditsAsync(edits, timestampSizes, atomicGroup, synchronous: true, CancellationToken.None));
+
+    /// <inheritdoc cref="AddEdits"/>
+    public ValueTask AddEditsAsync(IReadOnlyList<VersionEdit> edits, IReadOnlyList<int> timestampSizes, bool atomicGroup, CancellationToken cancellationToken) =>
+        AddEditsAsync(edits, timestampSizes, atomicGroup, synchronous: false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="AddEdits"/> and <see cref="AddEditsAsync(IReadOnlyList{VersionEdit}, IReadOnlyList{int}, bool, CancellationToken)"/>:
+    /// with <paramref name="synchronous"/> only the sink's synchronous members are used and the returned task is complete.
+    /// </summary>
+    internal async ValueTask AddEditsAsync(IReadOnlyList<VersionEdit> edits, IReadOnlyList<int> timestampSizes, bool atomicGroup, bool synchronous,
+        CancellationToken cancellationToken)
     {
         for (int i = 0; i < edits.Count; i++)
         {
             if (atomicGroup && edits.Count > 1) edits[i].MarkAtomicGroup((uint)(edits.Count - 1 - i));
-            await AddRecordAsync(edits[i], timestampSizes[i], cancellationToken).ConfigureAwait(false);
+            await AddRecordAsync(edits[i], timestampSizes[i], synchronous, cancellationToken).ConfigureAwait(false);
         }
-        await _sink.SyncAsync(cancellationToken).ConfigureAwait(false);
+        await SyncSinkAsync(synchronous, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Observes the task of a <c>synchronous: true</c> call, which never awaits anything incomplete.</summary>
+    private static void Complete(ValueTask t)
+    {
+        Debug.Assert(t.IsCompleted, "a synchronous MANIFEST write did not complete synchronously");
+        t.GetAwaiter().GetResult();
     }
 }
 

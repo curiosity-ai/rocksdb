@@ -112,4 +112,92 @@ public sealed class ManifestLogTests
             Directory.Delete(dir, recursive: true);
         }
     }
+
+    // ---- the synchronous API writes MANIFEST / CURRENT / IDENTITY / OPTIONS with the synchronous file APIs ----
+
+    /// <summary>
+    /// A fault-injection file system that records every asynchronous writable-file call on a DB metadata file (MANIFEST,
+    /// CURRENT, IDENTITY, OPTIONS and the *.dbtmp files they are written through).
+    /// </summary>
+    private static (FaultInjectionFileSystem Fs, System.Collections.Concurrent.ConcurrentQueue<string> AsyncCalls) NewRecordingFs()
+    {
+        var fs = new FaultInjectionFileSystem(DbTestUtil.NewFs());
+        fs.CreateDirectoryIfMissing("/ext");
+        var calls = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        fs.OnAsyncWrite = (op, path) =>
+        {
+            string name = Path.GetFileName(path);
+            if (name.StartsWith("MANIFEST-", StringComparison.Ordinal) || name.StartsWith("OPTIONS-", StringComparison.Ordinal)
+                || name is "CURRENT" or "IDENTITY" || name.EndsWith(".dbtmp", StringComparison.Ordinal))
+            {
+                calls.Enqueue(op + " " + path);
+            }
+        };
+        return (fs, calls);
+    }
+
+    private static DbOptions RecordingOptions(IFileSystem fs) =>
+        new() { CreateIfMissing = true, FileSystem = fs, VerifyManifestContentOnClose = true, MaxManifestFileSize = 1 };
+
+    private static string WriteSst(IFileSystem fs, string path, string key)
+    {
+        using var w = new SstFileWriter(new ColumnFamilyOptions(), fs);
+        w.Open(path);
+        w.Put(DbTestUtil.B(key), DbTestUtil.B("v-" + key));
+        w.Finish();
+        return path;
+    }
+
+    /// <summary>
+    /// Every synchronous DB API that writes the MANIFEST (LogAndApply, including a new MANIFEST + CURRENT on each edit
+    /// via max_manifest_file_size = 1), the IDENTITY file or an OPTIONS file - open of a new and of an existing DB, flush
+    /// installs, column family create/drop, SetOptions/SetDBOptions, CompactRange, ingestion, and close with the
+    /// MANIFEST checks - uses only the synchronous file APIs (the sync API never waits for thread-pool work).
+    /// </summary>
+    [TestMethod]
+    public void SyncApisWriteMetadataFilesWithSyncFileApis()
+    {
+        (FaultInjectionFileSystem fs, System.Collections.Concurrent.ConcurrentQueue<string> calls) = NewRecordingFs();
+        using (RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, RecordingOptions(fs)))
+        {
+            db.Put(DbTestUtil.B("a"), DbTestUtil.B("1"));
+            db.Flush();
+            ColumnFamily cf = db.CreateColumnFamily("cf1", new ColumnFamilyOptions());
+            cf.Put(DbTestUtil.B("b"), DbTestUtil.B("2"));
+            cf.SetOptions([new KeyValuePair<string, string>("disable_auto_compactions", "true")]);
+            db.SetDBOptions([new KeyValuePair<string, string>("max_background_jobs", "3")]);
+            cf.Flush();
+            db.Put(DbTestUtil.B("c"), DbTestUtil.B("3"));
+            db.Flush();
+            db.CompactRange();
+            db.IngestExternalFiles([WriteSst(fs, "/ext/1.sst", "z")], new IngestExternalFileOptions());
+            db.DropColumnFamily(cf);
+        }
+        using (RocksDatabase db = RocksDatabase.Open(DbTestUtil.DbPath, RecordingOptions(fs), [
+            new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, new ColumnFamilyOptions())]))
+        {
+            Assert.AreEqual("3", DbTestUtil.GetString(db, "c"));
+            Assert.AreEqual("v-z", DbTestUtil.GetString(db, "z"));
+        }
+        Assert.AreEqual(0, calls.Count, "async file calls on metadata files: " + string.Join(", ", calls));
+    }
+
+    /// <summary>The async counterparts do use the asynchronous file APIs (so the recording above can see them).</summary>
+    [TestMethod]
+    public async Task AsyncApisWriteMetadataFilesWithAsyncFileApis()
+    {
+        (FaultInjectionFileSystem fs, System.Collections.Concurrent.ConcurrentQueue<string> calls) = NewRecordingFs();
+        await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbTestUtil.DbPath, RecordingOptions(fs)))
+        {
+            await db.PutAsync(DbTestUtil.B("a"), DbTestUtil.B("1"));
+            ColumnFamily cf = await db.CreateColumnFamilyAsync("cf1", new ColumnFamilyOptions());
+            await db.SetDBOptionsAsync(o => o.MaxBackgroundJobs = 3);
+            await db.DropColumnFamilyAsync(cf);
+        }
+        string[] seen = [.. calls];
+        foreach (string fragment in new[] { "/MANIFEST-", "/OPTIONS-", ".dbtmp" })
+        {
+            Assert.IsTrue(Array.Exists(seen, c => c.Contains(fragment, StringComparison.Ordinal)), fragment + " not written asynchronously: " + string.Join(", ", seen));
+        }
+    }
 }

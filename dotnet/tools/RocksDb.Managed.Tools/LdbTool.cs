@@ -879,9 +879,9 @@ internal sealed class LdbTool
         state.NextFileNumber = manifestNumber + 1;
         using (ManifestLogWriter log = ManifestLogWriter.Create(_fs, FileNames.DescriptorFileName(_dbPath, manifestNumber)))
         {
-            new ManifestWriter(log).WriteSnapshotAsync(state, static _ => 0, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+            new ManifestWriter(log).WriteSnapshot(state, static _ => 0);
         }
-        FileNames.SetCurrentFileAsync(_fs, _dbPath, manifestNumber, syncDirectory: true, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+        FileNames.SetCurrentFile(_fs, _dbPath, manifestNumber, syncDirectory: true);
     }
 
     private static int UsedLevels(RecoveredVersionState state)
@@ -1020,7 +1020,7 @@ internal sealed class LdbTool
     {
         string dir = Opt("checkpoint_dir") ?? throw new ToolException("--checkpoint_dir must be specified");
         RocksDatabase db = OpenDb(readOnly: false);
-        db.CreateCheckpointAsync(dir, 0).AsTask().GetAwaiter().GetResult();
+        db.CreateCheckpoint(dir, 0);
         W("OK\n");
     }
 

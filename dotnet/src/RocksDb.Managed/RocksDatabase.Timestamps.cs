@@ -91,6 +91,10 @@ public sealed partial class RocksDatabase
     /// <inheritdoc cref="ColumnFamily.IncreaseFullHistoryTsLow"/>
     public void IncreaseFullHistoryTsLow(ReadOnlySpan<byte> tsLow) => _default.IncreaseFullHistoryTsLow(tsLow);
 
+    /// <inheritdoc cref="ColumnFamily.IncreaseFullHistoryTsLowAsync"/>
+    public ValueTask IncreaseFullHistoryTsLowAsync(ReadOnlyMemory<byte> tsLow, CancellationToken cancellationToken = default) =>
+        _default.IncreaseFullHistoryTsLowAsync(tsLow, cancellationToken);
+
     /// <inheritdoc cref="ColumnFamily.GetNewestUserDefinedTimestamp"/>
     public byte[] GetNewestUserDefinedTimestamp() => _default.GetNewestUserDefinedTimestamp();
 }

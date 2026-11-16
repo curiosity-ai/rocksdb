@@ -74,8 +74,16 @@ public sealed class ManifestLogWriter : IManifestRecordWriter, IDisposable, IAsy
     /// <summary>The underlying log writer (e.g. for its file size).</summary>
     public LogWriter Log => _log;
 
+    /// <inheritdoc/>
+    public void AddRecord(ReadOnlySpan<byte> record) => _log.AddRecord(record);
+
+    /// <inheritdoc/>
     public ValueTask AddRecordAsync(ReadOnlyMemory<byte> record, CancellationToken cancellationToken) => _log.AddRecordAsync(record, cancellationToken);
 
+    /// <inheritdoc/>
+    public void Sync() => _log.Sync();
+
+    /// <inheritdoc/>
     public ValueTask SyncAsync(CancellationToken cancellationToken) => _log.SyncAsync(cancellationToken);
 
     public void Dispose() => _log.Dispose();
