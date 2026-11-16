@@ -1433,4 +1433,80 @@ public sealed class Audit10WriteCustomizationTests
             AssertModel(db, model, "after a throwing verification");
         }
     }
+
+    // ---- compaction service that throws -----------------------------------------------------------------------------
+
+    public enum ServiceThrow
+    {
+        Schedule,
+        Wait,
+        InstallSuccess,
+    }
+
+    /// <summary>Runs the jobs in process (DB::OpenAndCompact) and throws at <c>where</c> while its switch is on.</summary>
+    private sealed class ThrowingService(Switch s, ServiceThrow where, IFileSystem fs) : CompactionService
+    {
+        private readonly Dictionary<string, byte[]> _jobs = new();
+        private int _next;
+
+        public override string Name => "ThrowingService";
+
+        public override ValueTask<CompactionServiceScheduleResponse> ScheduleAsync(CompactionServiceJobInfo info, ReadOnlyMemory<byte> input,
+            CancellationToken cancellationToken)
+        {
+            if (where == ServiceThrow.Schedule) Boom(s, "ScheduleAsync");
+            lock (_jobs)
+            {
+                string id = "job-" + (++_next).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                _jobs[id] = input.ToArray();
+                return ValueTask.FromResult(new CompactionServiceScheduleResponse(id, CompactionServiceJobStatus.Success));
+            }
+        }
+
+        public override async ValueTask<CompactionServiceWaitResult> WaitAsync(string scheduledJobId, CancellationToken cancellationToken)
+        {
+            if (where == ServiceThrow.Wait) Boom(s, "WaitAsync");
+            byte[] input;
+            lock (_jobs) input = _jobs[scheduledJobId];
+            byte[] result = await RocksDatabase.OpenAndCompactAsync(new OpenAndCompactOptions(), Db, scheduledJobId, input,
+                new CompactionServiceOptionsOverride { FileSystem = fs, MergeOperator = new StringAppendMergeOperator() }, cancellationToken);
+            return new CompactionServiceWaitResult(CompactionServiceJobStatus.Success, result);
+        }
+
+        public override void OnInstallation(string scheduledJobId, CompactionServiceJobStatus status)
+        {
+            if (where == ServiceThrow.InstallSuccess && status == CompactionServiceJobStatus.Success) Boom(s, "OnInstallation");
+        }
+    }
+
+    /// <summary>
+    /// A CompactionService whose Schedule / Wait / OnInstallation(kSuccess) throws (upstream's return statuses or void;
+    /// DBImpl's remote compaction path, CompactionServiceCompactionJob): the compaction fails like an I/O error of the
+    /// job, the outputs imported from the worker are removed, and the DB is recoverable.
+    /// </summary>
+    [TestMethod]
+    [DataRow(ServiceThrow.Schedule)]
+    [DataRow(ServiceThrow.Wait)]
+    [DataRow(ServiceThrow.InstallSuccess)]
+    public void ThrowingCompactionServiceFailsTheCompactionRecoverably(ServiceThrow where)
+    {
+        var s = new Switch();
+        MemoryFileSystem fs = NewDbFs();
+        DbOptions Dbo()
+        {
+            DbOptions o = NewOptions(fs);
+            o.CompactionService = new ThrowingService(s, where, fs);
+            return o;
+        }
+        ColumnFamilyOptions Cfo() => new() { MergeOperator = new StringAppendMergeOperator(), DisableAutoCompactions = true };
+        RocksDatabase db = RocksDatabase.Open(Db, Dbo(), Cfo());
+        Dictionary<string, string?> model = WriteWorkload(db, 1);
+        db.Flush();
+        foreach (KeyValuePair<string, string?> kv in WriteWorkload(db, 2)) model[kv.Key] = kv.Value;
+        db.Flush();
+        s.On = true;
+        Exception? failure = Capture(db.CompactRange);
+        Assert.IsTrue(s.Calls > 0);
+        AssertBackgroundFailureRecoverable(fs, db, failure, s, model, Dbo, Cfo, "compaction service " + where);
+    }
 }
