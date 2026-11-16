@@ -270,7 +270,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             bool upToDate;
             if (_resyncing)
             {
-                upToDate = IsUpToDateWithoutLog(lastLogTerm, _state);
+                upToDate = IsUpToDateWithoutLog(lastLogTerm, lastLogSeq, _state);
             }
             else
             {
@@ -294,15 +294,27 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// entries this member helped commit.
     /// </summary>
     /// <remarks>
-    /// The term map outlives the log: a range is persisted before any entry of its term is accepted, it is dropped only
+    /// <para>
+    /// A restore records where the log ended before it drops it (<see cref="RaftPersistentState.RecordLogEnd"/>): the
+    /// entries this member acknowledged are exactly the ones up to there, so the comparison is Raft's election
+    /// restriction against that end, the one the member would make with its log intact.
+    /// </para>
+    /// <para>
+    /// Without a record (a log lost before this was recorded, or by a version that did not record it) only the term map
+    /// is left. It outlives the log: a range is persisted before any entry of its term is accepted, it is dropped only
     /// for entries this member never held, and adopting a leader's map only adds terms. So its last term is at least the
     /// term of the last entry this member acknowledged. A candidate whose last log term is strictly greater has a log at
-    /// least as up-to-date as the one this member lost (Raft's election restriction, compared without the lost last
-    /// index, which is why equal terms are refused).
+    /// least as up-to-date as the one this member lost (the same restriction compared without the lost last index,
+    /// which is why equal terms are refused there).
+    /// </para>
     /// </remarks>
-    public static bool IsUpToDateWithoutLog(long candidateLastLogTerm, RaftPersistentState state)
+    public static bool IsUpToDateWithoutLog(long candidateLastLogTerm, ulong candidateLastLogSeq, RaftPersistentState state)
     {
         ArgumentNullException.ThrowIfNull(state);
+        if (state.LogEnd is { } end)
+        {
+            return candidateLastLogTerm > end.Term || (candidateLastLogTerm == end.Term && candidateLastLogSeq >= end.Seq);
+        }
         return candidateLastLogTerm > state.Terms.GetLast().Term;
     }
 
@@ -317,7 +329,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(state);
         ArgumentNullException.ThrowIfNull(isPeer);
         ArgumentNullException.ThrowIfNull(request);
-        (long term, string candidateId, _, long lastLogTerm) = request;
+        (long term, string candidateId, ulong lastLogSeq, long lastLogTerm) = request;
         if (!isPeer(candidateId)) return new RequestVoteResult(state.CurrentTerm, false);
         if (term > state.CurrentTerm)
         {
@@ -329,9 +341,24 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         if (state.Mode == ClusterMode.Bootstrap) return new RequestVoteResult(state.CurrentTerm, false);
         string? votedFor = state.VotedFor;
         if (votedFor != null && votedFor != candidateId) return new RequestVoteResult(state.CurrentTerm, false);
-        if (!IsUpToDateWithoutLog(lastLogTerm, state)) return new RequestVoteResult(state.CurrentTerm, false);
+        if (!IsUpToDateWithoutLog(lastLogTerm, lastLogSeq, state)) return new RequestVoteResult(state.CurrentTerm, false);
         state.UpdateTermAndVote(term, candidateId);
         return new RequestVoteResult(state.CurrentTerm, true);
+    }
+
+    /// <summary>
+    /// Drops the recorded log end once a restored log is in use (<see cref="RaftPersistentState.ClearLogEnd"/>). Best
+    /// effort: a record that stays behind is only read while there is no log, and the next restore replaces it first.
+    /// </summary>
+    internal static void ForgetLogEnd(RaftPersistentState state)
+    {
+        try
+        {
+            state.ClearLogEnd();
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+        }
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -469,6 +496,14 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (!_resyncing)
+            {
+                // Before the log is dropped, and durably: once it is gone this is what the node votes against
+                // (IsUpToDateWithoutLog). A failed write throws with nothing changed, and the caller must then keep the
+                // database - an older record left on disk could describe a shorter log than the one being dropped.
+                ulong lastSeq = _db.GetLatestSequenceNumber();
+                _state.RecordLogEnd(lastSeq, _state.Terms.GetTermForSeq(lastSeq));
+            }
             _resyncing = true;
             // A node whose log is about to be replaced cannot lead (or win a pending election): as a leader it would
             // keep sending heartbeats - holding the other nodes' election timers - while refusing every stream and
@@ -492,6 +527,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             _db = db;
             _resyncing = false;
             if (_role != RaftRole.Leader) _electionTimer.Reset();
+            ForgetLogEnd(_state);
         }
         finally
         {

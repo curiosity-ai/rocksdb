@@ -206,6 +206,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         var created = new RaftClusterNode(raft, _state, _db, new Transport(this));
         // From here on the node answers votes; none answered from the persisted state alone may still be in progress.
         lock (_votesWithoutNodeGate) Volatile.Write(ref _node, created);
+        // The node votes against its log from here on; a log end recorded by a restore is no longer needed.
+        RaftClusterNode.ForgetLogEnd(_state);
         _node.LeaderChanged += OnLeaderChanged;
         _node.RoleChanged += OnRoleChanged;
         _node.ModeChanged += (_, e) => Log("mode -> " + e.Mode);
@@ -812,7 +814,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         await _resyncGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            await _node.BeginResyncAsync(_cts.Token).ConfigureAwait(false);
+            try
+            {
+                await _node.BeginResyncAsync(_cts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or RocksDbException)
+            {
+                // The log end could not be recorded, so the log must not be dropped: keep the database and let the next
+                // divergence ask again.
+                Log("resync not started: recording the log end failed: " + ex.Message);
+                lock (_followerLock) _resyncing = false;
+                return;
+            }
             Task? follower;
             lock (_followerLock)
             {

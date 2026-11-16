@@ -7,7 +7,8 @@ namespace RocksDb.Managed.Cluster;
 /// <summary>
 /// The Raft state that must survive a crash (rocksdb-sharp <c>RaftPersistentState</c>): currentTerm, votedFor (in the
 /// current term), the cluster mode, and the per-sequence term log (<see cref="RaftLogTerms"/>) so a recovering node can
-/// answer "what was the term of entry X?". Files <c>raft.state</c> and <c>raft.terms</c> in the given directory.
+/// answer "what was the term of entry X?". Files <c>raft.state</c> and <c>raft.terms</c> in the given directory, plus
+/// <c>raft.logend</c> (managed addition): where this node's log ended when it was last dropped for a snapshot restore.
 /// <para>
 /// Everything is written through a temp file that is fsync'd and renamed over the target (and the directory fsync'd),
 /// so a crash mid-write cannot corrupt the state and an acknowledged vote/term is never rolled back by power loss.
@@ -20,12 +21,14 @@ public sealed class RaftPersistentState
     private readonly IFileSystem _fs;
     private readonly string _statePath;
     private readonly string _termsPath;
+    private readonly string _logEndPath;
     private readonly Lock _gate = new();
 
     private long _currentTerm;
     private string? _votedFor;
     private int _mode; // ClusterMode
     private RaftLogTerms _terms = new();
+    private RaftLogEnd? _logEnd;
 
     public RaftPersistentState(string directory) : this(LocalFileSystem.Instance, directory)
     {
@@ -39,6 +42,7 @@ public sealed class RaftPersistentState
         _fs.CreateDirectoryIfMissing(directory);
         _statePath = FileSystemHelpers.Combine(directory, "raft.state");
         _termsPath = FileSystemHelpers.Combine(directory, "raft.terms");
+        _logEndPath = FileSystemHelpers.Combine(directory, "raft.logend");
         IsFresh = !_fs.FileExists(_statePath);
         Load();
     }
@@ -63,6 +67,51 @@ public sealed class RaftPersistentState
         get
         {
             lock (_gate) return _terms;
+        }
+    }
+
+    /// <summary>
+    /// The last entry of the log this node dropped for a snapshot restore (<see cref="RecordLogEnd"/>), or null when none
+    /// was recorded or the restored log has replaced it (<see cref="ClearLogEnd"/>).
+    /// </summary>
+    public RaftLogEnd? LogEnd
+    {
+        get
+        {
+            lock (_gate) return _logEnd;
+        }
+    }
+
+    /// <summary>
+    /// Records, durably, the last entry of the log this node is about to drop for a snapshot restore. Until the restored
+    /// log takes over, the node votes against it as Raft's election restriction would against the log itself: the
+    /// entries it acknowledged are exactly the ones up to here. Must be written before the log is deleted, and while it
+    /// still describes the log (the term of <paramref name="seq"/> from <see cref="Terms"/>). Replaces any earlier record.
+    /// </summary>
+    public void RecordLogEnd(ulong seq, long term)
+    {
+        lock (_gate)
+        {
+            var end = new RaftLogEnd(seq, term);
+            // Durable first, see RecordTermRange: a vote answered from a record that is not on disk could be granted
+            // again, against an older record, after a restart.
+            FileSystemHelpers.AtomicWrite(_fs, _logEndPath, end.Serialize());
+            _logEnd = end;
+        }
+    }
+
+    /// <summary>
+    /// Forgets the recorded log end once a restored log is in use again (the node then votes against that log). Written
+    /// as an empty file through the same atomic write: a record that outlives this call only matters while there is no
+    /// log, and every restore records its own before it drops one.
+    /// </summary>
+    public void ClearLogEnd()
+    {
+        lock (_gate)
+        {
+            if (_logEnd is null) return;
+            FileSystemHelpers.AtomicWrite(_fs, _logEndPath, string.Empty);
+            _logEnd = null;
         }
     }
 
@@ -211,5 +260,29 @@ public sealed class RaftPersistentState
             if (lines.Length >= 3 && int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int m)) _mode = m;
         }
         _terms = RaftLogTerms.Deserialize(FileSystemHelpers.TryReadAllText(_fs, _termsPath));
+        _logEnd = RaftLogEnd.Deserialize(FileSystemHelpers.TryReadAllText(_fs, _logEndPath));
+    }
+}
+
+/// <summary>The last entry of a log: its sequence number and the term it belongs to.</summary>
+public readonly record struct RaftLogEnd(ulong Seq, long Term)
+{
+    internal string Serialize() =>
+        Seq.ToString(CultureInfo.InvariantCulture) + "\n" + Term.ToString(CultureInfo.InvariantCulture) + "\n";
+
+    /// <summary>Null for a missing or empty file (<see cref="RaftPersistentState.ClearLogEnd"/>); a damaged one throws.</summary>
+    internal static RaftLogEnd? Deserialize(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        string[] lines = text.Split('\n');
+        // Written atomically, so a file that does not parse was not written by this code: refusing it is the safe answer
+        // (see Load) - a wrong log end could grant a vote this node must not grant.
+        if (lines.Length < 2 ||
+            !ulong.TryParse(lines[0], NumberStyles.None, CultureInfo.InvariantCulture, out ulong seq) ||
+            !long.TryParse(lines[1], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long term))
+        {
+            throw new InvalidDataException("raft.logend is damaged: '" + text + "'");
+        }
+        return new RaftLogEnd(seq, term);
     }
 }
