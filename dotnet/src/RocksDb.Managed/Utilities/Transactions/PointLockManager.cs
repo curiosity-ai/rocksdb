@@ -149,6 +149,9 @@ internal sealed class PointLockManager : LockManager
         _lockMaps.TryRemove(cf, out _);
     }
 
+    /// <summary>The longest single timed wait (int.MaxValue ms, the limit of Task.Wait / Lock.TryEnter), in microseconds.</summary>
+    internal const long MaxTimedWaitMicros = int.MaxValue * 1000L;
+
     /// <summary>Monotonic clock in microseconds used for lock timeouts and expirations.</summary>
     public static long NowMicros() => (long)(Stopwatch.GetTimestamp() * (1_000_000.0 / Stopwatch.Frequency));
 
@@ -241,7 +244,9 @@ internal sealed class PointLockManager : LockManager
                     long now = NowMicros();
                     if (cvEnd > now)
                     {
-                        var wait = TimeSpan.FromTicks((cvEnd - now) * 10);
+                        // Timed waits take at most int.MaxValue ms; a longer timeout (or holder expiration) waits again
+                        // after a clamped wait, as the loop re-checks the end time.
+                        var wait = TimeSpan.FromTicks(Math.Min(cvEnd - now, MaxTimedWaitMicros) * 10);
                         if (synchronous) waiter.Task.Wait(wait, cancellationToken);
                         else await waiter.Task.WaitAsync(wait, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
                         cancellationToken.ThrowIfCancellationRequested();

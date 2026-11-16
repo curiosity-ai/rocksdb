@@ -91,7 +91,15 @@ public abstract class TransactionDbMutexFactory
                 _lock.Enter();
                 return true;
             }
-            return _lock.TryEnter(TimeSpan.FromTicks(Math.Max(1, timeoutMicros * 10)));
+            // Lock.TryEnter takes at most int.MaxValue ms: wait in bounded steps up to the requested timeout.
+            long remaining = timeoutMicros;
+            while (true)
+            {
+                long step = Math.Min(remaining, PointLockManager.MaxTimedWaitMicros);
+                if (_lock.TryEnter(TimeSpan.FromTicks(Math.Max(1, step * 10)))) return true;
+                remaining -= step;
+                if (remaining <= 0) return false;
+            }
         }
 
         public override void Unlock() => _lock.Exit();
