@@ -337,7 +337,7 @@ public class BackupEngineReadOnly : IDisposable
     /// <paramref name="verifyWithChecksum"/>, the recorded crc32c. Throws NotFound / Corruption.
     /// </summary>
     public void VerifyBackup(uint backupId, bool verifyWithChecksum) =>
-        VerifyBackupCoreAsync(backupId, verifyWithChecksum, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(VerifyBackupCoreAsync(backupId, verifyWithChecksum, synchronous: true, CancellationToken.None));
 
     public async ValueTask VerifyBackupAsync(uint backupId, bool verifyWithChecksum, CancellationToken cancellationToken = default) =>
         await VerifyBackupCoreAsync(backupId, verifyWithChecksum, synchronous: false, cancellationToken).ConfigureAwait(false);
@@ -403,7 +403,7 @@ public class BackupEngineReadOnly : IDisposable
     /// files with checksum verification and installs CURRENT last (atomic rename). Backup id 0 is the latest.
     /// </summary>
     public void RestoreDbFromBackup(uint backupId, string dbDir, string walDir, RestoreOptions options) =>
-        RestoreCoreAsync(backupId, dbDir, walDir, options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(RestoreCoreAsync(backupId, dbDir, walDir, options, synchronous: true, CancellationToken.None));
 
     public async ValueTask RestoreDbFromBackupAsync(uint backupId, string dbDir, string walDir, RestoreOptions options,
         CancellationToken cancellationToken = default) =>

@@ -21,7 +21,7 @@ public sealed partial class ColumnFamily
         try
         {
             b.PutEntity(_cfd.Id, key, columns);
-            _db.WriteAsync(options, b, validateColumnFamilies: false, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            SyncValueTask.GetResult(_db.WriteAsync(options, b, validateColumnFamilies: false, synchronous: true, CancellationToken.None));
         }
         finally
         {
@@ -126,8 +126,7 @@ public sealed partial class ColumnFamily
         _db.ThrowIfDisposed();
         batch.EntityRun = true;
         if (batch.Count == 0) return;
-        ValueTask t = _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None);
-        t.GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None));
     }
 
     /// <summary>Async <see cref="MultiGetEntity(ReadOptions?, MultiGetBatch)"/>: data blocks missing from the cache are read with async I/O.</summary>

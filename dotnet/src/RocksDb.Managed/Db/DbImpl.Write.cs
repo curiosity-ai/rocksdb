@@ -184,7 +184,7 @@ internal sealed partial class DbImpl
             if (synchronous)
             {
                 Debug.Assert(lead.IsCompleted);
-                leadState = lead.GetAwaiter().GetResult();
+                leadState = SyncValueTask.GetResult(lead);
             }
             else
             {
@@ -270,7 +270,7 @@ internal sealed partial class DbImpl
                 if (synchronous)
                 {
                     Debug.Assert(lead.IsCompleted);
-                    state = lead.GetAwaiter().GetResult();
+                    state = SyncValueTask.GetResult(lead);
                 }
                 else
                 {
@@ -706,7 +706,7 @@ internal sealed partial class DbImpl
                 if (needSync)
                 {
                     // WriteToWAL with need_log_sync: every WAL in logs_ is synced, oldest first.
-                    if (_closedWalsToSync.Count > 0) SyncClosedWalsAsync(synchronous: true).GetAwaiter().GetResult();
+                    if (_closedWalsToSync.Count > 0) SyncValueTask.GetResult(SyncClosedWalsAsync(synchronous: true));
                     log.Sync();
                     SyncWalDirIfNeeded();
                 }
@@ -1574,11 +1574,10 @@ internal sealed partial class DbImpl
     /// <summary>Test helper (TEST_SwitchMemtable): switches the default column family's memtable and WAL.</summary>
     internal void SwitchMemtableForTest()
     {
-        WriteThread.Writer w = EnterUnbatchedAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        WriteThread.Writer w = SyncValueTask.GetResult(EnterUnbatchedAsync(synchronous: true, CancellationToken.None));
         try
         {
-            SwitchMemtableAsync(GetColumnFamilyData(DefaultColumnFamilyName), FlushReason.Test, synchronous: true, CancellationToken.None)
-                .GetAwaiter().GetResult();
+            SyncValueTask.GetResult(SwitchMemtableAsync(GetColumnFamilyData(DefaultColumnFamilyName), FlushReason.Test, synchronous: true, CancellationToken.None));
         }
         finally
         {

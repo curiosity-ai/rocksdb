@@ -1,3 +1,5 @@
+using RocksDb.Managed.Util;
+
 namespace RocksDb.Managed;
 
 public sealed partial class ColumnFamily
@@ -12,7 +14,7 @@ public sealed partial class ColumnFamily
     /// is written.
     /// </summary>
     public void SetOptions(IEnumerable<KeyValuePair<string, string>> options) =>
-        _db.SetOptionsAsync(_cfd, options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.SetOptionsAsync(_cfd, options, synchronous: true, CancellationToken.None));
 
     /// <inheritdoc cref="SetOptions(IEnumerable{KeyValuePair{string, string}})"/>
     public ValueTask SetOptionsAsync(IEnumerable<KeyValuePair<string, string>> options, CancellationToken cancellationToken = default) =>
@@ -28,7 +30,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(update);
         ColumnFamilyOptions copy = _cfd.Options.Clone();
         update(copy);
-        _db.SetOptionsAsync(_cfd, copy, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.SetOptionsAsync(_cfd, copy, synchronous: true, CancellationToken.None));
     }
 
     /// <inheritdoc cref="SetOptions(Action{ColumnFamilyOptions})"/>
@@ -53,6 +55,10 @@ public sealed partial class RocksDatabase
     /// <summary><see cref="ColumnFamily.SetOptions(IEnumerable{KeyValuePair{string, string}})"/> for the default column family.</summary>
     public void SetOptions(IEnumerable<KeyValuePair<string, string>> options) => _default.SetOptions(options);
 
+    /// <summary><see cref="ColumnFamily.SetOptionsAsync(IEnumerable{KeyValuePair{string, string}}, CancellationToken)"/> for the default column family.</summary>
+    public ValueTask SetOptionsAsync(IEnumerable<KeyValuePair<string, string>> options, CancellationToken cancellationToken = default) =>
+        _default.SetOptionsAsync(options, cancellationToken);
+
     public ValueTask SetOptionsAsync(ColumnFamily columnFamily, IEnumerable<KeyValuePair<string, string>> options, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
@@ -66,7 +72,7 @@ public sealed partial class RocksDatabase
     /// A new OPTIONS file is written on success.
     /// </summary>
     public void SetDBOptions(IEnumerable<KeyValuePair<string, string>> options) =>
-        _db.SetDbOptionsAsync(options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.SetDbOptionsAsync(options, synchronous: true, CancellationToken.None));
 
     /// <inheritdoc cref="SetDBOptions(IEnumerable{KeyValuePair{string, string}})"/>
     public ValueTask SetDBOptionsAsync(IEnumerable<KeyValuePair<string, string>> options, CancellationToken cancellationToken = default) =>
@@ -81,7 +87,16 @@ public sealed partial class RocksDatabase
         ArgumentNullException.ThrowIfNull(update);
         DbOptions copy = _db.Options.Clone();
         update(copy);
-        _db.SetDbOptionsAsync(copy, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.SetDbOptionsAsync(copy, synchronous: true, CancellationToken.None));
+    }
+
+    /// <inheritdoc cref="SetDBOptions(Action{DbOptions})"/>
+    public ValueTask SetDBOptionsAsync(Action<DbOptions> update, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        DbOptions copy = _db.Options.Clone();
+        update(copy);
+        return _db.SetDbOptionsAsync(copy, synchronous: false, cancellationToken);
     }
 
     /// <summary>A copy of the DB options currently in effect (DB::GetDBOptions).</summary>

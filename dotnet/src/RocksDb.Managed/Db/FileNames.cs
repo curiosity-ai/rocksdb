@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using RocksDb.Managed.Env;
@@ -359,13 +360,25 @@ public static class FileNames
     /// Port of SetCurrentFile: writes "MANIFEST-NNNNNN\n" to "dbname/NNNNNN.dbtmp" (synced), renames it over
     /// CURRENT and fsyncs the directory. On failure the temp file is removed (best effort) and the error rethrown.
     /// </summary>
-    public static async ValueTask SetCurrentFileAsync(IFileSystem fs, string dbname, ulong descriptorNumber, bool syncDirectory, CancellationToken cancellationToken)
+    public static void SetCurrentFile(IFileSystem fs, string dbname, ulong descriptorNumber, bool syncDirectory) =>
+        Complete(SetCurrentFileAsync(fs, dbname, descriptorNumber, syncDirectory, synchronous: true, CancellationToken.None));
+
+    /// <inheritdoc cref="SetCurrentFile"/>
+    public static ValueTask SetCurrentFileAsync(IFileSystem fs, string dbname, ulong descriptorNumber, bool syncDirectory, CancellationToken cancellationToken) =>
+        SetCurrentFileAsync(fs, dbname, descriptorNumber, syncDirectory, synchronous: false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="SetCurrentFile"/>: with <paramref name="synchronous"/> only the synchronous file APIs are used and the
+    /// returned task is complete.
+    /// </summary>
+    internal static async ValueTask SetCurrentFileAsync(IFileSystem fs, string dbname, ulong descriptorNumber, bool syncDirectory, bool synchronous,
+        CancellationToken cancellationToken)
     {
         string contents = DescriptorFileName(descriptorNumber) + "\n";
         string tmp = TempFileName(dbname, descriptorNumber);
         try
         {
-            await WriteStringToFileAsync(fs, contents, tmp, cancellationToken).ConfigureAwait(false);
+            await WriteStringToFileAsync(fs, contents, tmp, synchronous, cancellationToken).ConfigureAwait(false);
             fs.RenameFile(tmp, CurrentFilePath(dbname));
         }
         catch
@@ -380,13 +393,29 @@ public static class FileNames
     /// Port of SetIdentityFile: writes the DB id (a generated UUID string when <paramref name="dbId"/> is empty)
     /// to "dbname/000000.dbtmp", renames it to IDENTITY and fsyncs the directory. Returns the id written.
     /// </summary>
-    public static async ValueTask<string> SetIdentityFileAsync(IFileSystem fs, string dbname, string? dbId, CancellationToken cancellationToken)
+    public static string SetIdentityFile(IFileSystem fs, string dbname, string? dbId)
+    {
+        ValueTask<string> t = SetIdentityFileAsync(fs, dbname, dbId, synchronous: true, CancellationToken.None);
+        Debug.Assert(t.IsCompleted, "a synchronous IDENTITY write did not complete synchronously");
+        return t.GetAwaiter().GetResult();
+    }
+
+    /// <inheritdoc cref="SetIdentityFile"/>
+    public static ValueTask<string> SetIdentityFileAsync(IFileSystem fs, string dbname, string? dbId, CancellationToken cancellationToken) =>
+        SetIdentityFileAsync(fs, dbname, dbId, synchronous: false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="SetIdentityFile"/>: with <paramref name="synchronous"/> only the synchronous file APIs are used and the
+    /// returned task is complete.
+    /// </summary>
+    internal static async ValueTask<string> SetIdentityFileAsync(IFileSystem fs, string dbname, string? dbId, bool synchronous,
+        CancellationToken cancellationToken)
     {
         string id = string.IsNullOrEmpty(dbId) ? GenerateUniqueId() : dbId;
         string tmp = TempFileName(dbname, 0);
         try
         {
-            await WriteStringToFileAsync(fs, id, tmp, cancellationToken).ConfigureAwait(false);
+            await WriteStringToFileAsync(fs, id, tmp, synchronous, cancellationToken).ConfigureAwait(false);
             fs.RenameFile(tmp, IdentityFileName(dbname));
             fs.SyncDirectory(dbname);
         }
@@ -425,15 +454,35 @@ public static class FileNames
         return dbname.EndsWith('/') ? dbname + fname : dbname + "/" + fname;
     }
 
-    private static async ValueTask WriteStringToFileAsync(IFileSystem fs, string contents, string path, CancellationToken cancellationToken)
+    /// <summary>
+    /// WriteStringToFile(..., should_sync = true). With <paramref name="synchronous"/> the file is written, synced and
+    /// closed with the synchronous APIs and the returned task is complete.
+    /// </summary>
+    internal static async ValueTask WriteStringToFileAsync(IFileSystem fs, string contents, string path, bool synchronous, CancellationToken cancellationToken)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(contents);
         IWritableFile file = fs.CreateWritable(path, truncate: true);
+        if (synchronous)
+        {
+            using (file)
+            {
+                file.Append(bytes);
+                file.Sync();
+            }
+            return;
+        }
         await using (file.ConfigureAwait(false))
         {
             await file.AppendAsync(bytes, cancellationToken).ConfigureAwait(false);
             await file.SyncAsync(cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Observes the task of a <c>synchronous: true</c> call, which never awaits anything incomplete.</summary>
+    private static void Complete(ValueTask t)
+    {
+        Debug.Assert(t.IsCompleted, "a synchronous CURRENT write did not complete synchronously");
+        t.GetAwaiter().GetResult();
     }
 
     internal static byte[] ReadAllBytes(IFileSystem fs, string path)

@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace RocksDb.Managed.Db;
 
 /// <summary>
@@ -138,6 +140,42 @@ internal sealed class BackgroundThreadPool
         return item.Task;
     }
 
+    /// <summary>
+    /// Starts <paramref name="action"/>(<paramref name="state"/>) on the pool and returns a task that completes with the
+    /// outcome of the <see cref="ValueTask"/> it returns. The job runs on the pool thread up to its first incomplete
+    /// await; that thread is then free, and the job decides where it continues (<see cref="SwitchTo"/> returns to the
+    /// pool). For manual compactions that wait for a compaction service without holding a thread.
+    /// The returned task's continuations never run inline on the thread that completes it.
+    /// </summary>
+    public Task RunAsync(Func<object?, ValueTask> action, object? state)
+    {
+        var item = new AsyncTaskWorkItem(action, state);
+        Schedule(item);
+        return item.Task;
+    }
+
+    /// <summary>
+    /// An awaitable that continues the awaiting method on a thread of this pool (always asynchronously). Used by a job
+    /// started with <see cref="RunAsync"/> to bring its CPU-bound and blocking work back onto the pool after an
+    /// asynchronous wait.
+    /// </summary>
+    public SwitchToAwaitable SwitchTo() => new(this);
+
+    /// <summary>The awaitable of <see cref="SwitchTo"/>.</summary>
+    internal readonly struct SwitchToAwaitable(BackgroundThreadPool pool) : ICriticalNotifyCompletion
+    {
+        public SwitchToAwaitable GetAwaiter() => this;
+        public bool IsCompleted => false;
+        public void GetResult() { }
+        public void OnCompleted(Action continuation) => pool.Schedule(new ContinuationWorkItem(continuation));
+        public void UnsafeOnCompleted(Action continuation) => pool.Schedule(new ContinuationWorkItem(continuation));
+    }
+
+    private sealed class ContinuationWorkItem(Action continuation) : IThreadPoolWorkItem
+    {
+        public void Execute() => continuation();
+    }
+
     private void WorkerLoop()
     {
         while (true)
@@ -192,6 +230,49 @@ internal sealed class BackgroundThreadPool
             }
             catch (Exception e)
             {
+                _tcs.TrySetException(e);
+            }
+        }
+    }
+
+    /// <summary>A work item running an async job whose outcome is observed through <see cref="Task"/>.</summary>
+    private sealed class AsyncTaskWorkItem(Func<object?, ValueTask> action, object? state) : IThreadPoolWorkItem
+    {
+        private readonly TaskCompletionSource _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Task => _tcs.Task;
+
+        public void Execute()
+        {
+            ValueTask job;
+            try
+            {
+                job = action(state);
+            }
+            catch (Exception e)
+            {
+                _tcs.TrySetException(e);
+                return;
+            }
+            if (job.IsCompleted)
+            {
+                Complete(job);
+                return;
+            }
+            ValueTaskAwaiter awaiter = job.GetAwaiter();
+            awaiter.UnsafeOnCompleted(() => Complete(job));
+        }
+
+        private void Complete(ValueTask job)
+        {
+            try
+            {
+                job.GetAwaiter().GetResult();
+                _tcs.TrySetResult();
+            }
+            catch (Exception e)
+            {
+                // A cancellation from inside the job faults the task, as for TaskWorkItem.
                 _tcs.TrySetException(e);
             }
         }

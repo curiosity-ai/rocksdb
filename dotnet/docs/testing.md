@@ -196,6 +196,7 @@ Environment variables:
 |---|---|
 | `WAL_MATRIX_LONG=1` (or `ROUNDTRIP_LONG=1`) | unit: 400 random rows on top of the pairwise ones (6,300 scenarios, about 2.5 min); compat: all 256 write-time combinations (36,864 scenarios, about 15 min) |
 | `WAL_MATRIX_REPORT=<file>` | write the outcome counts and every failure / disagreement to the file |
+| `HUGE_ENTRIES=1` | compat: `DbCompatTests.ManagedReadsAValueOverItsWriteLimitThatNativeWrote` (a 1.1 GiB value written by native, read from the WAL and from an SST; needs about 8 GB of memory; otherwise inconclusive) |
 | `WAL_MATRIX_ONLY=<row>` | unit matrix: run only the row with this description (as printed in a failure) |
 
 ```bash

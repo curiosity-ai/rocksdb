@@ -1,6 +1,7 @@
 using System.Buffers;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
 
@@ -19,6 +20,18 @@ namespace RocksDb.Managed;
 /// </summary>
 public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
 {
+    /// <summary>
+    /// The largest key, in bytes, that a write accepts (1 GiB). Larger keys fail with
+    /// <see cref="StatusCode.InvalidArgument"/> ("key is too large"), and the database stays writable. Deviation:
+    /// upstream RocksDB accepts keys up to 4 GiB (uint32 lengths); the managed port holds a memtable entry in one .NET
+    /// array, which caps an entry at 2 GiB, and a lower round limit leaves room for a maximum key and value together.
+    /// Data written by native RocksDB with larger keys or values can still be read, up to what one array can hold.
+    /// </summary>
+    public const int MaxKeyLength = 1 << 30;
+
+    /// <summary>The largest value, in bytes, that a write accepts (1 GiB); see <see cref="MaxKeyLength"/>.</summary>
+    public const int MaxValueLength = 1 << 30;
+
     private readonly DbImpl _db;
     private readonly ColumnFamily _default;
     private readonly Dictionary<uint, ColumnFamily> _handles = new();
@@ -159,7 +172,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void DropColumnFamily(ColumnFamily columnFamily)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
-        _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None));
         ReleaseHandle(columnFamily);
     }
 
@@ -220,7 +233,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void Write(WriteBatch batch) => Write(null, batch);
 
     public void Write(WriteOptions? options, WriteBatch batch) =>
-        _db.WriteAsync(options, batch, validateColumnFamilies: true, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.WriteAsync(options, batch, validateColumnFamilies: true, synchronous: true, CancellationToken.None));
 
     public ValueTask WriteAsync(WriteBatch batch, CancellationToken cancellationToken = default) => WriteAsync(null, batch, cancellationToken);
 
@@ -235,7 +248,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// (NotSupported) on WritePrepared / WriteUnprepared transaction DBs.
     /// </summary>
     public void WriteWithCallback(WriteOptions? options, WriteBatch batch, UserWriteCallback callback) =>
-        _db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None));
 
     /// <summary>Asynchronous <see cref="WriteWithCallback(WriteOptions?, WriteBatch, UserWriteCallback)"/>.</summary>
     public ValueTask WriteWithCallbackAsync(WriteOptions? options, WriteBatch batch, UserWriteCallback callback, CancellationToken cancellationToken = default) =>
@@ -280,7 +293,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// Waits until all scheduled flushes and compactions (of every column family) have finished and no automatic
     /// compaction is pending (DB::WaitForCompact with default options).
     /// </summary>
-    public void WaitForCompact() => _db.WaitForCompactAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    public void WaitForCompact() => SyncValueTask.GetResult(_db.WaitForCompactAsync(synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="WaitForCompact"/>.</summary>
     public ValueTask WaitForCompactAsync(CancellationToken cancellationToken = default) => _db.WaitForCompactAsync(synchronous: false, cancellationToken);

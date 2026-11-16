@@ -43,6 +43,7 @@ public sealed class SstFileManager : IDisposable
     private ErrorHandler? _currentInstance;
     private RocksDbException? _bgError;
     private Task _recoveryTask = Task.CompletedTask;
+    private ErrorRecoveryRun? _runningRecovery; // the recovery attempt running on _recoveryTask (volatile access)
     private readonly CancellationTokenSource _closeCancellation = new();
     private readonly DeleteScheduler _deleteScheduler;
 
@@ -338,13 +339,19 @@ public sealed class SstFileManager : IDisposable
             }
             if (handler is not null)
             {
+                var run = new ErrorRecoveryRun();
+                Volatile.Write(ref _runningRecovery, run);
                 try
                 {
-                    s = await handler.RecoverFromBgErrorAsync(isManual: false).ConfigureAwait(false);
+                    s = await handler.RecoverFromBgErrorAsync(isManual: false, run, synchronous: false).ConfigureAwait(false);
                 }
                 catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException)
                 {
                     s = RocksDbException.FromException(e);
+                }
+                finally
+                {
+                    Volatile.Write(ref _runningRecovery, null);
                 }
                 // Since we're past the recovery, we can look at this error. Read it before taking the lock: it takes the
                 // DB mutex, and the DB calls into this manager (OnAddFile from VersionSet.InstallEdit) while holding the
@@ -383,7 +390,11 @@ public sealed class SstFileManager : IDisposable
 
     private static RocksDbException NoSpace() => RocksDbException.NoSpace("not enough free space to clear the background error");
 
-    /// <summary>Close: stops the recovery and trash deletion tasks.</summary>
+    /// <summary>
+    /// Close: stops the recovery and trash deletion tasks. Called from OnErrorRecoveryEnd raised by the running recovery
+    /// (a DB that owns this manager closed by its listener), it does not wait for the recovery task, which is the caller:
+    /// after the listener returns, the task sees <c>_closing</c> or the cancelled delay and ends.
+    /// </summary>
     public void Dispose()
     {
         lock (_lock)
@@ -393,6 +404,8 @@ public sealed class SstFileManager : IDisposable
         }
         _closeCancellation.Cancel();
         _deleteScheduler.Dispose();
+        ErrorRecoveryRun? caller = ErrorHandler.CurrentRecoveryEndNotification;
+        if (caller is not null && caller == Volatile.Read(ref _runningRecovery)) return;
         try { _recoveryTask.Wait(TimeSpan.FromSeconds(30)); }
         catch (AggregateException) { }
     }

@@ -241,4 +241,123 @@ public sealed class ClusterTests
         await c.AssertConvergedAsync(final);
         foreach (ClusterNodeHost h in c.Running) Assert.IsNotNull(h.Db.Get(U("acked")), "acknowledged write lost on " + h.NodeId + "\n" + c.LogText);
     }
+
+    /// <summary>A client whose replication calls (attach, stream, snapshot) fail while <c>Blocked</c> is set; votes,
+    /// heartbeats and status calls pass.</summary>
+    private sealed class ReplicationBlockingClient(IClusterNodeClient inner, Func<bool> blocked) : IClusterNodeClient
+    {
+        public string NodeId => inner.NodeId;
+        public Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) => inner.RequestVoteAsync(request, cancellationToken);
+        public Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) => inner.HeartbeatAsync(payload, cancellationToken);
+        public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => inner.GetStatusAsync(cancellationToken);
+
+        public Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
+            blocked() ? Task.FromException<ClusterAttachResult?>(new IOException("replication blocked")) : inner.CheckLogConsistencyAsync(followerId, latestSeq, termAtLatest, cancellationToken);
+
+        public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
+            blocked() ? throw new IOException("replication blocked") : inner.StreamUpdatesAsync(followerId, startSeq, cancellationToken);
+
+        public Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken) =>
+            inner.ReportProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken);
+
+        public Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>
+            blocked() ? Task.FromException<IReadOnlyDictionary<string, string>>(new IOException("replication blocked")) : inner.GetFileHashesAsync(candidates, cancellationToken);
+
+        public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
+            blocked() ? throw new IOException("replication blocked") : inner.StreamSnapshotAsync(verifiedInventory, cancellationToken);
+
+        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => inner.GetTermsAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Found by the cluster soak: two of three members lost their databases at once (one killed, one powered off,
+    /// both in the middle of a snapshot restore) after the third had won a newer term. A member without a database
+    /// waits for a leader to restore from and used to refuse every vote, so the one member that kept its data could
+    /// never win: the cluster stayed leaderless for good. The members without a database now vote on the term map
+    /// that outlived their log, for a candidate whose last log term is strictly newer.
+    /// </summary>
+    [TestMethod]
+    public async Task MajorityRestartedWithoutDatabasesElectsTheMemberWithTheNewerTerm()
+    {
+        bool blocked = false;
+        await using var c = new ClusterHarness(3, null) { ArchiveWals = false };
+        c.WrapClient = (_, _, inner) => new ReplicationBlockingClient(inner, () => Volatile.Read(ref blocked));
+        await c.StartAsync("n1");
+        for (int i = 0; i < 50; i++) await c["n1"].TryWriteAsLeaderAsync(U(K(i)), U(V(i, 0)), CancellationToken.None);
+        await c.StartAsync("n2");
+        await c.StartAsync("n3");
+        await WaitUntilAsync(() => c.Statuses().TrueForAll(s => s.Mode == ClusterMode.Cluster), "cluster mode\n" + c.LogText);
+        ClusterNodeHost first = await c.WaitForLeaderAsync(null);
+        await WriteCommittedAsync(c, 50, 80);
+        await c.AssertConvergedAsync(first);
+        long firstTerm = first.Node.CurrentTerm;
+
+        // No member can replicate from another any more. The leader goes; the next one wins a newer term and writes its
+        // no-op, which neither of the others receives.
+        Volatile.Write(ref blocked, true);
+        string old = first.NodeId;
+        await c.StopAsync(old);
+        ClusterNodeHost winner = await c.WaitForLeaderAsync(old);
+        Assert.IsTrue(winner.Node.CurrentTerm > firstTerm);
+        await WaitUntilAsync(() => winner.Db.Get(RaftClusterNode.LeaderNoOpKey) is not null, "the new leader's no-op\n" + c.LogText);
+        string other = new[] { "n1", "n2", "n3" }.Single(id => id != old && id != winner.NodeId);
+
+        // Both others die in the middle of a snapshot restore: their database files are gone, their Raft state is not.
+        await c.StopAsync(other);
+        await c.StopAsync(winner.NodeId);
+        foreach (string id in new[] { old, other })
+            foreach (string f in Directory.GetFiles(c.DbPath(id))) File.Delete(f);
+        Volatile.Write(ref blocked, false);
+
+        // Everyone comes back; the two without a database wait for a leader, reachable as a gRPC host is.
+        string winnerId = winner.NodeId;
+        await c.StartAsync(winnerId);
+        Task oldStart = c.StartAsync(old, registerFirst: true);
+        Task otherStart = c.StartAsync(other, registerFirst: true);
+        await WaitUntilAsync(() => oldStart.IsCompleted && otherStart.IsCompleted, TimeSpan.FromSeconds(30),
+            "the members without a database to restore from an elected leader\n" + c.LogText);
+        await oldStart;
+        await otherStart;
+        ClusterNodeHost leader = await c.WaitForLeaderAsync(null);
+        Assert.AreEqual(winnerId, leader.NodeId, "only the member that kept its data can lead");
+        await WriteCommittedAsync(c, 80, 90);
+        await c.AssertConvergedAsync(leader);
+        for (int i = 0; i < 90; i++)
+            foreach (ClusterNodeHost h in c.Running) Assert.IsNotNull(h.Db.Get(U(K(i))), K(i) + " lost on " + h.NodeId);
+    }
+
+    /// <summary>The vote of a member without a usable log (<see cref="RaftClusterNode.HandleRequestVoteWithoutLog"/>).</summary>
+    [TestMethod]
+    public void VoteWithoutALogNeedsAStrictlyNewerLastLogTerm()
+    {
+        using var dir = new TempDir("vote");
+        var state = new RaftPersistentState(dir.Path);
+        state.SetMode(ClusterMode.Cluster);
+        state.UpdateTermAndVote(7, null);
+        state.RecordTermRange(1, 3);
+        state.RecordTermRange(500, 5);   // the last entry this member held was of term 5
+        static bool Peer(string id) => id is "n1" or "n3";
+
+        RequestVoteResult Vote(long term, string id, long lastLogTerm) =>
+            RaftClusterNode.HandleRequestVoteWithoutLog(state, Peer, new RequestVotePayload(term, id, 1_000_000, lastLogTerm));
+
+        Assert.IsFalse(Vote(8, "n1", 5).VoteGranted, "equal last term: the lost last index decides, and it is unknown");
+        Assert.IsFalse(Vote(8, "n1", 4).VoteGranted, "older last term");
+        Assert.IsFalse(Vote(9, "n9", 6).VoteGranted, "not a member");
+        Assert.AreEqual(8, state.CurrentTerm, "a refused vote still adopts the higher term");
+        Assert.IsTrue(Vote(9, "n1", 6).VoteGranted, "newer last term");
+        Assert.AreEqual("n1", state.VotedFor);
+        Assert.IsFalse(Vote(9, "n3", 6).VoteGranted, "one vote per term");
+        Assert.IsFalse(Vote(5, "n3", 9).VoteGranted, "stale term");
+
+        // The vote is durable: a restart (a new instance over the same files) keeps it.
+        var reloaded = new RaftPersistentState(dir.Path);
+        Assert.AreEqual(9, reloaded.CurrentTerm);
+        Assert.AreEqual("n1", reloaded.VotedFor);
+
+        var bootstrap = new RaftPersistentState(Path.Combine(dir.Path, "b"));
+        bootstrap.RecordTermRange(1, 1);
+        Assert.IsFalse(RaftClusterNode.HandleRequestVoteWithoutLog(bootstrap, Peer, new RequestVotePayload(0, "n1", 10, 2)).VoteGranted,
+            "Bootstrap mode, same term: the bootstrap primary is fixed");
+    }
 }

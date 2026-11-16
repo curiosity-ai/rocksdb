@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
 
@@ -189,7 +190,7 @@ public sealed partial class RocksDatabase
     public WalFileInfo GetCurrentWalFile() => _db.GetCurrentWalFile();
 
     /// <summary>Writes buffered WAL data to the OS (manual_wal_flush) and, with <paramref name="sync"/>, fsyncs it (DB::FlushWAL).</summary>
-    public void FlushWal(bool sync) => _db.FlushWalAsync(sync, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    public void FlushWal(bool sync) => SyncValueTask.GetResult(_db.FlushWalAsync(sync, synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="FlushWal(bool)"/>.</summary>
     public ValueTask FlushWalAsync(bool sync, CancellationToken cancellationToken = default) => _db.FlushWalAsync(sync, synchronous: false, cancellationToken);

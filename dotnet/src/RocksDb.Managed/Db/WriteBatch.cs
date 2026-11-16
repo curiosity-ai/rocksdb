@@ -767,8 +767,10 @@ public sealed partial class WriteBatch : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private Span<byte> BeginRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, int keyLength, long valueLength, out int p)
     {
+        // RocksDatabase.MaxKeyLength / MaxValueLength (a deviation from upstream's uint32 limits): checked before
+        // anything is written, so the batch and the database are unchanged by a rejected record.
+        if ((uint)keyLength > RocksDatabase.MaxKeyLength || (ulong)valueLength > RocksDatabase.MaxValueLength) ThrowTooLarge(keyLength, valueLength);
         long max = 1 + Coding.MaxVarint32Length + (2L * Coding.MaxVarint32Length) + keyLength + valueLength;
-        if (max > Array.MaxLength) ThrowTooLarge();
         Span<byte> dst = _rep.GetSpan((int)max);
         if (columnFamilyId == 0)
         {
@@ -829,7 +831,10 @@ public sealed partial class WriteBatch : IDisposable
     }
 
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
-    private static void ThrowTooLarge() => ThrowHelper.InvalidArgument("key or value is too large");
+    private static void ThrowTooLarge(int keyLength, long valueLength) =>
+        ThrowHelper.InvalidArgument((uint)keyLength > RocksDatabase.MaxKeyLength
+            ? "key is too large: " + keyLength + " bytes (the limit is " + RocksDatabase.MaxKeyLength + ")"
+            : "value is too large: " + valueLength + " bytes (the limit is " + RocksDatabase.MaxValueLength + ")");
 
     // ---- Save points ------------------------------------------------------------------------------------------
 

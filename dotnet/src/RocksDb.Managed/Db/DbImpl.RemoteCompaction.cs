@@ -36,9 +36,15 @@ internal sealed partial class DbImpl
     /// <summary>
     /// ProcessKeyValueCompactionWithCompactionService for the whole compaction. Returns null when the compaction must
     /// run locally (kUseLocal or unsupported); throws for kFailure / kAborted.
+    /// <para>
+    /// With <paramref name="synchronous"/> the calling compaction thread blocks in the service's calls (upstream's
+    /// model), with the caller's <see cref="SynchronizationContext"/> suppressed for the duration of each call; else the
+    /// calls are awaited and the method continues on a pool thread of the compaction's priority
+    /// (<see cref="BackgroundThreadPool.SwitchTo"/>), so the caller's work after it still runs on a compaction thread.
+    /// </para>
     /// </summary>
-    private RemoteCompactionOutcome? TryRunRemoteCompaction(CompactionService service, ColumnFamilyData cfd, Compaction c, ulong[] snapshots, int jobId,
-        bool bottom, CancellationToken ct)
+    private async ValueTask<RemoteCompactionOutcome?> TryRunRemoteCompactionAsync(CompactionService service, ColumnFamilyData cfd, Compaction c,
+        ulong[] snapshots, int jobId, bool bottom, bool synchronous, CancellationToken ct)
     {
         if (c.DoesInputReferenceBlobFiles() || cfd.Options.EnableBlobFiles || c.SupportsPerKeyPlacement || c.TrimTs is not null) return null;
         // DBImpl::CaptureOptionsFileNumber / ReleaseOptionsFileNumber around CompactionJob::Run (BackgroundCompaction,
@@ -47,7 +53,7 @@ internal sealed partial class DbImpl
         ulong optionsFileNumber = CaptureOptionsFileNumber(ct);
         try
         {
-            return RunRemoteCompaction(service, cfd, c, snapshots, jobId, bottom, optionsFileNumber, ct);
+            return await RunRemoteCompactionAsync(service, cfd, c, snapshots, jobId, bottom, optionsFileNumber, synchronous, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -94,9 +100,10 @@ internal sealed partial class DbImpl
         return secondNewest;
     }
 
-    private RemoteCompactionOutcome? RunRemoteCompaction(CompactionService service, ColumnFamilyData cfd, Compaction c, ulong[] snapshots, int jobId,
-        bool bottom, ulong optionsFileNumber, CancellationToken ct)
+    private async ValueTask<RemoteCompactionOutcome?> RunRemoteCompactionAsync(CompactionService service, ColumnFamilyData cfd, Compaction c,
+        ulong[] snapshots, int jobId, bool bottom, ulong optionsFileNumber, bool synchronous, CancellationToken ct)
     {
+        BackgroundThreadPool pool = bottom ? BackgroundThreadPool.Bottom : BackgroundThreadPool.Low;
         var input = new CompactionServiceInput
         {
             CfName = cfd.Name,
@@ -132,7 +139,8 @@ internal sealed partial class DbImpl
             c.StartLevel, c.OutputLevel);
         LogInfo("[" + cfd.Name + "] [JOB " + jobId + "] Starting remote compaction (output level: " + c.OutputLevel + "): "
             + string.Join(", ", input.InputFiles));
-        CompactionServiceScheduleResponse response = Await(service.ScheduleAsync(info, binary, ct));
+        CompactionServiceScheduleResponse response = await CallServiceAsync(static s => s.Service.ScheduleAsync(s.Info, s.Binary, s.Ct),
+            (Service: service, Info: info, Binary: binary, Ct: ct), pool, synchronous).ConfigureAwait(false);
         switch (response.Status)
         {
             case CompactionServiceJobStatus.Success:
@@ -149,7 +157,8 @@ internal sealed partial class DbImpl
         Interlocked.Increment(ref _numRunningRemoteCompactions);
         try
         {
-            waited = Await(service.WaitAsync(response.ScheduledJobId, ct));
+            waited = await CallServiceAsync(static s => s.Service.WaitAsync(s.JobId, s.Ct), (Service: service, JobId: response.ScheduledJobId, Ct: ct), pool,
+                synchronous).ConfigureAwait(false);
         }
         finally
         {
@@ -293,7 +302,44 @@ internal sealed partial class DbImpl
     /// <summary>Compactions currently waiting for their remote worker.</summary>
     internal int NumRunningRemoteCompactions => Volatile.Read(ref _numRunningRemoteCompactions);
 
-    private static T Await<T>(ValueTask<T> t) => t.IsCompletedSuccessfully ? t.Result : t.AsTask().GetAwaiter().GetResult();
+    /// <summary>
+    /// Calls the user's <see cref="CompactionService"/>. Synchronously (a compaction thread, or the caller of a sync
+    /// CompactRange / CompactFiles): blocks until the returned task completes, with <see cref="SynchronizationContext"/>
+    /// set to null for the duration of the call, so continuations inside the service that do not use
+    /// ConfigureAwait(false) cannot capture the caller's context (blocking a UI / single-threaded context while its own
+    /// continuation waits for it would deadlock). Asynchronously: awaits the task without holding a thread and, if it
+    /// did not complete synchronously, continues on <paramref name="pool"/>, also when it throws.
+    /// </summary>
+    private static ValueTask<T> CallServiceAsync<TState, T>(Func<TState, ValueTask<T>> call, TState state, BackgroundThreadPool pool, bool synchronous)
+    {
+        if (!synchronous) return AwaitServiceAsync(call, state, pool);
+        SynchronizationContext? saved = SynchronizationContext.Current;
+        if (saved is not null) SynchronizationContext.SetSynchronizationContext(null);
+        try
+        {
+            ValueTask<T> t = call(state);
+            return new ValueTask<T>(t.IsCompleted ? t.GetAwaiter().GetResult() : t.AsTask().GetAwaiter().GetResult());
+        }
+        finally
+        {
+            if (saved is not null) SynchronizationContext.SetSynchronizationContext(saved);
+        }
+    }
+
+    private static async ValueTask<T> AwaitServiceAsync<TState, T>(Func<TState, ValueTask<T>> call, TState state, BackgroundThreadPool pool)
+    {
+        ValueTask<T> t = call(state);
+        if (t.IsCompleted) return t.GetAwaiter().GetResult();
+        try
+        {
+            return await t.ConfigureAwait(false);
+        }
+        finally
+        {
+            // Back onto a compaction thread: the rest of the compaction (local fallback, installation) blocks.
+            await pool.SwitchTo();
+        }
+    }
 
     // ---- worker ----------------------------------------------------------------------------------------
 

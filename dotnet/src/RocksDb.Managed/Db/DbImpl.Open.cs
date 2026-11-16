@@ -129,7 +129,7 @@ internal sealed partial class DbImpl
         try
         {
             _log?.Dispose();
-            Versions.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            Versions.Close();
             lock (_mutex)
             {
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
@@ -271,7 +271,7 @@ internal sealed partial class DbImpl
         dbId ??= FileNames.GenerateUniqueId();
         if (Options.WriteIdentityFile && !FileSystem.FileExists(FileNames.IdentityFileName(DbName)))
         {
-            await AwaitIo2(FileNames.SetIdentityFileAsync(FileSystem, DbName, dbId, ct), synchronous).ConfigureAwait(false);
+            await FileNames.SetIdentityFileAsync(FileSystem, DbName, dbId, synchronous, ct).ConfigureAwait(false);
         }
         Versions.DbId = dbId;
         Identity = Identity with { DbId = dbId };
@@ -699,23 +699,13 @@ internal sealed partial class DbImpl
         if (result.BlobDirectWritePartitions == 0) result.BlobDirectWritePartitions = 1;
     }
 
-    private static ValueTask AwaitIo(ValueTask t, bool synchronous)
-    {
-        if (synchronous && !t.IsCompleted)
-        {
-            t.AsTask().GetAwaiter().GetResult();
-            return default;
-        }
-        return t;
-    }
-
     /// <summary>Port of DBImpl::NewDB: writes MANIFEST-000001 describing an empty DB and points CURRENT at it.</summary>
     private async ValueTask NewDbAsync(ColumnFamilyOptions defaultCf, bool synchronous, CancellationToken ct)
     {
         string? dbId = null;
         if (Options.WriteIdentityFile)
         {
-            dbId = await AwaitIo2(FileNames.SetIdentityFileAsync(FileSystem, DbName, null, ct), synchronous).ConfigureAwait(false);
+            dbId = await FileNames.SetIdentityFileAsync(FileSystem, DbName, null, synchronous, ct).ConfigureAwait(false);
         }
         else
         {
@@ -737,7 +727,7 @@ internal sealed partial class DbImpl
             using (ManifestLogWriter log = ManifestLogWriter.Create(FileSystem, manifest))
             {
                 var writer = new ManifestWriter(log);
-                await AwaitIo(writer.AddEditAsync(edit, 0, sync: true, ct), synchronous).ConfigureAwait(false);
+                await writer.AddEditAsync(edit, 0, sync: true, synchronous, ct).ConfigureAwait(false);
             }
         }
         catch
@@ -747,13 +737,7 @@ internal sealed partial class DbImpl
         }
         // Make "CURRENT" file that points to the new manifest file. The MANIFEST stays when this fails (NewDB only
         // deletes it when writing it failed): CURRENT may already name it (renamed, directory fsync failed).
-        await AwaitIo(FileNames.SetCurrentFileAsync(FileSystem, DbName, manifestNumber, syncDirectory: true, ct), synchronous).ConfigureAwait(false);
-    }
-
-    private static ValueTask<T> AwaitIo2<T>(ValueTask<T> t, bool synchronous)
-    {
-        if (synchronous && !t.IsCompleted) return new ValueTask<T>(t.AsTask().GetAwaiter().GetResult());
-        return t;
+        await FileNames.SetCurrentFileAsync(FileSystem, DbName, manifestNumber, syncDirectory: true, synchronous, ct).ConfigureAwait(false);
     }
 
     /// <summary>

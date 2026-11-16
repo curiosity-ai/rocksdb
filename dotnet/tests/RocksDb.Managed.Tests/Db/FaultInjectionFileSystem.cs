@@ -256,6 +256,12 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
     /// <summary>Called with the path before every random access open (it may throw to fail the open).</summary>
     public Action<string>? BeforeOpenRandomAccess { get; set; }
 
+    /// <summary>
+    /// Called with the operation ("AppendAsync", "FlushAsync", "SyncAsync", "DisposeAsync") and the path whenever an
+    /// asynchronous member of a writable file is used (it may throw to fail the operation).
+    /// </summary>
+    public Action<string, string>? OnAsyncWrite { get; set; }
+
     public IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options)
     {
         BeforeOpenRandomAccess?.Invoke(path);
@@ -373,6 +379,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
         {
             try
             {
+                fs.OnAsyncWrite?.Invoke("AppendAsync", path);
                 Append(data.Span);
                 return ValueTask.CompletedTask;
             }
@@ -392,6 +399,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
         {
             try
             {
+                fs.OnAsyncWrite?.Invoke("FlushAsync", path);
                 Flush();
                 return ValueTask.CompletedTask;
             }
@@ -412,6 +420,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
         {
             try
             {
+                fs.OnAsyncWrite?.Invoke("SyncAsync", path);
                 Sync();
                 return ValueTask.CompletedTask;
             }
@@ -430,6 +439,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
         public ValueTask DisposeAsync()
         {
+            if (Volatile.Read(ref _disposed) == 0) fs.OnAsyncWrite?.Invoke("DisposeAsync", path);
             Dispose();
             return ValueTask.CompletedTask;
         }

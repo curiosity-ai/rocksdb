@@ -1,3 +1,5 @@
+using RocksDb.Managed.Util;
+
 namespace RocksDb.Managed;
 
 public sealed partial class ColumnFamily
@@ -11,7 +13,7 @@ public sealed partial class ColumnFamily
     /// are not exported.
     /// </summary>
     public ExportImportFilesMetadata ExportColumnFamily(string exportDirectory) =>
-        _db.ExportColumnFamilyAsync(_cfd, exportDirectory, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.ExportColumnFamilyAsync(_cfd, exportDirectory, synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="ExportColumnFamily(string)"/>.</summary>
     public ValueTask<ExportImportFilesMetadata> ExportColumnFamilyAsync(string exportDirectory, CancellationToken cancellationToken = default) =>
@@ -38,8 +40,7 @@ public sealed partial class RocksDatabase
     /// </summary>
     public ColumnFamily CreateColumnFamilyWithImport(string name, ColumnFamilyOptions options, ImportColumnFamilyOptions importOptions,
         IReadOnlyList<ExportImportFilesMetadata> metadatas) =>
-        Handle(_db.CreateColumnFamilyWithImportAsync(name, options, importOptions, metadatas, synchronous: true, CancellationToken.None)
-            .GetAwaiter().GetResult());
+        Handle(SyncValueTask.GetResult(_db.CreateColumnFamilyWithImportAsync(name, options, importOptions, metadatas, synchronous: true, CancellationToken.None)));
 
     /// <summary>Async <see cref="CreateColumnFamilyWithImport(string, ColumnFamilyOptions, ImportColumnFamilyOptions, ExportImportFilesMetadata)"/>.</summary>
     public ValueTask<ColumnFamily> CreateColumnFamilyWithImportAsync(string name, ColumnFamilyOptions options, ImportColumnFamilyOptions importOptions,

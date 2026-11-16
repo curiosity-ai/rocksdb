@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using RocksDb.Managed.Db.Iterators;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
@@ -206,8 +207,7 @@ internal sealed partial class DbImpl
                 _statsSlice = statsMap;
                 try
                 {
-                    WriteAsync(StatsWriteOptions(), batch, validateColumnFamilies: false, synchronous: true, CancellationToken.None)
-                        .GetAwaiter().GetResult();
+                    SyncValueTask.GetResult(WriteAsync(StatsWriteOptions(), batch, validateColumnFamilies: false, synchronous: true, CancellationToken.None));
                     LogInfo("Writing " + statsMap.Count.ToString(CultureInfo.InvariantCulture) + " stats with timestamp "
                         + nowSeconds.ToString(CultureInfo.InvariantCulture) + " to persistent stats CF succeeded");
                 }

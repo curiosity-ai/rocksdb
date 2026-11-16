@@ -283,7 +283,7 @@ internal static class NodeMain
         RaftClusterNode node = host.Node;
         events.Write("start term=" + node.CurrentTerm + " role=" + node.Role + " leader=" + (node.CurrentLeaderId ?? "-") + " seq=" +
                      host.Db.GetLatestSequenceNumber() + " mode=" + node.Mode + " pid=" + Environment.ProcessId);
-        // Raised under the node's lock: only volatile reads here (commit index; the latest sequence of the current instance).
+        // Raised under the node's gate (not reentrant): only volatile reads here (commit index; the latest sequence of the current instance).
         node.RoleChanged += (_, e) => events.Write("role " + e.Role + " term=" + e.Term + " commit=" + node.CommitSeq + " seq=" + LatestSeq(host));
         node.LeaderChanged += (_, e) => events.Write("leader " + (e.LeaderId ?? "-") + " term=" + e.Term + " commit=" + node.CommitSeq + " seq=" + LatestSeq(host));
         Out("READY " + cfg.NodeId);
@@ -334,26 +334,27 @@ internal static class NodeMain
 /// </summary>
 public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : ServiceBase<IClusterService>, IClusterService
 {
-    public UnaryResult<RequestVoteResultDto> RequestVoteAsync(RequestVoteDto request)
+    public async UnaryResult<RequestVoteResultDto> RequestVoteAsync(RequestVoteDto request)
     {
-        RequestVoteResult r = host.HandleRequestVote(new RequestVotePayload(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm));
+        RequestVoteResult r = await host.HandleRequestVoteAsync(new RequestVotePayload(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm),
+            Context.CallContext.CancellationToken).ConfigureAwait(false);
         if (r.VoteGranted) ctx.Events.Write("vote term=" + request.Term + " cand=" + request.CandidateId);
-        return UnaryResult.FromResult(new RequestVoteResultDto { Term = r.Term, VoteGranted = r.VoteGranted });
+        return new RequestVoteResultDto { Term = r.Term, VoteGranted = r.VoteGranted };
     }
 
-    public UnaryResult<AppendEntriesDto> HeartbeatAsync(HeartbeatDto request)
+    public async UnaryResult<AppendEntriesDto> HeartbeatAsync(HeartbeatDto request)
     {
-        AppendEntriesResult r = host.HandleHeartbeat(new HeartbeatPayload(request.Term, request.LeaderId, request.PrevLogSeq, request.PrevLogTerm,
-            request.LeaderCommit, (ClusterMode)request.LeaderMode));
-        return UnaryResult.FromResult(new AppendEntriesDto { Term = r.Term, Success = r.Success, LastSeq = r.LastSeq, Reason = r.Reason });
+        AppendEntriesResult r = await host.HandleHeartbeatAsync(new HeartbeatPayload(request.Term, request.LeaderId, request.PrevLogSeq, request.PrevLogTerm,
+            request.LeaderCommit, (ClusterMode)request.LeaderMode), Context.CallContext.CancellationToken).ConfigureAwait(false);
+        return new AppendEntriesDto { Term = r.Term, Success = r.Success, LastSeq = r.LastSeq, Reason = r.Reason };
     }
 
     public UnaryResult<ClusterStatusDto> GetStatusAsync() => UnaryResult.FromResult(ClusterStatusDto.From(host.GetStatus()));
 
-    public UnaryResult<AttachDto> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest)
+    public async UnaryResult<AttachDto> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest)
     {
-        ClusterAttachResult r = host.HandleCheckLogConsistency(latestSeq, termAtLatest);
-        return UnaryResult.FromResult(new AttachDto { IsLeader = r.IsLeader, Consistent = r.Consistent, Term = r.Term, Terms = r.Terms });
+        ClusterAttachResult r = await host.HandleCheckLogConsistencyAsync(latestSeq, termAtLatest, Context.CallContext.CancellationToken).ConfigureAwait(false);
+        return new AttachDto { IsLeader = r.IsLeader, Consistent = r.Consistent, Term = r.Term, Terms = r.Terms };
     }
 
     public async Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(string followerId, ulong startSeq)
@@ -375,8 +376,8 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
         return stream.Result();
     }
 
-    public UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm) =>
-        UnaryResult.FromResult(host.HandleReportProgress(nodeId, seq, leaderTerm));
+    public async UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm) =>
+        await host.HandleReportProgressAsync(nodeId, seq, leaderTerm, Context.CallContext.CancellationToken).ConfigureAwait(false);
 
     public async UnaryResult<Dictionary<string, string>> GetFileHashesAsync(List<FileInfoDto> candidates)
     {

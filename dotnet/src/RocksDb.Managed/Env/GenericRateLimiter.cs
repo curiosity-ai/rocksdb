@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using RocksDb.Managed.Db;
 
 namespace RocksDb.Managed.Env;
 
@@ -26,9 +27,15 @@ public enum RateLimiterMode
 /// With <c>autoTuned</c>, the rate adapts within [max/20, max] to how often the bucket is drained (TuneLocked).
 /// </para>
 /// <para>
-/// Synchronization: all state is guarded by <c>_lock</c>. Waiting requests do not hold a thread: the refill that
-/// grants them is driven by a one-shot timer while requests are queued (upstream elects a waiting thread for that
-/// duty), and <see cref="RequestAsync(long, IoPriority, CancellationToken)"/> waits asynchronously.
+/// Synchronization: all state is guarded by <c>_lock</c>. Upstream (RequestImpl, util/rate_limiter.cc) has the queued
+/// threads themselves wait for the next refill time (duty 1) and refill and grant (duty 2). Here a one-shot timer does
+/// both while requests are queued, so that <see cref="RequestAsync(long, IoPriority, CancellationToken)"/> waits
+/// without holding a thread. A synchronous <see cref="Request(long, IoPriority)"/> that has to wait does not depend on
+/// the timer (whose callback needs a .NET thread pool thread, which may be starved): like an upstream waiter it waits
+/// until it is granted or the next refill time has come, and then performs duty 2 itself if nobody did, which also
+/// grants the async waiters. The timer stays armed while requests are queued, so whichever of the two comes first
+/// refills; the other finds the refill done. Drains are counted where the timer is armed (one per refill a request
+/// waits for), as upstream counts the thread performing duty 1.
 /// </para>
 /// <para>
 /// Statistics (when the caller passes them, like WritableFileWriter does for writes): RATE_LIMITER_REQUESTS_* and
@@ -211,21 +218,54 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
     /// <inheritdoc/>
     public void Request(long bytes, IoPriority priority, RocksDb.Managed.Statistics? statistics, RateLimiterOpType opType)
     {
-        Task? wait = RequestCore(bytes, priority, statistics, opType);
-        wait?.GetAwaiter().GetResult();
+        Req? r = RequestCore(bytes, priority, statistics, opType);
+        if (r is not null) WaitSync(r);
     }
 
     /// <inheritdoc/>
     public ValueTask RequestAsync(long bytes, IoPriority priority, RocksDb.Managed.Statistics? statistics, RateLimiterOpType opType, CancellationToken cancellationToken)
     {
-        Task? wait = RequestCore(bytes, priority, statistics, opType);
-        if (wait is null) return ValueTask.CompletedTask;
+        Req? r = RequestCore(bytes, priority, statistics, opType);
+        if (r is null) return ValueTask.CompletedTask;
+        Task wait = r.Granted.Task;
         // A cancelled waiter keeps its place in the queue (its tokens are still consumed when granted).
         return new ValueTask(cancellationToken.CanBeCanceled ? wait.WaitAsync(cancellationToken) : wait);
     }
 
-    /// <summary>GenericRateLimiter::RequestImpl. Returns null when granted immediately, else the grant to wait for.</summary>
-    private Task? RequestCore(long bytes, IoPriority priority, RocksDb.Managed.Statistics? stats, RateLimiterOpType opType)
+    /// <summary>
+    /// The wait loop of GenericRateLimiter::RequestImpl for a thread that may block: waits on its own grant until the
+    /// next refill time (duty 1, which the armed timer also performs, so the wait is bounded by that time), and when the
+    /// refill is due and nobody performed it yet, refills and grants under the lock (duty 2), then keeps the timer armed
+    /// for the requests still queued (as <see cref="OnTimer"/> does). Needs no other thread to make progress.
+    /// </summary>
+    private void WaitSync(Req r)
+    {
+        Task granted = r.Granted.Task;
+        while (!granted.IsCompleted)
+        {
+            long waitMicros;
+            lock (_lock)
+            {
+                // Granted by a refill, or released by Dispose (which completes every queued request).
+                if (granted.IsCompleted) break;
+                long now = NowMicros();
+                waitMicros = _nextRefillMicros - now;
+                if (waitMicros <= 0)
+                {
+                    RefillBytesAndGrantRequestsLocked();
+                    RearmForQueuedLocked();
+                    continue;
+                }
+            }
+            // Bounded by the refill period: the (mock or real) clock is re-read at least once per period.
+            long waitMillis = (Math.Min(waitMicros, _refillPeriodMicros) + 999) / 1000;
+            granted.Wait((int)Math.Clamp(waitMillis, 1, int.MaxValue));
+        }
+        granted.GetAwaiter().GetResult();
+    }
+
+    /// <summary>GenericRateLimiter::RequestImpl. Returns null when granted immediately, else the queued request to wait for.</summary>
+    private Req? RequestCore(long bytes, IoPriority priority, RocksDb.Managed.Statistics? stats, RateLimiterOpType opType)
     {
         if (priority >= IoPriority.Total || !IsRateLimited(opType)) return null;
         bytes = Math.Max(0, Math.Min(bytes, SingleBurstBytes));
@@ -260,7 +300,7 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
                 r.WaitStartMicros = now;
                 ScheduleRefillLocked(stats);
             }
-            return r.Granted.Task;
+            return r;
         }
     }
 
@@ -291,6 +331,7 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
 
     private void OnTimer()
     {
+        TestHooks.Invoke("GenericRateLimiter::OnTimer");
         lock (_lock)
         {
             _timerPending = false;
@@ -299,14 +340,20 @@ public sealed class GenericRateLimiter : IRateLimiter, IDisposable
             foreach (Queue<Req> q in _queues) any |= q.Count > 0;
             if (!any) return;
             if (NowMicros() >= _nextRefillMicros) RefillBytesAndGrantRequestsLocked();
-            foreach (Queue<Req> q in _queues)
+            RearmForQueuedLocked();
+        }
+    }
+
+    /// <summary>Arms the timer for the next refill when requests are still queued (no-op while it is armed).</summary>
+    private void RearmForQueuedLocked()
+    {
+        foreach (Queue<Req> q in _queues)
+        {
+            if (q.Count > 0)
             {
-                if (q.Count > 0)
-                {
-                    // The request at the head waits for another refill (the waiter performing duty (1) upstream).
-                    ScheduleRefillLocked(q.Peek().Stats);
-                    break;
-                }
+                // The request at the head waits for another refill (the waiter performing duty (1) upstream).
+                ScheduleRefillLocked(q.Peek().Stats);
+                break;
             }
         }
     }

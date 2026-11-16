@@ -233,7 +233,7 @@ public sealed class Audit4ReplicationOriginalTests
         for (int i = 0; i < 10; i++) db.Put(U("n" + i), U("v"));
         Assert.AreEqual(term, node.GetTermForSeq(12), "an entry of this leader is labelled with the old leader's term");
         // The old leader comes back with its own entries 6..12 (term 3 at 12) and asks whether it may keep them.
-        LogConsistencyResult check = node.CheckFollowerLogConsistency(12, 3);
+        LogConsistencyResult check = await node.CheckFollowerLogConsistencyAsync(12, 3, CancellationToken.None);
         Assert.IsTrue(check.IsLeader);
         Assert.IsFalse(check.Consistent, "the deposed leader's divergent tail passed the attach check");
     }
@@ -434,8 +434,8 @@ public sealed class Audit4ReplicationOriginalTests
         for (int i = 0; i < 7; i++) db.Put(U("n" + i), U("v"));
         Assert.AreEqual(firstTerm, node.GetTermForSeq(5));
         Assert.AreEqual(node.CurrentTerm, node.GetTermForSeq(6));
-        Assert.IsTrue(node.CheckFollowerLogConsistency(5, firstTerm).Consistent, "a follower that holds nothing past the recovered log attaches");
-        Assert.IsFalse(node.CheckFollowerLogConsistency(8, firstTerm).Consistent, "a follower's entries of the first run that this node lost passed the attach check");
+        Assert.IsTrue((await node.CheckFollowerLogConsistencyAsync(5, firstTerm, CancellationToken.None)).Consistent, "a follower that holds nothing past the recovered log attaches");
+        Assert.IsFalse((await node.CheckFollowerLogConsistencyAsync(8, firstTerm, CancellationToken.None)).Consistent, "a follower's entries of the first run that this node lost passed the attach check");
     }
 
     /// <summary>
@@ -460,12 +460,12 @@ public sealed class Audit4ReplicationOriginalTests
         // n2 leads the next term. This node's log is rebuilt from it (simulated: the term map of the new leader says
         // the entry at seq is one of the new term), and the new leader commits that entry.
         long newTerm = writeTerm + 1;
-        node.HandleAppendEntries(new HeartbeatPayload(newTerm, "n2", 0, 0, 0, ClusterMode.Bootstrap));
+        await node.HandleAppendEntriesAsync(new HeartbeatPayload(newTerm, "n2", 0, 0, 0, ClusterMode.Bootstrap), CancellationToken.None);
         Assert.AreEqual(RaftRole.Follower, node.Role);
         var terms = new RaftLogTerms();
         terms.Record(1, newTerm);
         state.ReplaceTerms(terms);
-        Assert.IsTrue(node.HandleAppendEntries(new HeartbeatPayload(newTerm, "n2", seq, newTerm, seq, ClusterMode.Bootstrap)).Success);
+        Assert.IsTrue((await node.HandleAppendEntriesAsync(new HeartbeatPayload(newTerm, "n2", seq, newTerm, seq, ClusterMode.Bootstrap), CancellationToken.None)).Success);
         Assert.IsTrue(node.CommitSeq >= seq);
 
         Assert.IsFalse(await node.WaitForCommitAsync(seq, writeTerm, CancellationToken.None), "a replaced entry was acknowledged as committed");
@@ -488,7 +488,7 @@ public sealed class Audit4ReplicationOriginalTests
         state.SetMode(ClusterMode.Cluster);
         await using (var node = new RaftClusterNode(config, state, db, new NoTransport()))
         {
-            Assert.IsTrue(node.HandleRequestVote(new RequestVotePayload(7, "n2", 0, 0)).VoteGranted);
+            Assert.IsTrue((await node.HandleRequestVoteAsync(new RequestVotePayload(7, "n2", 0, 0), CancellationToken.None)).VoteGranted);
         }
 
         // Restart; the state file cannot be read this time.
@@ -506,7 +506,7 @@ public sealed class Audit4ReplicationOriginalTests
         if (reloaded != null)
         {
             await using var again = new RaftClusterNode(config, reloaded, db, new NoTransport());
-            Assert.IsFalse(again.HandleRequestVote(new RequestVotePayload(7, "n3", 0, 0)).VoteGranted, "a second vote in term 7, for another candidate");
+            Assert.IsFalse((await again.HandleRequestVoteAsync(new RequestVotePayload(7, "n3", 0, 0), CancellationToken.None)).VoteGranted, "a second vote in term 7, for another candidate");
         }
         Assert.AreEqual(StatusCode.IOError, code, "the read error is reported");
 
@@ -516,9 +516,9 @@ public sealed class Audit4ReplicationOriginalTests
         Assert.AreEqual(7, recovered.CurrentTerm);
         Assert.AreEqual("n2", recovered.VotedFor);
         await using var restarted = new RaftClusterNode(config, recovered, db, new NoTransport());
-        Assert.IsFalse(restarted.HandleRequestVote(new RequestVotePayload(7, "n3", 0, 0)).VoteGranted);
-        Assert.IsTrue(restarted.HandleRequestVote(new RequestVotePayload(7, "n2", 0, 0)).VoteGranted, "the candidate's repeated request (its first answer was lost)");
-        Assert.IsFalse(restarted.HandleRequestVote(new RequestVotePayload(6, "n3", 0, 0)).VoteGranted, "a request of an older term");
+        Assert.IsFalse((await restarted.HandleRequestVoteAsync(new RequestVotePayload(7, "n3", 0, 0), CancellationToken.None)).VoteGranted);
+        Assert.IsTrue((await restarted.HandleRequestVoteAsync(new RequestVotePayload(7, "n2", 0, 0), CancellationToken.None)).VoteGranted, "the candidate's repeated request (its first answer was lost)");
+        Assert.IsFalse((await restarted.HandleRequestVoteAsync(new RequestVotePayload(6, "n3", 0, 0), CancellationToken.None)).VoteGranted, "a request of an older term");
     }
 
     /// <summary>
@@ -586,35 +586,35 @@ public sealed class Audit4ReplicationOriginalTests
         var config = new RaftConfig("n3", "mem://n3", [new ClusterMember("n1", "mem://n1"), new ClusterMember("n2", "mem://n2")]);
         await using var node = new RaftClusterNode(config, state, db, new NoTransport());
 
-        AppendEntriesResult r = node.HandleAppendEntries(new HeartbeatPayload(5, "n2", 9, 5, 8, ClusterMode.Cluster));
+        AppendEntriesResult r = await node.HandleAppendEntriesAsync(new HeartbeatPayload(5, "n2", 9, 5, 8, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsTrue(r.Success);
         Assert.AreEqual(8UL, node.CommitSeq);
         Assert.AreEqual("n2", node.CurrentLeaderId);
 
         // The deposed leader of term 4: heartbeat and stream tag.
-        r = node.HandleAppendEntries(new HeartbeatPayload(4, "n1", 10, 1, 10, ClusterMode.Cluster));
+        r = await node.HandleAppendEntriesAsync(new HeartbeatPayload(4, "n1", 10, 1, 10, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsFalse(r.Success);
         Assert.AreEqual(AppendEntriesRejectReason.StaleTerm, r.Reason);
         Assert.AreEqual(5, r.Term, "the stale leader learns the newer term from the answer");
-        node.HandleObservedLeader("n1", 4);
+        await node.HandleObservedLeaderAsync("n1", 4, CancellationToken.None);
         Assert.AreEqual("n2", node.CurrentLeaderId);
         Assert.AreEqual(5, node.CurrentTerm);
         Assert.AreEqual(8UL, node.CommitSeq);
 
         // An older heartbeat of the current leader arrives after a newer one; then the newer one again.
-        Assert.IsTrue(node.HandleAppendEntries(new HeartbeatPayload(5, "n2", 6, 1, 6, ClusterMode.Cluster)).Success);
+        Assert.IsTrue((await node.HandleAppendEntriesAsync(new HeartbeatPayload(5, "n2", 6, 1, 6, ClusterMode.Cluster), CancellationToken.None)).Success);
         Assert.AreEqual(8UL, node.CommitSeq, "the commit index moved back");
-        Assert.IsTrue(node.HandleAppendEntries(new HeartbeatPayload(5, "n2", 9, 5, 8, ClusterMode.Cluster)).Success);
+        Assert.IsTrue((await node.HandleAppendEntriesAsync(new HeartbeatPayload(5, "n2", 9, 5, 8, ClusterMode.Cluster), CancellationToken.None)).Success);
         Assert.AreEqual(8UL, node.CommitSeq);
 
         // The leader committed 10, but this heartbeat only verified the log up to 9.
-        Assert.IsTrue(node.HandleAppendEntries(new HeartbeatPayload(5, "n2", 9, 5, 10, ClusterMode.Cluster)).Success);
+        Assert.IsTrue((await node.HandleAppendEntriesAsync(new HeartbeatPayload(5, "n2", 9, 5, 10, ClusterMode.Cluster), CancellationToken.None)).Success);
         Assert.AreEqual(9UL, node.CommitSeq);
 
         // A heartbeat whose previous entry carries another term here: nothing is committed, the node asks for a rebuild.
         int resyncs = 0;
         node.ResyncRequired += (_, _) => resyncs++;
-        r = node.HandleAppendEntries(new HeartbeatPayload(6, "n1", 10, 6, 10, ClusterMode.Cluster));
+        r = await node.HandleAppendEntriesAsync(new HeartbeatPayload(6, "n1", 10, 6, 10, ClusterMode.Cluster), CancellationToken.None);
         Assert.IsFalse(r.Success);
         Assert.AreEqual(AppendEntriesRejectReason.TermMismatch, r.Reason);
         Assert.AreEqual(1, resyncs);

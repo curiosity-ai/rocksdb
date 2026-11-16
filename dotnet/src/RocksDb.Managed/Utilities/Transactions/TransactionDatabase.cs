@@ -1,4 +1,5 @@
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Utilities.Transactions;
 
@@ -264,8 +265,7 @@ public sealed class TransactionDatabase : IDisposable, IAsyncDisposable
             var commit = new CommitEntryPreReleaseCallback(wp);
             commit.Set(DbFormat.MaxSequenceNumber, 0, 1);
             var ctx = new TransactionWriteContext { BatchCount = 1, PreRelease = commit };
-            impl.WriteAsync(new WriteOptions(), rollbackBatch, validateColumnFamilies: false, ctx, synchronous: true, CancellationToken.None)
-                .GetAwaiter().GetResult();
+            SyncValueTask.GetResult(impl.WriteAsync(new WriteOptions(), rollbackBatch, validateColumnFamilies: false, ctx, synchronous: true, CancellationToken.None));
         }
     }
 

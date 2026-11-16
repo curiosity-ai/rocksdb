@@ -230,6 +230,11 @@ their reads carry a `ReadCallback` and their flushes / compactions a `SnapshotCh
 Every I/O-bound public API returns `ValueTask`. Internally, most code paths are written once as
 `async ValueTask XxxAsync(..., bool synchronous)`. With `synchronous: true`, every awaited call completes inline, so
 the sync API runs the same code without thread-pool hops. This keeps the sync and async paths from drifting apart.
+With `synchronous: true` such a method calls the synchronous file members (`Append`, `Sync`, `Dispose`) and never an
+async one, down to the metadata files: MANIFEST records (`ManifestWriter` over `IManifestRecordWriter.AddRecord` /
+`Sync`), `CURRENT` and `IDENTITY` (`FileNames.SetCurrentFile` / `SetIdentityFile`) and `OPTIONS` files
+(`OptionsFile.WriteToDbDirectory`). So a sync flush or compaction install, Open, CreateColumnFamily or SetOptions never
+waits for an async fsync to complete on another thread, whatever the `IFileSystem` does asynchronously.
 
 The file layer (`Env/LocalFileSystem.cs`, `Env/UnixNative.cs`) uses `RandomAccess` on `SafeFileHandle`. Async reads
 first try `preadv2(RWF_NOWAIT)`: a page-cache hit completes synchronously, and only a miss goes to the asynchronous

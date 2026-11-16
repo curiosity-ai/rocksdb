@@ -128,7 +128,7 @@ internal sealed partial class DbImpl
         try
         {
             ulong number = Versions.NewFileNumber();
-            await AwaitIo(file.WriteToDbDirectoryAsync(FileSystem, DbName, number, ct), synchronous).ConfigureAwait(false);
+            await file.WriteToDbDirectoryAsync(FileSystem, DbName, number, synchronous, ct).ConfigureAwait(false);
             var existing = new List<(ulong Number, string Name)>();
             foreach (string child in FileSystem.GetChildren(DbName))
             {

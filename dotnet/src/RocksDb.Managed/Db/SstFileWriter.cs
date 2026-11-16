@@ -196,6 +196,11 @@ public sealed class SstFileWriter : IDisposable, IAsyncDisposable
     private SstFileWriter AddImpl(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value, EntryType type)
     {
         TableBuilder builder = _builder ?? throw RocksDbException.InvalidArgument("File is not opened");
+        // RocksDatabase.MaxKeyLength / MaxValueLength, as for a write (a deviation from upstream's uint32 limits).
+        if ((uint)userKey.Length > RocksDatabase.MaxKeyLength)
+            ThrowHelper.InvalidArgument("key is too large: " + userKey.Length + " bytes (the limit is " + RocksDatabase.MaxKeyLength + ")");
+        if ((uint)value.Length > RocksDatabase.MaxValueLength)
+            ThrowHelper.InvalidArgument("value is too large: " + value.Length + " bytes (the limit is " + RocksDatabase.MaxValueLength + ")");
         if (_numEntries > 0 && _ucmp.Compare(userKey, _largestKey.WrittenSpan) <= 0)
         {
             // Make sure that keys are added in order.

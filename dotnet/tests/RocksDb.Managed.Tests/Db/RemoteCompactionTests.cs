@@ -135,12 +135,21 @@ public sealed class RemoteCompactionTests
         public readonly List<CompactionServiceJobInfo> Infos = new();
         public readonly List<(string, CompactionServiceJobStatus)> Installed = new();
         public int Completed;
+        /// <summary>When set, WaitAsync awaits it before running the job (a worker that answers later).</summary>
+        public TaskCompletionSource? WaitGate;
+        /// <summary>Completed when WaitAsync is entered.</summary>
+        public readonly TaskCompletionSource WaitEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>When set, WaitAsync first awaits an incomplete task without ConfigureAwait(false).</summary>
+        public bool YieldWithCapturedContext;
+        public string? ScheduleThread;
+        public string? InstallThread;
 
         public override string Name => "InProcess";
 
         public override ValueTask<CompactionServiceScheduleResponse> ScheduleAsync(CompactionServiceJobInfo info, ReadOnlyMemory<byte> input,
             CancellationToken cancellationToken)
         {
+            ScheduleThread = Thread.CurrentThread.Name;
             lock (_jobs)
             {
                 Infos.Add(info);
@@ -154,6 +163,9 @@ public sealed class RemoteCompactionTests
         {
             byte[] input;
             lock (_jobs) input = _jobs[scheduledJobId];
+            WaitEntered.TrySetResult();
+            if (WaitGate is { } gate) await gate.Task.ConfigureAwait(false);
+            if (YieldWithCapturedContext) await Task.Delay(1); // deliberately without ConfigureAwait(false)
             if (ForcedWaitStatus is { } forced) return new CompactionServiceWaitResult(forced, null);
             try
             {
@@ -171,6 +183,7 @@ public sealed class RemoteCompactionTests
 
         public override void OnInstallation(string scheduledJobId, CompactionServiceJobStatus status)
         {
+            InstallThread = Thread.CurrentThread.Name;
             lock (Installed) Installed.Add((scheduledJobId, status));
         }
     }
@@ -225,6 +238,119 @@ public sealed class RemoteCompactionTests
         using RocksDatabase re = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator() });
         Assert.AreEqual("op0,op1,op2", GetString(re, "m"));
         Assert.AreEqual(S(Value(20, 2)), GetString(re, S(Key(20))!));
+    }
+
+    [TestMethod]
+    public async Task CompactRangeAsyncAwaitsTheService()
+    {
+        MemoryFileSystem fs = NewFs();
+        (RocksDatabase db, InProcessService svc) = Open(fs, autoCompactions: false);
+        using (db)
+        {
+            FillFiles(db, 3, 50);
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            svc.WaitGate = gate;
+            ValueTask compaction = db.CompactRangeAsync();
+            await svc.WaitEntered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            // The worker has not answered: the call is pending, holding no thread (the LOW thread that called the
+            // service returned to its pool).
+            Assert.IsFalse(compaction.IsCompleted);
+            Assert.AreEqual(0, svc.Completed);
+            Assert.IsTrue(svc.ScheduleThread?.StartsWith("rocksdb:low", StringComparison.Ordinal) == true, svc.ScheduleThread);
+            gate.SetResult();
+            await compaction.AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.AreEqual(1, svc.Completed);
+            Assert.AreEqual(CompactionServiceJobStatus.Success, svc.Installed[0].Item2);
+            // The installation continued on a compaction thread, not on the thread that completed the worker's task.
+            Assert.IsTrue(svc.InstallThread?.StartsWith("rocksdb:low", StringComparison.Ordinal) == true, svc.InstallThread);
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) Assert.AreEqual(6, f.Level);
+            Assert.AreEqual("op0,op1,op2", GetString(db, "m"));
+            Assert.AreEqual(S(Value(20, 2)), GetString(db, S(Key(20))!));
+        }
+    }
+
+    [TestMethod]
+    public async Task CompactRangeAsyncFallsBackToLocalAfterAnAsyncWait()
+    {
+        MemoryFileSystem fs = NewFs();
+        (RocksDatabase db, InProcessService svc) = Open(fs, autoCompactions: false);
+        using (db)
+        {
+            FillFiles(db, 2, 20);
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            svc.WaitGate = gate;
+            svc.ForcedWaitStatus = CompactionServiceJobStatus.UseLocal;
+            ValueTask compaction = db.CompactRangeAsync();
+            await svc.WaitEntered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.IsFalse(compaction.IsCompleted);
+            gate.SetResult();
+            await compaction.AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.AreEqual(0, svc.Completed);
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) Assert.AreEqual(6, f.Level);
+            Assert.AreEqual(S(Value(5, 1)), GetString(db, S(Key(5))!));
+        }
+    }
+
+    [TestMethod]
+    public void SyncCompactRangeOnASingleThreadedContextDoesNotDeadlock()
+    {
+        MemoryFileSystem fs = NewFs();
+        (RocksDatabase db, InProcessService svc) = Open(fs, autoCompactions: false);
+        using (db)
+        {
+            FillFiles(db, 3, 50);
+            svc.YieldWithCapturedContext = true;
+            var context = new QueueingSynchronizationContext();
+            Exception? failure = null;
+            var caller = new Thread(() =>
+            {
+                SynchronizationContext.SetSynchronizationContext(context);
+                try
+                {
+                    // The service's continuation would be posted to this context, which nobody pumps while the call blocks.
+                    db.CompactRange();
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                }
+            }) { IsBackground = true, Name = "single-threaded-context" };
+            caller.Start();
+            bool finished = caller.Join(TimeSpan.FromSeconds(30));
+            if (!finished)
+            {
+                // Unblock the deadlocked call so the DB can close, then fail.
+                context.RunPosted();
+                caller.Join(TimeSpan.FromSeconds(30));
+            }
+            Assert.IsTrue(finished, "CompactRange deadlocked on the caller's SynchronizationContext");
+            Assert.IsNull(failure, failure?.ToString());
+            Assert.AreEqual(0, context.PostedCount);
+            Assert.AreEqual(1, svc.Completed);
+            Assert.AreEqual("op0,op1,op2", GetString(db, "m"));
+        }
+    }
+
+    /// <summary>A single-threaded context (UI / legacy ASP.NET style) that runs posted callbacks only when pumped.</summary>
+    private sealed class QueueingSynchronizationContext : SynchronizationContext
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<(SendOrPostCallback, object?)> _posted = new();
+        private int _postedCount;
+
+        public int PostedCount => Volatile.Read(ref _postedCount);
+
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref _postedCount);
+            _posted.Enqueue((d, state));
+        }
+
+        public override void Send(SendOrPostCallback d, object? state) => throw new NotSupportedException();
+
+        public void RunPosted()
+        {
+            while (_posted.TryDequeue(out (SendOrPostCallback Callback, object? State) item)) item.Callback(item.State);
+        }
     }
 
     [TestMethod]
