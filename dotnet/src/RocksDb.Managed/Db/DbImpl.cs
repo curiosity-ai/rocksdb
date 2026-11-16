@@ -327,6 +327,65 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Port of DBImpl::CleanupIteratorSuperVersion (db/db_impl/db_impl.cc), the release of an iterator's super version:
+    /// unlike a point read's release (ReturnAndCleanupSuperVersion, which leaves the files the dropped version made
+    /// obsolete for the next flush, compaction or close), the last reference also runs FindObsoleteFiles +
+    /// PurgeObsoleteFiles, so the inputs of a compaction that finished while the iterator was open are deleted when it
+    /// is released. With <paramref name="backgroundPurge"/> (ReadOptions::background_purge_on_iterator_cleanup) or
+    /// avoid_unnecessary_blocking_io the purge runs on a background thread (SchedulePurge). Nothing is purged once the
+    /// DB is closing (the close purges, and an iterator that outlives its DB must not touch the directory).
+    /// </summary>
+    internal void ReturnIteratorSuperVersion(SuperVersion sv, bool backgroundPurge)
+    {
+        if (!sv.Unref()) return;
+        lock (_mutex)
+        {
+            CleanupSuperVersion(sv);
+            if (_closing || IsDisposed) return;
+            if (backgroundPurge || Options.AvoidUnnecessaryBlockingIo)
+            {
+                // SchedulePurge (bg_purge_scheduled_): the close waits for it like for any background job.
+                _backgroundJobs++;
+                BackgroundThreadPool.High.Schedule(new PurgeRun(this));
+                return;
+            }
+        }
+        PurgeObsoleteFilesQuietly();
+    }
+
+    /// <summary>BGWorkPurge: a purge scheduled by <see cref="ReturnIteratorSuperVersion"/>.</summary>
+    private sealed class PurgeRun(DbImpl db) : IThreadPoolWorkItem
+    {
+        public void Execute()
+        {
+            try
+            {
+                db.PurgeObsoleteFilesQuietly();
+            }
+            finally
+            {
+                lock (db._mutex)
+                {
+                    db._backgroundJobs--;
+                    db.SignalBackgroundWork();
+                }
+            }
+        }
+    }
+
+    /// <summary>PurgeObsoleteFiles, best effort (deleting obsolete files never fails the caller).</summary>
+    private void PurgeObsoleteFilesQuietly()
+    {
+        try
+        {
+            PurgeObsoleteFiles();
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+        }
+    }
+
     /// <summary>Releases what a dead super version referenced (SuperVersion::Cleanup). REQUIRES: mutex.</summary>
     internal void CleanupSuperVersion(SuperVersion sv)
     {

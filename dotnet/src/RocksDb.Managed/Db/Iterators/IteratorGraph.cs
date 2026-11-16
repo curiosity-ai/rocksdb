@@ -428,12 +428,13 @@ internal sealed class IteratorGraph : IDisposable
         ParkChildren();
         SuperVersion? sv = _sv;
         Snapshot? own = _ownedSnapshot;
+        bool backgroundPurge = _options?.BackgroundPurgeOnIteratorCleanup ?? false;
         _sv = null;
         _ownedSnapshot = null;
         _callback = null;
         _options = null;
         _hasTombstones = false;
-        if (sv is not null) _db.ReturnSuperVersion(sv);
+        if (sv is not null) _db.ReturnIteratorSuperVersion(sv, backgroundPurge);
         own?.Dispose();
     }
 

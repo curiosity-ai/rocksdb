@@ -99,7 +99,7 @@ internal sealed partial class DbImpl
             MemTables = mems,
             Levels = levels,
             TableCache = cfd.TableCache,
-            Cleanup = new SuperVersionRelease(this, sv, null),
+            Cleanup = new SuperVersionRelease(this, sv, null, backgroundPurge: false),
         };
     }
 }
