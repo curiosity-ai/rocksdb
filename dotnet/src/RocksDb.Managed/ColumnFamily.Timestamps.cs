@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
 
@@ -45,8 +46,7 @@ public sealed partial class ColumnFamily
         try
         {
             EncodeWithTimestamp(b, op, key, timestamp, value);
-            ValueTask t = _db.WriteAsync(options, b, validateColumnFamilies: false, synchronous: true, CancellationToken.None);
-            t.GetAwaiter().GetResult();
+            SyncValueTask.GetResult(_db.WriteAsync(options, b, validateColumnFamilies: false, synchronous: true, CancellationToken.None));
         }
         finally
         {
@@ -213,7 +213,7 @@ public sealed partial class ColumnFamily
     public void IncreaseFullHistoryTsLow(ReadOnlySpan<byte> tsLow)
     {
         _db.ThrowIfDisposed();
-        _db.IncreaseFullHistoryTsLowAsync(_cfd, tsLow.ToArray(), synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.IncreaseFullHistoryTsLowAsync(_cfd, tsLow.ToArray(), synchronous: true, CancellationToken.None));
     }
 
     /// <summary>

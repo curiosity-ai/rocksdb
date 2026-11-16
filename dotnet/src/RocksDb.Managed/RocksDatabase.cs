@@ -1,6 +1,7 @@
 using System.Buffers;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
 
@@ -159,7 +160,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void DropColumnFamily(ColumnFamily columnFamily)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
-        _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None));
         ReleaseHandle(columnFamily);
     }
 
@@ -220,7 +221,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void Write(WriteBatch batch) => Write(null, batch);
 
     public void Write(WriteOptions? options, WriteBatch batch) =>
-        _db.WriteAsync(options, batch, validateColumnFamilies: true, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.WriteAsync(options, batch, validateColumnFamilies: true, synchronous: true, CancellationToken.None));
 
     public ValueTask WriteAsync(WriteBatch batch, CancellationToken cancellationToken = default) => WriteAsync(null, batch, cancellationToken);
 
@@ -235,7 +236,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// (NotSupported) on WritePrepared / WriteUnprepared transaction DBs.
     /// </summary>
     public void WriteWithCallback(WriteOptions? options, WriteBatch batch, UserWriteCallback callback) =>
-        _db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None));
 
     /// <summary>Asynchronous <see cref="WriteWithCallback(WriteOptions?, WriteBatch, UserWriteCallback)"/>.</summary>
     public ValueTask WriteWithCallbackAsync(WriteOptions? options, WriteBatch batch, UserWriteCallback callback, CancellationToken cancellationToken = default) =>
@@ -280,7 +281,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// Waits until all scheduled flushes and compactions (of every column family) have finished and no automatic
     /// compaction is pending (DB::WaitForCompact with default options).
     /// </summary>
-    public void WaitForCompact() => _db.WaitForCompactAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+    public void WaitForCompact() => SyncValueTask.GetResult(_db.WaitForCompactAsync(synchronous: true, CancellationToken.None));
 
     /// <summary>Async <see cref="WaitForCompact"/>.</summary>
     public ValueTask WaitForCompactAsync(CancellationToken cancellationToken = default) => _db.WaitForCompactAsync(synchronous: false, cancellationToken);

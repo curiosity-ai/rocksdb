@@ -1,5 +1,6 @@
 using System.Buffers;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Utilities.Transactions;
 
@@ -90,7 +91,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
     {
         if (_writeBatchFlushThreshold > 0 && _batch.Count > 0 && _batch.DataSize > _writeBatchFlushThreshold)
         {
-            FlushWriteBatchToDb(prepared: false, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            SyncValueTask.GetResult(FlushWriteBatchToDb(prepared: false, synchronous: true, CancellationToken.None));
         }
     }
 
@@ -401,7 +402,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         {
             try
             {
-                RollbackInternalAsync(synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+                SyncValueTask.GetResult(RollbackInternalAsync(synchronous: true, CancellationToken.None));
                 _db.MarkLogAsHavingPrepSectionFlushed(_logNumber);
             }
             catch (Exception e) when (e is RocksDbException or ObjectDisposedException or IOException)
@@ -453,7 +454,7 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         WriteRollbackKeys(trackedKeys, restore, callback, options);
         var copy = new SavePointBatchHandler(_batch);
         restore.WriteBatch.Iterate(ref copy);
-        FlushWriteBatchToDbInternal(prepared: false, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(FlushWriteBatchToDbInternal(prepared: false, synchronous: true, CancellationToken.None));
         // PessimisticTransaction::RollbackToSavePoint will call also RollbackToSavePoint on write_batch_. Make sure we
         // have a savepoint there to roll back to.
         _batch.SetSavePoint();

@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Db.Iterators;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
 
@@ -53,8 +54,7 @@ public sealed partial class ColumnFamily
         try
         {
             Encode(b, op, key, value);
-            ValueTask t = _db.WriteAsync(options, b, validateColumnFamilies: false, synchronous: true, CancellationToken.None);
-            t.GetAwaiter().GetResult();
+            SyncValueTask.GetResult(_db.WriteAsync(options, b, validateColumnFamilies: false, synchronous: true, CancellationToken.None));
         }
         finally
         {
@@ -328,13 +328,13 @@ public sealed partial class ColumnFamily
         if (batch.Count == 0) return;
         if (_db.Stats is null)
         {
-            _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            SyncValueTask.GetResult(_db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None));
             return;
         }
         int activity = Monitoring.FileReadActivity.Enter(Histogram.FileReadMultigetMicros);
         try
         {
-            _db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            SyncValueTask.GetResult(_db.MultiGetAsync(_cfd, options, batch, synchronous: true, CancellationToken.None));
         }
         finally
         {
@@ -489,7 +489,7 @@ public sealed partial class ColumnFamily
     public void Flush(FlushOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _db.FlushColumnFamilyAsync(_cfd, options.Wait, FlushReason.ManualFlush, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.FlushColumnFamilyAsync(_cfd, options.Wait, FlushReason.ManualFlush, synchronous: true, CancellationToken.None));
     }
 
     public ValueTask FlushAsync(CancellationToken cancellationToken = default) => FlushAsync(s_waitFlush, cancellationToken);
@@ -519,7 +519,7 @@ public sealed partial class ColumnFamily
     public void CompactRange(CompactRangeOptions options, byte[]? begin, byte[]? end)
     {
         ArgumentNullException.ThrowIfNull(options);
-        _db.CompactRangeAsync(_cfd, begin, end, options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(_db.CompactRangeAsync(_cfd, begin, end, options, synchronous: true, CancellationToken.None));
     }
 
     /// <summary>Async <see cref="CompactRange()"/>: the compaction runs on a background thread.</summary>
@@ -562,7 +562,7 @@ public sealed partial class ColumnFamily
     public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel)
     {
         ArgumentNullException.ThrowIfNull(options);
-        return _db.CompactFilesAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        return SyncValueTask.GetResult(_db.CompactFilesAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: true, CancellationToken.None));
     }
 
     /// <summary>
@@ -574,8 +574,8 @@ public sealed partial class ColumnFamily
     public IReadOnlyList<string> CompactFiles(CompactFilesOptions options, IEnumerable<ulong> inputFileNumbers, int outputLevel, out CompactionJobInfo? jobInfo)
     {
         ArgumentNullException.ThrowIfNull(options);
-        (List<string> files, CompactionJobInfo? info) = _db.CompactFilesWithJobInfoAsync(_cfd, options, inputFileNumbers, outputLevel, synchronous: true,
-            CancellationToken.None).GetAwaiter().GetResult();
+        (List<string> files, CompactionJobInfo? info) = SyncValueTask.GetResult(_db.CompactFilesWithJobInfoAsync(_cfd, options, inputFileNumbers, outputLevel,
+            synchronous: true, CancellationToken.None));
         jobInfo = info;
         return files;
     }

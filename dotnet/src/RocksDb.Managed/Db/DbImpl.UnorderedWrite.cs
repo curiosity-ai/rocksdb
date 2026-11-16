@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
@@ -63,14 +64,14 @@ internal sealed partial class DbImpl
                 if (state == WriteThread.StateGroupLeader)
                 {
                     ValueTask lead = LeadUnorderedWalGroupAsync(w, synchronous, cancellationToken);
-                    if (synchronous) lead.GetAwaiter().GetResult();
+                    if (synchronous) SyncValueTask.GetResult(lead);
                     else await lead.ConfigureAwait(false);
                 }
             }
             else
             {
                 ValueTask lead = LeadUnorderedWalGroupAsync(w, synchronous, cancellationToken);
-                if (synchronous) lead.GetAwaiter().GetResult();
+                if (synchronous) SyncValueTask.GetResult(lead);
                 else await lead.ConfigureAwait(false);
             }
             // The group counted this writer in pending_memtable_writes_ iff it should write to the memtables; nothing

@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using RocksDb.Managed.Db;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed;
 
@@ -94,7 +95,7 @@ public sealed partial class RocksDatabase
         try
         {
             b.PutAttributeGroups(key, attributeGroups);
-            _db.WriteAsync(options, b, validateColumnFamilies: true, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+            SyncValueTask.GetResult(_db.WriteAsync(options, b, validateColumnFamilies: true, synchronous: true, CancellationToken.None));
         }
         finally
         {
@@ -168,7 +169,7 @@ public sealed partial class RocksDatabase
                     RocksDbException? callError = null;
                     try
                     {
-                        _db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+                        SyncValueTask.GetResult(_db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: true, CancellationToken.None));
                     }
                     catch (RocksDbException e)
                     {
@@ -261,7 +262,7 @@ public sealed partial class RocksDatabase
                     RocksDbException? callError = null;
                     try
                     {
-                        _db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+                        SyncValueTask.GetResult(_db.MultiGetAsync(cf.Data, ro, snap, scratch.Batch, synchronous: true, CancellationToken.None));
                     }
                     catch (RocksDbException e)
                     {

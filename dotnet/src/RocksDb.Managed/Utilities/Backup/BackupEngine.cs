@@ -50,7 +50,7 @@ public sealed class BackupEngine : BackupEngineReadOnly
 
     /// <summary>Creates a backup carrying <paramref name="appMetadata"/> (at most 1 MiB, UTF-8).</summary>
     public uint CreateNewBackupWithMetadata(RocksDatabase db, string appMetadata, CreateBackupOptions options) =>
-        CreateCoreAsync(db, appMetadata, options, synchronous: true, CancellationToken.None).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(CreateCoreAsync(db, appMetadata, options, synchronous: true, CancellationToken.None));
 
     public ValueTask<uint> CreateNewBackupAsync(RocksDatabase db, bool flushBeforeBackup, CancellationToken cancellationToken = default) =>
         CreateNewBackupAsync(db, new CreateBackupOptions { FlushBeforeBackup = flushBeforeBackup }, cancellationToken);

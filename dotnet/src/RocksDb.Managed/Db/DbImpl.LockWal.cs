@@ -1,3 +1,5 @@
+using RocksDb.Managed.Util;
+
 namespace RocksDb.Managed.Db;
 
 /// <summary>
@@ -63,7 +65,7 @@ internal sealed partial class DbImpl
     {
         // A FlushWAL / SyncWAL called while the WAL is locked uses the WAL outside the write thread, under the WAL I/O
         // lock: the write stop is released only once none is in flight (the stalled writers append to the same WAL).
-        AcquireWalIoLockAsync(synchronous: true).GetAwaiter().GetResult();
+        SyncValueTask.GetResult(AcquireWalIoLockAsync(synchronous: true));
         try
         {
             lock (_mutex)
