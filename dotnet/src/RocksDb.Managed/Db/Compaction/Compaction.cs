@@ -491,7 +491,15 @@ internal sealed class Compaction
             return false;
         if (OutputLevel + 1 < NumberLevels)
         {
-            SstPartitioner? partitioner = CreateSstPartitioner();
+            SstPartitioner? partitioner;
+            try
+            {
+                partitioner = CreateSstPartitioner();
+            }
+            catch (Exception e)
+            {
+                return TrivialMoveCheckFailed(e);
+            }
             var grandparents = new List<FileMetaData>();
             foreach (FileMetaData file in _inputs[0].Files)
             {
@@ -500,16 +508,37 @@ internal sealed class Compaction
                 ulong size = file.FileSize;
                 foreach (FileMetaData g in grandparents) size += g.FileSize;
                 if (size > MaxCompactionBytes) return false;
-                if (partitioner is not null
-                    && !partitioner.CanDoTrivialMove(DbFormat.ExtractUserKey(file.Smallest), DbFormat.ExtractUserKey(file.Largest)))
+                if (partitioner is null) continue;
+                bool allowed;
+                try
                 {
-                    return false;
+                    allowed = partitioner.CanDoTrivialMove(DbFormat.ExtractUserKey(file.Smallest), DbFormat.ExtractUserKey(file.Largest));
                 }
+                catch (Exception e)
+                {
+                    return TrivialMoveCheckFailed(e);
+                }
+                if (!allowed) return false;
             }
         }
         // PerKeyPlacement compaction should never be trivial move.
         if (SupportsPerKeyPlacement) return false;
         return true;
+    }
+
+    /// <summary>
+    /// The exception a user SST partitioner (factory) threw while <see cref="IsTrivialMove"/> consulted it, or null.
+    /// Upstream's SstPartitioner cannot fail; IsTrivialMove runs under the DB mutex from the compaction scheduler
+    /// (EnoughRoomForCompaction, the bottom-priority forwarding check) and from property reads, where an exception would
+    /// leave a registered compaction half scheduled. The check answers "not a trivial move" instead and the compaction
+    /// job rethrows this exception when it runs, so it fails like any other user-callback failure of the job.
+    /// </summary>
+    internal Exception? PartitionerFailure { get; private set; }
+
+    private bool TrivialMoveCheckFailed(Exception e)
+    {
+        PartitionerFailure ??= e;
+        return false;
     }
 
     /// <summary>Port of Compaction::AddInputDeletions.</summary>
@@ -656,8 +685,13 @@ internal sealed class Compaction
     public CompactionFilter? CreateCompactionFilter(uint columnFamilyId)
     {
         if (Options.CompactionFilter is { } f) return f;
-        if (Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: false)) return null;
-        return factory.CreateCompactionFilter(new CompactionFilterContext(IsFullCompaction, IsManual, columnFamilyId, IsFlush: false));
+        if (Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(TableFileCreationReason.Compaction)) return null;
+        // Compaction::CreateCompactionFilter: input_start_level = start_level_, reason = kCompaction (input_table_properties
+        // is not offered).
+        return factory.CreateCompactionFilter(new CompactionFilterContext(IsFullCompaction, IsManual, columnFamilyId, IsFlush: false)
+        {
+            InputStartLevel = StartLevel,
+        });
     }
 
     /// <summary>Compaction::InputLevelSummary, e.g. "3@0 + 2@1 files to L1".</summary>

@@ -276,7 +276,22 @@ internal sealed partial class DbImpl
         }
         Stats?.RecordTick(Ticker.RemoteCompactReadBytes, result.BytesRead);
         Stats?.RecordTick(Ticker.RemoteCompactWriteBytes, result.BytesWritten);
-        service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.Success);
+        try
+        {
+            service.OnInstallation(response.ScheduledJobId, CompactionServiceJobStatus.Success);
+        }
+        catch
+        {
+            // A user OnInstallation that throws (upstream's returns void) fails the job before its outputs are installed:
+            // the imported files are not handed to the caller, so they are removed here instead of staying pending
+            // outputs until the next open.
+            foreach (ulong n in outcome.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+            lock (_mutex)
+            {
+                foreach (ulong n in outcome.CreatedFileNumbers) _pendingOutputs.Remove(n);
+            }
+            throw;
+        }
         return outcome;
     }
 
