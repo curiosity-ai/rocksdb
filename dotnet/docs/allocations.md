@@ -13,10 +13,10 @@ steady state, including background flush and compaction work, with 16-byte keys 
 
 | Area | Allocation-free (0 B/op) | Allocates | Instead |
 |---|---|---|---|
-| Point reads | `TryGet(key, Span<byte>, out len)`, `TryGet(key, IBufferWriter<byte>)`, `Get<TState,TResult>(key, state, callback)`, `GetPooled` + `Dispose`, `ContainsKey`, `KeyMayExist`, the async versions of each | `byte[]? Get` / `GetAsync` (the value array: 128 B for 100 B) | the span / writer / callback / pooled variants |
+| Point reads | `TryGet(key, Span<byte>, out len)`, `TryGet(key, IBufferWriter<byte>)`, `Get<TState,TResult>(key, state, callback)`, `ContainsKey`, `KeyMayExist`, the async versions of each | `byte[]? Get` / `GetAsync` (the value array: 128 B for 100 B), `GetPooled` (32 B: the `PooledValue` handle; the value buffer is pooled) | the span / writer / callback / pooled variants |
 | Batched reads | `MultiGetBatch` reused with `Clear()`, `MultiGet` / `MultiGetAsync` / `MultiGetEntity`; `MultiGet(options, keys, values, valueRanges, statuses)` into caller memory and its async version | `byte[]?[] MultiGet(IReadOnlyList<byte[]>)` (the result arrays: 2.2 KB per 16 values of 100 B) | a reused `MultiGetBatch` or the caller-memory `MultiGet` |
 | Writes | `Put` / `Delete` / `SingleDelete` / `Merge` / `PutEntity` with spans, and their async versions (0.0-0.3 B/op on the calling thread) | none on the caller; background work adds 1-3 B/op, see [Writes](#writes) | |
-| Write batches | `db.CreateWriteBatch()` / `db.CreateWriteBatchWithIndex()` + `using`; one batch reused with `Clear()`; `WriteAsync` | `new WriteBatch()` that is never disposed (2.2 KB per batch); `new WriteBatchWithIndex()` per batch (1.1 KB) | `CreateWriteBatch` / `CreateWriteBatchWithIndex`, or `Clear()` |
+| Write batches | one batch reused with `Clear()`; `WriteAsync` | `db.CreateWriteBatch()` + `using` (88 B: the batch object; its buffer is pooled), `db.CreateWriteBatchWithIndex()` + `using` (152 B: the batch objects; index and buffer pooled), `new WriteBatch()` that is never disposed (2.2 KB per batch), `new WriteBatchWithIndex()` per batch (1.1 KB) | `Clear()`, or `CreateWriteBatch` / `CreateWriteBatchWithIndex` |
 | Iterators | a reused `Iterator`: `Seek` / `SeekForPrev` / `Next` / `Prev` / `Key` / `Value` / `Columns`, async moves, `foreach` over `Range(...)`, `ScanAsync`, `Refresh`, `SetBounds` | `NewIterator` / `NewIteratorAsync` + `Dispose` (56 B: the iterator handle), a `new ReadOptions` per scan (184 B) | reuse one iterator with `SetBounds` / `Refresh`, or one `ReadOptions` |
 | Wide columns | `TryGetEntity(key, WideColumns)` and `TryGetEntityLazy(options, key, LazyWideColumns)` with a reused result, `MultiGetEntity`, `Iterator.Columns` | `GetEntity` (312 B), `GetEntityLazy` (1 KB) | `TryGetEntity` / `TryGetEntityLazy` with a reused result |
 | Transactions | `BeginTransaction(writeOptions, options, oldTransaction)` + `SetName` / `Put` / `TryGetForUpdate` / `TryGet` / `Prepare` / `Commit` (sync and async, pessimistic and optimistic) | `using BeginTransaction(writeOptions)` per transaction (the transaction object, 350-470 B) | reuse the transaction object |
@@ -42,7 +42,7 @@ if (db.TryGet(key, writer)) Use(writer.WrittenSpan);
 //    Use a static lambda and pass state explicitly, so no closure is allocated.
 long counter = db.Get(key, 0, static (value, _) => BinaryPrimitives.ReadInt64LittleEndian(value));
 
-// 4. A pooled copy you own until Dispose.
+// 4. A copy in a pooled buffer, yours until Dispose (32 B for the PooledValue handle).
 using (PooledValue? v = db.GetPooled(key))
     if (v is not null) Use(v.Span);
 ```
@@ -116,7 +116,7 @@ Write options: reuse `WriteOptions` instances (`WriteOptions.SyncWrites` is a sh
 ### Write batches
 
 ```csharp
-// Pooled: Dispose returns the batch (and its buffer) to a process-wide pool.
+// Pooled buffer: Dispose returns it to a process-wide pool (the batch object is new: 88 B).
 using (WriteBatch batch = db.CreateWriteBatch())
 {
     batch.Put(k1, v1).Delete(k2).Merge(cf, k3, v3);
@@ -129,16 +129,17 @@ batch.Put(k1, v1);
 db.Write(batch);
 ```
 
-Both patterns cost the same as single writes (about 3 B per Put, all of it background). `new WriteBatch()` is fine if
-you dispose it. A batch that is dropped without `Dispose` takes its pooled buffer with it, which costs about 2.2 KB per
-batch.
+A reused batch costs the same as single writes (about 3 B per Put, all of it background); a rented one adds its 88-byte
+batch object (the buffer is pooled). `new WriteBatch()` is fine if you dispose it. A batch that is dropped without
+`Dispose` takes its pooled buffer with it, which costs about 2.2 KB per batch.
 
-`WriteBatchWithIndex` works the same way: take a pooled one per batch, or keep one and call `Clear()` (both about 3 B
-per Put, all of it background). `new WriteBatchWithIndex()` per batch builds its index from scratch (1.1 KB).
+`WriteBatchWithIndex` works the same way: keep one and call `Clear()` (about 3 B per Put, all of it background), or
+rent one per batch (its index state and buffer are pooled; the `WriteBatchWithIndex` and `WriteBatch` objects add
+152 B). `new WriteBatchWithIndex()` per batch builds its index from scratch (1.1 KB).
 `TryGetFromBatchAndDB(db, key, writer)` allocates nothing.
 
 ```csharp
-// Pooled (bytewise order; pass overwriteKey: true for overwrite_key mode). Dispose returns it to the pool.
+// Pooled index and buffer (bytewise order; pass overwriteKey: true for overwrite_key mode). Dispose returns them.
 using (WriteBatchWithIndex wbwi = db.CreateWriteBatchWithIndex())     // or WriteBatchWithIndex.Rent()
 {
     wbwi.Put(k1, v1);
@@ -147,9 +148,10 @@ using (WriteBatchWithIndex wbwi = db.CreateWriteBatchWithIndex())     // or Writ
 }
 ```
 
-A pooled batch must not be used after `Dispose`, nor the `WriteBatch` or iterators taken from it: a call on it while
-it sits in the pool throws `ObjectDisposedException`, but once another caller has rented it again, a stale reference
-would see that caller's batch.
+After `Dispose`, a rented batch, the `WriteBatch` taken from a `WriteBatchWithIndex` and its iterators throw
+`ObjectDisposedException`, and a second `Dispose` does nothing. Only the buffers and index state are pooled, never the
+objects handed out, so a reference kept after `Dispose` cannot reach the batch another caller rented later. The same
+holds for `PooledValue`.
 
 ### Range deletions
 

@@ -582,17 +582,24 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
     public void Write(WriteOptions? options, WriteBatch batch)
     {
         ArgumentNullException.ThrowIfNull(batch);
-        using WriteBatch rewritten = WriteBatch.Rent();
-        var h = new TimestampAppender(rewritten, Now);
-        batch.Iterate(ref h);
-        _db.Write(options, rewritten);
+        WriteBatch rewritten = WriteBatch.RentInternal();
+        try
+        {
+            var h = new TimestampAppender(rewritten, Now);
+            batch.Iterate(ref h);
+            _db.Write(options, rewritten);
+        }
+        finally
+        {
+            WriteBatch.ReturnInternal(rewritten);
+        }
     }
 
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder))]
     public async ValueTask WriteAsync(WriteOptions? options, WriteBatch batch, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(batch);
-        WriteBatch rewritten = WriteBatch.Rent();
+        WriteBatch rewritten = WriteBatch.RentInternal();
         try
         {
             var h = new TimestampAppender(rewritten, Now);
@@ -601,7 +608,7 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
         }
         finally
         {
-            rewritten.Dispose();
+            WriteBatch.ReturnInternal(rewritten);
         }
     }
 
@@ -633,16 +640,23 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
     /// <summary>DBWithTTLImpl::Put / Merge / Delete: a one-entry batch through <see cref="Write(WriteOptions?, WriteBatch)"/>.</summary>
     internal void WriteOne(WriteOptions? options, uint cf, byte op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        using WriteBatch b = WriteBatch.Rent();
-        AppendOne(b, cf, op, key, value, Now);
-        _db.Write(options, b);
+        WriteBatch b = WriteBatch.RentInternal();
+        try
+        {
+            AppendOne(b, cf, op, key, value, Now);
+            _db.Write(options, b);
+        }
+        finally
+        {
+            WriteBatch.ReturnInternal(b);
+        }
     }
 
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(System.Runtime.CompilerServices.PoolingAsyncValueTaskMethodBuilder))]
     internal async ValueTask WriteOneAsync(WriteOptions? options, uint cf, byte op, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value,
         CancellationToken cancellationToken)
     {
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             AppendOne(b, cf, op, key.Span, value.Span, Now);
@@ -650,7 +664,7 @@ public sealed class TtlDatabase : IDisposable, IAsyncDisposable
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 

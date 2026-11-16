@@ -680,44 +680,105 @@ public sealed class Audit7ApiEdgeCasesTests
     }
 
     // ---------------------------------------------------------------------------------------------------------
-    // Stale references to pooled objects (no native counterpart: C++ has no pool; a delete'd WriteBatch or a
-    // destroyed PinnableSlice is gone, and touching it again is undefined behaviour)
+    // Stale references to pooled objects. No native counterpart: C++ has no pool -- a WriteBatch / WriteBatchWithIndex
+    // is a plain object deleted once (a second delete or a use after delete is undefined behaviour) and a PinnableSlice
+    // releases its pinned buffer once (Reset). The port pools only the buffers / index state behind a new public object
+    // per rent, so a reference kept after Dispose throws ObjectDisposedException and never reaches the next renter.
     // ---------------------------------------------------------------------------------------------------------
 
-    /// <summary>
-    /// A rented WriteBatch is one object for its renter and every later renter: a Dispose (or Put) through a reference
-    /// kept after the first Dispose acts on whoever rented the object next. Here B's record is silently dropped (B is
-    /// cleared and pooled while B still uses it). Open: the handle itself is the pooled object, so a stale reference
-    /// cannot be told apart from the new renter without pooling only the rep behind a fresh handle (one small object
-    /// per Rent) -- an API / allocation decision.
-    /// </summary>
-    [TestMethod]
-    [Ignore("audit #7 open: a stale Dispose of a pooled WriteBatch after re-rent clears and re-pools the next renter's batch")]
-    public void StaleWriteBatchDisposeAfterReRentDoesNotTouchTheNextRenter()
+    /// <summary>Disposes <paramref name="d"/> from several threads at once (released together by a barrier).</summary>
+    private static void RaceDispose(IDisposable d, int threads)
     {
-        // The pool is process-wide: the Rent after a Dispose on this thread returns the same object unless another
-        // test thread interleaves (the assertion below checks it).
-        WriteBatch a = WriteBatch.Rent();
-        a.Dispose();
-        WriteBatch b = WriteBatch.Rent();
-        Assert.AreSame(a, b, "the pool handed out another object; the repro needs the same one");
-        b.Put(B("k"), B("v"));
-        a.Dispose(); // stale: must not affect b
-        Assert.AreEqual(1, b.Count);
-        WriteBatch c = WriteBatch.Rent();
-        Assert.AreNotSame(b, c, "b is still in use but was handed out again");
-        c.Dispose();
-        b.Dispose();
+        using var barrier = new Barrier(threads);
+        var tasks = new Task[threads];
+        for (int t = 0; t < threads; t++)
+        {
+            tasks[t] = Task.Factory.StartNew(() =>
+            {
+                barrier.SignalAndWait();
+                d.Dispose();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+        Task.WaitAll(tasks);
     }
 
     /// <summary>
-    /// PooledValue: a Dispose through a stale reference after the object was handed out again (GetPooled) returns the
-    /// new holder's buffer to the array pool while the new holder still reads it. Open for the same reason as
-    /// <see cref="StaleWriteBatchDisposeAfterReRentDoesNotTouchTheNextRenter"/>.
+    /// WriteBatch: rent A, dispose A, rent B, dispose A again: B keeps its records and writes them (the old pooled
+    /// object was the same instance for A and B, so the stale Dispose cleared B and pooled it while in use).
     /// </summary>
     [TestMethod]
-    [Ignore("audit #7 open: a stale Dispose of a PooledValue after re-rent returns the next holder's buffer")]
-    public void StalePooledValueDisposeAfterReRentDoesNotTouchTheNextHolder()
+    public void StaleWriteBatchDisposeDoesNotTouchTheNextRenter()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        WriteBatch a = db.CreateWriteBatch();
+        a.Put(B("a"), B("1"));
+        a.Dispose();
+        WriteBatch b = db.CreateWriteBatch();
+        Assert.AreNotSame(a, b);
+        b.Put(B("b"), B("2"));
+        a.Dispose(); // stale
+        Assert.ThrowsExactly<ObjectDisposedException>(() => a.Put(B("x"), B("y")));
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = a.Count);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = a.Data.Length);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => db.Write(a));
+        WriteBatch c = db.CreateWriteBatch(); // must not get b's rep
+        c.Put(B("c"), B("3"));
+        Assert.AreEqual(1, b.Count);
+        db.Write(b);
+        b.Dispose();
+        c.Dispose();
+        Assert.AreEqual("2", GetString(db, "b"));
+        Assert.IsNull(GetString(db, "a"));
+        Assert.IsNull(GetString(db, "c"));
+    }
+
+    /// <summary>WriteBatch: a Dispose race returns the rep once, so later renters never share a rep.</summary>
+    [TestMethod]
+    public void WriteBatchDisposeRaceReturnsTheRepOnce()
+    {
+        for (int round = 0; round < 200; round++)
+        {
+            WriteBatch w = WriteBatch.Rent();
+            w.Put(B("k"), B("v"));
+            RaceDispose(w, 4);
+        }
+        var held = new List<WriteBatch>();
+        for (int i = 0; i < 300; i++)
+        {
+            WriteBatch b = WriteBatch.Rent();
+            b.Put(Key(i), Value(i, 0));
+            held.Add(b);
+        }
+        for (int i = 0; i < held.Count; i++)
+        {
+            Assert.AreEqual(1, held[i].Count, "batch " + i);
+            foreach (WriteBatchEntry e in held[i]) CollectionAssert.AreEqual(Key(i), e.Key.ToArray());
+        }
+        foreach (WriteBatch b in held) b.Dispose();
+    }
+
+    /// <summary>
+    /// The engine's own single-key writes use a separate internal pool of whole batches: a user's stale reference to a
+    /// rented batch cannot reach them either (db.Put after a stale Dispose still writes).
+    /// </summary>
+    [TestMethod]
+    public void StaleWriteBatchCannotReachInternalWrites()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        WriteBatch a = db.CreateWriteBatch();
+        a.Dispose();
+        db.Put(B("p"), B("1"));
+        a.Dispose();
+        db.Put(B("q"), B("2"));
+        Assert.AreEqual("1", GetString(db, "p"));
+        Assert.AreEqual("2", GetString(db, "q"));
+    }
+
+    /// <summary>PooledValue: a stale Dispose after another GetPooled leaves the new value's buffer alone.</summary>
+    [TestMethod]
+    public void StalePooledValueDisposeDoesNotTouchTheNextHolder()
     {
         MemoryFileSystem fs = NewFs();
         using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
@@ -726,10 +787,150 @@ public sealed class Audit7ApiEdgeCasesTests
         PooledValue a = db.GetPooled(B("a"))!;
         a.Dispose();
         PooledValue b = db.GetPooled(B("b"))!;
-        Assert.AreSame(a, b, "the pool handed out another object; the repro needs the same one");
-        a.Dispose(); // stale: must not affect b
+        Assert.AreNotSame(a, b);
+        a.Dispose(); // stale
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = a.Length);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = a.Memory);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => a.ToArray());
+        using PooledValue c = db.GetPooled(B("a"))!;
         Assert.AreEqual(6, b.Length);
         Assert.AreEqual("second", S(b.ToArray()));
+        Assert.AreEqual("first", S(c.ToArray()));
         b.Dispose();
+    }
+
+    /// <summary>PooledValue: a Dispose race returns the buffer once (two later values never share a buffer).</summary>
+    [TestMethod]
+    public void PooledValueDisposeRaceReturnsTheBufferOnce()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        for (int i = 0; i < 64; i++) db.Put(Key(i), Value(i, 0));
+        for (int round = 0; round < 200; round++) RaceDispose(db.GetPooled(Key(round % 64))!, 4);
+        var held = new List<PooledValue>();
+        for (int i = 0; i < 64; i++) held.Add(db.GetPooled(Key(i))!);
+        for (int i = 0; i < 64; i++) CollectionAssert.AreEqual(Value(i, 0), held[i].ToArray(), "value " + i);
+        foreach (PooledValue v in held) v.Dispose();
+    }
+
+    /// <summary>
+    /// WriteBatchWithIndex (Rent / Dispose, utilities/write_batch_with_index): rent A, dispose A, rent B, dispose A again:
+    /// B keeps its entries, index and lookups; A, its WriteBatch and its iterators throw ObjectDisposedException.
+    /// </summary>
+    [TestMethod]
+    public void StaleWriteBatchWithIndexDisposeDoesNotTouchTheNextRenter()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        WriteBatchWithIndex a = db.CreateWriteBatchWithIndex();
+        a.Put(B("a"), B("1"));
+        WriteBatch aBatch = a.WriteBatch;
+        WriteBatchWithIndexIterator aIt = a.NewIterator();
+        a.Dispose();
+        WriteBatchWithIndex b = db.CreateWriteBatchWithIndex();
+        Assert.AreNotSame(a, b);
+        b.Put(B("b"), B("2"));
+        a.Dispose(); // stale
+        Assert.ThrowsExactly<ObjectDisposedException>(() => a.Put(B("x"), B("y")));
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = a.Count);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => _ = a.WriteBatch);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => aBatch.Put(B("x"), B("y")));
+        Assert.ThrowsExactly<ObjectDisposedException>(() => aIt.SeekToFirst());
+        Assert.ThrowsExactly<ObjectDisposedException>(() => db.Write(a));
+        using WriteBatchWithIndex c = db.CreateWriteBatchWithIndex(); // must not get b's state
+        c.Put(B("c"), B("3"));
+        Assert.AreEqual(1, b.Count);
+        var w = new System.Buffers.ArrayBufferWriter<byte>();
+        Assert.IsTrue(b.TryGetFromBatch(null, B("b"), w));
+        Assert.AreEqual("2", S(w.WrittenSpan.ToArray()));
+        Assert.IsFalse(b.TryGetFromBatch(null, B("c"), new System.Buffers.ArrayBufferWriter<byte>()));
+        db.Write(b);
+        b.Dispose();
+        Assert.AreEqual("2", GetString(db, "b"));
+        Assert.IsNull(GetString(db, "a"));
+    }
+
+    /// <summary>WriteBatchWithIndex: a Dispose race returns the index state once.</summary>
+    [TestMethod]
+    public void WriteBatchWithIndexDisposeRaceReturnsTheStateOnce()
+    {
+        for (int round = 0; round < 200; round++)
+        {
+            WriteBatchWithIndex w = WriteBatchWithIndex.Rent();
+            w.Put(B("k"), B("v"));
+            RaceDispose(w, 4);
+        }
+        var held = new List<WriteBatchWithIndex>();
+        for (int i = 0; i < 300; i++)
+        {
+            WriteBatchWithIndex b = WriteBatchWithIndex.Rent();
+            b.Put(Key(i), Value(i, 0));
+            held.Add(b);
+        }
+        var w2 = new System.Buffers.ArrayBufferWriter<byte>();
+        for (int i = 0; i < held.Count; i++)
+        {
+            Assert.AreEqual(1, held[i].Count, "batch " + i);
+            w2.Clear();
+            Assert.IsTrue(held[i].TryGetFromBatch(null, Key(i), w2), "batch " + i);
+            CollectionAssert.AreEqual(Value(i, 0), w2.WrittenSpan.ToArray());
+            WriteBatchWithIndexIterator it = held[i].NewIterator();
+            int n = 0;
+            for (it.SeekToFirst(); it.Valid; it.Next()) n++;
+            Assert.AreEqual(1, n, "batch " + i);
+        }
+        foreach (WriteBatchWithIndex b in held) b.Dispose();
+    }
+
+    /// <summary>
+    /// Bytes allocated per operation on the calling thread in warm loops (rented WriteBatch written with Write,
+    /// GetPooled, Put, rented WriteBatchWithIndex). Printed for the record; the bounds only catch regressions.
+    /// </summary>
+    [TestMethod]
+    public void PooledObjectAllocationsPerOperation()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        byte[] k = B("key"), v = B("value");
+        db.Put(k, v);
+        double Measure(Action op)
+        {
+            for (int i = 0; i < 2000; i++) op();
+            const int n = 20000;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < n; i++) op();
+            return (GC.GetAllocatedBytesForCurrentThread() - before) / (double)n;
+        }
+        double batch = Measure(() =>
+        {
+            WriteBatch b = db.CreateWriteBatch();
+            b.Put(k, v);
+            db.Write(b);
+            b.Dispose();
+        });
+        double pooled = Measure(() => db.GetPooled(k)!.Dispose());
+        double put = Measure(() => db.Put(k, v));
+        double wbwi = Measure(() =>
+        {
+            WriteBatchWithIndex b = db.CreateWriteBatchWithIndex();
+            b.Put(k, v);
+            db.Write(b);
+            b.Dispose();
+        });
+        double batchOnly = Measure(() =>
+        {
+            WriteBatch b = WriteBatch.Rent();
+            b.Put(k, v);
+            b.Dispose();
+        });
+        double wbwiOnly = Measure(() =>
+        {
+            WriteBatchWithIndex b = WriteBatchWithIndex.Rent();
+            b.Put(k, v);
+            b.Dispose();
+        });
+        // The write loops include the memtable arena and WAL growth of the in-memory DB (amortized, not per-op garbage).
+        Console.WriteLine($"bytes/op: Rent+Put+Dispose {batchOnly:F1}, CreateWriteBatch+Write {batch:F1}, GetPooled {pooled:F1}, Put {put:F1}, " +
+            $"WBWI Rent+Put+Dispose {wbwiOnly:F1}, CreateWriteBatchWithIndex+Write {wbwi:F1}");
     }
 }

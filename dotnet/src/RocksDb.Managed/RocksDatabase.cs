@@ -212,12 +212,16 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     // Batches, snapshots, flush, properties
     // =====================================================================================================
 
-    /// <summary>A pooled, empty write batch; disposing it returns it to the pool.</summary>
+    /// <summary>
+    /// An empty write batch whose buffer comes from a pool (<see cref="WriteBatch.Rent"/>); disposing it returns the buffer.
+    /// After Dispose the batch throws <see cref="ObjectDisposedException"/>; a second Dispose does nothing.
+    /// </summary>
     public WriteBatch CreateWriteBatch() => WriteBatch.Rent();
 
     /// <summary>
-    /// A pooled, empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> (<see cref="WriteBatchWithIndex.Rent()"/>);
-    /// disposing it returns it to the pool.
+    /// An empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> whose index state and buffer come from pools
+    /// (<see cref="WriteBatchWithIndex.Rent()"/>); disposing it returns them, and the batch throws
+    /// <see cref="ObjectDisposedException"/> afterwards.
     /// </summary>
     public WriteBatchWithIndex CreateWriteBatchWithIndex() => WriteBatchWithIndex.Rent();
 
