@@ -23,7 +23,7 @@ facebook/rocksdb `main`.
 | [12-backup-restore-ignores-stale-wal-delete-failure.md](12-backup-restore-ignores-stale-wal-delete-failure.md) | A restore that cannot delete a stale WAL in the destination reports success; the next open replays writes that were never in the backup |
 | [13-log-reader-drops-records-without-reporting.md](13-log-reader-drops-records-without-reporting.md) | A zeroed WAL record header mid-log, or a CRC-valid zstd WAL record that fails to decompress, drops records without any error in every recovery mode, `kAbsoluteConsistency` included |
 | [14-user-write-callback-not-exception-safe.md](14-user-write-callback-not-exception-safe.md) | A `UserWriteCallback` that throws leaves its writer linked in the write queue; every later write hangs |
-| [15-reverse-iteration-merge-without-operator-segfaults.md](15-reverse-iteration-merge-without-operator-segfaults.md) | A DB with merge operands in its table files, opened without a merge operator: reverse iteration over an operand, and `Get` / `MultiGet` of an operand above an older value, segfault (only `assert(merge_operator_ != nullptr)`); forward iteration fails with InvalidArgument |
+| [15-merge-without-operator-segfaults.md](15-merge-without-operator-segfaults.md) | A DB with merge operands in its table files, opened without a merge operator: reverse iteration over an operand, and `Get` / `MultiGet` of an operand above an older value, segfault (only `assert(merge_operator_ != nullptr)`); forward iteration fails with InvalidArgument |
 
 01-03, 05-07, 09-13 and 15 were reproduced with the C API programs they contain, 08 with the NuGet package's library
 in a child process (validation.md, "Audit #7"), 14 with the ABI-independent C++ variant it contains (the plain C++ program

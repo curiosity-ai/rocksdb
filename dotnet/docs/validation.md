@@ -2466,9 +2466,12 @@ now say so.
 
 ### Upstream behaviour found
 
-- Native 11.12 crashes (SIGSEGV) on reverse iteration over a merge operand when the DB is opened without a merge operator
-  (`DBIter::FindValueForCurrentKey` only asserts the operator); Get and forward iteration return InvalidArgument. The port
-  returns InvalidArgument for all. Upstream issue draft 15.
+- Native 11.12 crashes (SIGSEGV) when a DB with merge operands in table files is opened without a merge operator and a
+  read merges an operand with an older value or runs backwards: Get / MultiGet of a key whose operand is above an older
+  base value (`GetContext::SaveValue` only asserts the operator), Prev / SeekForPrev (`DBIter::FindValueForCurrentKey`
+  only asserts it). Forward iteration and keys with operands only return InvalidArgument. The port returns InvalidArgument
+  in every case. Upstream issue draft 15. (Operands only in the WAL cannot crash: replay stops at the first Merge record,
+  which upstream reports as a corrupted record, so under PointInTime recovery later writes are dropped.)
 - With prefix_same_as_start and a seek target outside the extractor's domain upstream falls back to a legacy prefix seek
   (undefined behaviour; native returned an older version at a snapshot); the port returns the total-order result.
 
