@@ -190,29 +190,29 @@ public sealed class Iterator : IDisposable
     internal void SetTraceState(DbImpl db, uint cfId, ReadOptions? options) => Core.SetTraceState(db, cfId, options);
 
     /// <summary>Async <see cref="SeekToFirst"/>: data blocks are read with async I/O; completes synchronously on cache hits.</summary>
-    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => Core.SeekToFirstAsync(cancellationToken);
+    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => Track(Core.SeekToFirstAsync(cancellationToken));
 
     /// <summary>Async <see cref="SeekToLast"/>.</summary>
-    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => Core.SeekToLastAsync(cancellationToken);
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => Track(Core.SeekToLastAsync(cancellationToken));
 
     /// <summary>Async <see cref="Seek"/>.</summary>
-    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => Core.SeekAsync(target, cancellationToken);
+    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => Track(Core.SeekAsync(target, cancellationToken));
 
     /// <summary>Async <see cref="SeekForPrev"/>.</summary>
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) =>
-        Core.SeekForPrevAsync(target, cancellationToken);
+        Track(Core.SeekForPrevAsync(target, cancellationToken));
 
     /// <summary>Async <see cref="Next"/>.</summary>
-    public ValueTask NextAsync(CancellationToken cancellationToken = default) => Core.NextAsync(cancellationToken);
+    public ValueTask NextAsync(CancellationToken cancellationToken = default) => Track(Core.NextAsync(cancellationToken));
 
     /// <summary>Async <see cref="Prev"/>.</summary>
-    public ValueTask PrevAsync(CancellationToken cancellationToken = default) => Core.PrevAsync(cancellationToken);
+    public ValueTask PrevAsync(CancellationToken cancellationToken = default) => Track(Core.PrevAsync(cancellationToken));
 
     /// <summary>
     /// Reads the current value with async I/O if it is still pending (a value stored in a blob file is otherwise read
     /// synchronously on first access to <c>Value</c>). Iterator::PrepareValue.
     /// </summary>
-    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => Core.It.PrepareValueAsync(cancellationToken);
+    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => Track(Core.It.PrepareValueAsync(cancellationToken));
 
     // ------------------------------------------------------------------ refresh and bounds
 
@@ -236,10 +236,52 @@ public sealed class Iterator : IDisposable
     public void Refresh(Snapshot? snapshot) => Core.Refresh(snapshot);
 
     /// <summary>Async <see cref="Refresh()"/>: when the DB's files changed, the new table files are opened with async I/O.</summary>
-    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => Core.RefreshAsync(null, cancellationToken);
+    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => Track(Core.RefreshAsync(null, cancellationToken));
 
     /// <summary>Async <see cref="Refresh(Snapshot?)"/>.</summary>
-    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default) => Core.RefreshAsync(snapshot, cancellationToken);
+    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default) =>
+        Track(Core.RefreshAsync(snapshot, cancellationToken));
+
+    // ------------------------------------------------------------------ async moves in flight
+    //
+    // An async move that has to wait for a file read keeps running on the core after it returned. If the iterator is
+    // disposed meanwhile, the core must not go back to the column family's pool before that move is done: the next
+    // NewIterator would rent it, and the move would then reposition (or invalidate) that other iterator. Dispose
+    // therefore hands the core over to the move, which releases it when it completes.
+
+    private const int Idle = 0, MovePending = 1, DisposeRequested = 2;
+    private int _moveState;
+    private IteratorCore? _deferredCore;
+
+    /// <summary>Returns <paramref name="move"/>; one that has not completed is tracked until it does (no allocation either way).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ValueTask Track(ValueTask move) => move.IsCompleted ? move : TrackSlowAsync(move);
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask TrackSlowAsync(ValueTask move)
+    {
+        BeginPendingMove();
+        try
+        {
+            await move.ConfigureAwait(false);
+        }
+        finally
+        {
+            EndPendingMove();
+        }
+    }
+
+    /// <summary>An async move (or scan step) is about to wait: Dispose defers the release of the core until <see cref="EndPendingMove"/>.</summary>
+    private void BeginPendingMove() => Volatile.Write(ref _moveState, MovePending);
+
+    /// <summary>The pending async move is done; releases the core if the iterator was disposed meanwhile.</summary>
+    private void EndPendingMove()
+    {
+        if (Interlocked.Exchange(ref _moveState, Idle) != DisposeRequested) return;
+        IteratorCore core = _deferredCore!;
+        _deferredCore = null;
+        ReleaseCore(core);
+    }
 
     /// <summary>
     /// Replaces the iterate bounds the iterator was created with (<see cref="ReadOptions.IterateLowerBound"/> inclusive,
@@ -402,19 +444,22 @@ public sealed class Iterator : IDisposable
             if (_iterator._core is null) ThrowDisposed();
             if (_done) return new ValueTask<bool>(false);
             _ct.ThrowIfCancellationRequested();
-            DbIter it = _iterator.Core.It;
+            // The moves go through the core like Seek / Next of the sync range enumerator: statistics (NUMBER_DB_SEEK /
+            // NEXT, ITER_BYTES_READ), query tracing and the renewal of a tailing iterator apply to scans too.
+            IteratorCore core = _iterator.Core;
             ValueTask t;
             if (!_started)
             {
                 _started = true;
-                t = _start is ReadOnlyMemory<byte> s ? it.SeekAsync(s, _ct) : it.SeekToFirstAsync(_ct);
+                t = _start is ReadOnlyMemory<byte> s ? core.SeekAsync(s, _ct) : core.SeekToFirstAsync(_ct);
             }
             else
             {
-                t = it.NextAsync(_ct);
+                t = core.NextAsync(_ct);
             }
             if (!t.IsCompletedSuccessfully) return MoveNextSlowAsync(t);
             t.GetAwaiter().GetResult();
+            DbIter it = core.It;
             // A value in a blob file is read with async I/O before it is captured.
             if (it.Valid)
             {
@@ -428,10 +473,19 @@ public sealed class Iterator : IDisposable
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         private async ValueTask<bool> MoveNextSlowAsync(ValueTask pending)
         {
-            await pending.ConfigureAwait(false);
-            DbIter it = _iterator.Core.It;
-            if (it.Valid) await it.PrepareValueAsync(_ct).ConfigureAwait(false);
-            return Capture();
+            // A disposal of the iterator meanwhile keeps the core and the item buffer until this step is done (see Track).
+            _iterator.BeginPendingMove();
+            try
+            {
+                await pending.ConfigureAwait(false);
+                DbIter it = _iterator.Core.It;
+                if (it.Valid) await it.PrepareValueAsync(_ct).ConfigureAwait(false);
+                return Capture();
+            }
+            finally
+            {
+                _iterator.EndPendingMove();
+            }
         }
 
         private bool Capture()
@@ -486,6 +540,15 @@ public sealed class Iterator : IDisposable
         IteratorCore? core = Interlocked.Exchange(ref _core, null);
         if (core is null) return;
         _it = null;
+        // An async move still waiting for a file read releases the core when it completes (EndPendingMove).
+        _deferredCore = core;
+        if (Interlocked.CompareExchange(ref _moveState, DisposeRequested, MovePending) == MovePending) return;
+        _deferredCore = null;
+        ReleaseCore(core);
+    }
+
+    private void ReleaseCore(IteratorCore core)
+    {
         _scan?.ReleaseBuffer();
         core.Release();
     }

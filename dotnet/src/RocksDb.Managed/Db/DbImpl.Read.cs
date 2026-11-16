@@ -805,9 +805,11 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Async <see cref="GetFromFile"/>: the first entry of the key is read with <see cref="BlockBasedTableReader.GetAsync"/>
-    /// (merge chains continue with the synchronous visitor). Completes without an async state machine when the table
-    /// lookup does (filter miss, cached blocks).
+    /// Async <see cref="GetFromFile"/>: the table lookup visits the key's entries like the synchronous TableCache::Get
+    /// (<see cref="BlockBasedTableReader.GetAsync{TState}"/>, data blocks read with async I/O), so the filter, the index
+    /// and the data blocks are consulted once per file as on the sync path. (A first-entry lookup that restarted the
+    /// table lookup for merge chains counted the block cache and filter accesses of those keys twice.) Completes without
+    /// an async state machine when the table lookup does (filter miss, cached blocks).
     /// </summary>
     private static ValueTask<bool> GetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ReadOnlyMemory<byte> userKey,
         ulong snapshot, GetContext ctx, CancellationToken cancellationToken)
@@ -815,7 +817,7 @@ internal sealed partial class DbImpl
         if (cfd.TableCache.RowCache is not null && UsesRowCache(ctx)) return GetFromFileWithRowCacheAsync(cfd, f, ikey, userKey, snapshot, ctx, cancellationToken);
         // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
         TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
-        ValueTask<TableGetResult> pending;
+        ValueTask pending;
         try
         {
             if (rangeDels is not null && !ctx.IgnoreRangeDeletions)
@@ -823,13 +825,12 @@ internal sealed partial class DbImpl
                 ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey.Span, snapshot);
                 if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
             }
-            ctx.Scratch.Clear();
             pending = lease.Reader is BlockBasedTableReader bbt
-                ? bbt.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken)
-                : lease.Reader.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken);
+                ? bbt.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken)
+                : lease.Reader.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken);
             if (pending.IsCompletedSuccessfully)
             {
-                SaveFileResult(lease.Reader, pending.Result, ikey.Span, ctx);
+                pending.GetAwaiter().GetResult();
                 lease.Dispose();
                 return new ValueTask<bool>(ctx.Done);
             }
@@ -839,37 +840,21 @@ internal sealed partial class DbImpl
             lease.Dispose();
             throw;
         }
-        return GetFromFileSlowAsync(lease, pending, ikey, ctx);
+        return GetFromFileSlowAsync(lease, pending, ctx);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private static async ValueTask<bool> GetFromFileSlowAsync(TableReaderLease lease, ValueTask<TableGetResult> pending, ReadOnlyMemory<byte> ikey, GetContext ctx)
+    private static async ValueTask<bool> GetFromFileSlowAsync(TableReaderLease lease, ValueTask pending, GetContext ctx)
     {
         try
         {
-            TableGetResult r = await pending.ConfigureAwait(false);
-            SaveFileResult(lease.Reader, r, ikey.Span, ctx);
+            await pending.ConfigureAwait(false);
         }
         finally
         {
             lease.Dispose();
         }
         return ctx.Done;
-    }
-
-    private static void SaveFileResult(TableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
-    {
-        if (!r.Found) return;
-        if (r.Type == EntryType.Merge && ctx.MaxCoveringTombstoneSeq <= r.Sequence)
-        {
-            // Merge chain: the rest of the operands are most likely in the same (now cached by the OS) block.
-            if (reader is BlockBasedTableReader bbt) bbt.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
-            else reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
-        }
-        else
-        {
-            ctx.SaveEntry(r.Sequence, r.Type, ctx.Scratch.WrittenSpan);
-        }
     }
 
     // ---- iterators --------------------------------------------------------------------------------------
