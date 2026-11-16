@@ -65,7 +65,22 @@ public readonly record struct CompactionServiceWaitResult(CompactionServiceJobSt
 /// with <see cref="RocksDatabase.OpenAndCompact(OpenAndCompactOptions, string, string, ReadOnlySpan{byte}, CompactionServiceOptionsOverride)"/>
 /// (or native <c>DB::OpenAndCompact</c>) on a host that can read the DB directory, and returns the worker's serialized
 /// result; the primary then moves the output files into the DB and installs them. The default implementation runs every
-/// compaction locally. Calls come from the compaction threads (one job per call, possibly concurrently).
+/// compaction locally. One job per call; calls for different jobs can run concurrently.
+/// </para>
+/// <para>
+/// Threads: <see cref="ScheduleAsync"/>, <see cref="WaitAsync"/> and <see cref="OnInstallation"/> are called from
+/// <list type="bullet">
+/// <item>the DB's compaction threads (dedicated LOW / BOTTOM priority threads, not the .NET thread pool) for automatic
+/// compactions, which block until the returned task completes (like upstream's Wait);</item>
+/// <item>the calling thread of a synchronous <c>CompactRange</c> / <c>CompactFiles</c>, which also blocks;</item>
+/// <item>a LOW priority compaction thread for <c>CompactRangeAsync</c> / <c>CompactFilesAsync</c>, which await the
+/// returned tasks without holding any thread.</item>
+/// </list>
+/// Blocking calls run with <see cref="SynchronizationContext.Current"/> set to null, so an implementation that awaits
+/// without <c>ConfigureAwait(false)</c> does not deadlock a caller on a UI or other single-threaded context. A
+/// non-default <see cref="TaskScheduler.Current"/> of the caller is not suppressed: from a task scheduled on a
+/// single-threaded <see cref="TaskScheduler"/>, call the async overloads (or await with ConfigureAwait(false)).
+/// Continuations of the returned tasks may run on any thread.
 /// </para>
 /// </summary>
 public abstract class CompactionService

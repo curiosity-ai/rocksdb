@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db;
 
@@ -655,7 +656,7 @@ internal sealed partial class DbImpl
         Low,
         /// <summary>Automatic compaction on the bottom-priority pool (Env::Priority::BOTTOM).</summary>
         Bottom,
-        /// <summary>Manual compaction (CompactRange / CompactFiles) on the caller's thread.</summary>
+        /// <summary>Manual compaction (CompactRange / CompactFiles): on the caller's thread (sync) or a LOW pool thread (async).</summary>
         Manual,
     }
 
@@ -806,7 +807,7 @@ internal sealed partial class DbImpl
                 }
             }
         }
-        RunCompaction(cfd, c, snapshots, CompactionThread.Bottom);
+        SyncValueTask.GetResult(RunCompactionAsync(cfd, c, snapshots, CompactionThread.Bottom, synchronous: true));
     }
 
     /// <summary>Accounts a finished bottom-priority job and schedules more work. REQUIRES: mutex.</summary>
@@ -846,7 +847,7 @@ internal sealed partial class DbImpl
         {
             try
             {
-                _db.RunCompaction(_cfd, _c, _snapshots, _thread);
+                SyncValueTask.GetResult(_db.RunCompactionAsync(_cfd, _c, _snapshots, _thread, synchronous: true));
             }
             catch (Exception)
             {
@@ -859,8 +860,16 @@ internal sealed partial class DbImpl
     /// Runs a registered compaction to completion: trivial move (MANIFEST-only), FIFO deletion or a full
     /// <see cref="CompactionJob"/>; installs the result and releases the inputs. Errors other than shutdown / dropped
     /// column family become the background error. Rethrows the failure for manual callers.
+    /// <para>
+    /// Threads: automatic compactions and synchronous manual ones run with <paramref name="synchronous"/> true on the
+    /// calling thread (a LOW / BOTTOM pool thread, or the caller of CompactRange / CompactFiles). The asynchronous manual
+    /// path (CompactRangeAsync / CompactFilesAsync) starts it with <paramref name="synchronous"/> false on a LOW pool
+    /// thread (<see cref="BackgroundThreadPool.RunAsync"/>): the only waits that then do not hold a thread are those for
+    /// the <see cref="CompactionService"/>, after which the job continues on a LOW pool thread, so the local compaction,
+    /// the MANIFEST write and the file deletions always run on a compaction thread, as upstream's.
+    /// </para>
     /// </summary>
-    private void RunCompaction(ColumnFamilyData cfd, Compaction c, ulong[] snapshots, CompactionThread thread)
+    private async ValueTask RunCompactionAsync(ColumnFamilyData cfd, Compaction c, ulong[] snapshots, CompactionThread thread, bool synchronous)
     {
         bool isManual = thread == CompactionThread.Manual;
         bool ok = false;
@@ -952,7 +961,7 @@ internal sealed partial class DbImpl
                         LogCompactionStartedEvent(cfd, c, jobId, null, null);
                         startedEventLogged = true;
                     }
-                    remote = TryRunRemoteCompaction(service, cfd, c, jobSnapshots, jobId, bottom, ct);
+                    remote = await TryRunRemoteCompactionAsync(service, cfd, c, jobSnapshots, jobId, bottom, synchronous, ct).ConfigureAwait(false);
                 }
                 if (remote is not null)
                 {
@@ -982,7 +991,7 @@ internal sealed partial class DbImpl
                     Monitoring.JobIoCounter? previousCounter = Monitoring.JobIoCounter.Enter(job.IoCounter);
                     try
                     {
-                        job.RunAsync(synchronous: true).GetAwaiter().GetResult();
+                        SyncValueTask.GetResult(job.RunAsync(synchronous: true));
                     }
                     finally
                     {
@@ -1024,7 +1033,7 @@ internal sealed partial class DbImpl
             // The super version (and with it the write stall) is installed in the critical section that installs the
             // version (InstallSuperVersionAndScheduleWork right after LogAndApply, under the same mutex hold).
             editSubmitted = true;
-            Versions.LogAndApplyAsync(cfd, edit, synchronous: true, () => InstallSuperVersion(cfd), CancellationToken.None).GetAwaiter().GetResult();
+            SyncValueTask.GetResult(Versions.LogAndApplyAsync(cfd, edit, synchronous: true, () => InstallSuperVersion(cfd), CancellationToken.None));
             TestHooks.Invoke("DBImpl::RunCompaction:AfterLogAndApply");
             var installed = new List<FileMetaData>(edit.NewFiles.Count);
             foreach (NewFileEntry nf in edit.NewFiles) installed.Add(nf.Meta);
@@ -1632,12 +1641,12 @@ internal sealed partial class DbImpl
             if (outputLevel == CompactionPicker.CompactToBaseLevel) baseLevel = c.OutputLevel;
             if (synchronous)
             {
-                RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
+                SyncValueTask.GetResult(RunCompactionAsync(cfd, c, snapshots, CompactionThread.Manual, synchronous: true));
             }
             else
             {
                 var run = new ManualRun(this, cfd, c, snapshots);
-                await BackgroundThreadPool.Low.Run(static s => ((ManualRun)s!).Run(), run).ConfigureAwait(false);
+                await BackgroundThreadPool.Low.RunAsync(static s => ((ManualRun)s!).RunAsync(), run).ConfigureAwait(false);
             }
             if (compactionEnd is null) return baseLevel;
             beginKey = compactionEnd;
@@ -1646,7 +1655,7 @@ internal sealed partial class DbImpl
 
     private sealed class ManualRun(DbImpl db, ColumnFamilyData cfd, Compaction c, ulong[] snapshots)
     {
-        public void Run() => db.RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
+        public ValueTask RunAsync() => db.RunCompactionAsync(cfd, c, snapshots, CompactionThread.Manual, synchronous: false);
     }
 
     /// <summary>
@@ -1743,13 +1752,13 @@ internal sealed partial class DbImpl
         }
         if (synchronous)
         {
-            RunCompaction(cfd, c, snapshots, CompactionThread.Manual);
+            SyncValueTask.GetResult(RunCompactionAsync(cfd, c, snapshots, CompactionThread.Manual, synchronous: true));
         }
         else
         {
             var run = new ManualRun(this, cfd, c, snapshots);
             // Not cancellable once registered: the compaction must run (or fail) to release its input files.
-            await BackgroundThreadPool.Low.Run(static s => ((ManualRun)s!).Run(), run).ConfigureAwait(false);
+            await BackgroundThreadPool.Low.RunAsync(static s => ((ManualRun)s!).RunAsync(), run).ConfigureAwait(false);
         }
         var names = new List<string>();
         if (c.InstalledFiles is { } files)
