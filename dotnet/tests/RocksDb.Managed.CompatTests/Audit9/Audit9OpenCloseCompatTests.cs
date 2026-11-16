@@ -344,6 +344,61 @@ public sealed class Audit9OpenCloseCompatTests
         Assert.AreEqual(Listing(nativeDir.Path).Replace("OPTIONS.dbtmp x1, ", "", StringComparison.Ordinal), Listing(managedDir.Path));
     }
 
+    /// <summary>
+    /// DBImpl::Recover / RecoverLogFiles: the last sequence number after an open (replayed WALs, recovery flush, empty
+    /// reopen, avoid_flush_during_recovery) is the same as native's, so is the sequence number of the first write after
+    /// it; every open gets a new db_session_id (DBImpl::SetDbSessionId) while the DB id stays.
+    /// </summary>
+    [TestMethod]
+    public void SequenceNumbersAndSessionIdsAcrossReopensMatchNative()
+    {
+        using var nativeDir = new TempDir("a9-seq-native");
+        using var managedDir = new TempDir("a9-seq-managed");
+        var nativeSeqs = new List<ulong>();
+        var managedSeqs = new List<ulong>();
+        for (int round = 0; round < 4; round++)
+        {
+            bool avoid = round == 2;
+            var no = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
+            N.rocksdb_options_set_avoid_flush_during_recovery(no.Handle, avoid ? (byte)1 : (byte)0);
+            using (RocksDbSharp.RocksDb db = RocksDbSharp.RocksDb.Open(no, nativeDir.Path))
+            {
+                nativeSeqs.Add(db.GetLatestSequenceNumber());
+                if (round != 1)
+                {
+                    for (int i = 0; i < 3; i++) db.Put(U("k" + round + i), U("v"));
+                    var b = new RocksDbSharp.WriteBatch();
+                    b.Put(U("b1"), U("1"));
+                    b.Delete(U("b2"));
+                    db.Write(b);
+                }
+                nativeSeqs.Add(db.GetLatestSequenceNumber());
+            }
+            var mo = new DbOptions { CreateIfMissing = true, AvoidFlushDuringRecovery = avoid };
+            string sessionBefore = "";
+            using (RocksDatabase db = RocksDatabase.Open(managedDir.Path, mo))
+            {
+                managedSeqs.Add(db.GetLatestSequenceNumber());
+                if (round != 1)
+                {
+                    for (int i = 0; i < 3; i++) db.Put(U("k" + round + i), U("v"));
+                    using RocksDb.Managed.Db.WriteBatch b = RocksDb.Managed.Db.WriteBatch.Rent();
+                    b.Put(U("b1"), U("1"));
+                    b.Delete(U("b2"));
+                    db.Write(b);
+                }
+                managedSeqs.Add(db.GetLatestSequenceNumber());
+                sessionBefore = db.DbSessionId;
+            }
+            using (RocksDatabase db = RocksDatabase.OpenReadOnly(managedDir.Path, new DbOptions()))
+            {
+                Assert.AreNotEqual(sessionBefore, db.DbSessionId, "a new session id per open");
+                Assert.AreEqual(20, db.DbSessionId.Length);
+            }
+        }
+        CollectionAssert.AreEqual(nativeSeqs, managedSeqs, "native " + string.Join(",", nativeSeqs) + " managed " + string.Join(",", managedSeqs));
+    }
+
     /// <summary>A failed open of the DB at a path (whose DB has a column family "cf1").</summary>
     public enum FailedOpen { MissingColumnFamily, UnlistedColumnFamily, ErrorIfExists, LockHeld }
 

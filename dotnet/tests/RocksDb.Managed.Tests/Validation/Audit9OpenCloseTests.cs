@@ -1,6 +1,7 @@
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Tests.Db;
+using RocksDb.Managed.Utilities.Transactions;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
 
 namespace RocksDb.Managed.Tests.Validation;
@@ -315,9 +316,9 @@ public sealed class Audit9OpenCloseTests
     /// handle; after the power loss / process kill the DB opens twice with exactly the durable writes, keeps its DB id
     /// and accepts a sync write and a flush.
     /// </summary>
-    private static bool CrashDuringOpen(OpenScenario s, int seed, long crashAt, bool powerLoss)
+    private static bool CrashDuringOpen(OpenScenario s, int seed, long crashAt, bool powerLoss, bool transient)
     {
-        string context = s + " seed=" + seed + " crashAt=" + crashAt + " powerLoss=" + powerLoss;
+        string context = s + " seed=" + seed + " crashAt=" + crashAt + " powerLoss=" + powerLoss + " transient=" + transient;
         List<Op> ops = MakeOps(seed, 160);
         var fs = new FaultInjectionFileSystem(NewMemFs());
         string dbId = BuildDbBeforeOpen(fs, s, ops);
@@ -326,7 +327,8 @@ public sealed class Audit9OpenCloseTests
         {
             foreach (Op op in ops) Apply(model, op);
         }
-        fs.TornWrites = !powerLoss;
+        fs.TornWrites = !powerLoss && !transient;
+        fs.TransientFailure = transient;
         fs.CrashAtOperation = fs.Operations + crashAt;
         try
         {
@@ -346,6 +348,7 @@ public sealed class Audit9OpenCloseTests
         else FaultInjectionFileSystem.ProcessKill();
         fs.Restart();
         fs.TornWrites = false;
+        fs.TransientFailure = false;
         for (int round = 0; round < 2; round++)
         {
             RocksDatabase db2;
@@ -379,12 +382,14 @@ public sealed class Audit9OpenCloseTests
 
     private static void RunOpenSweep(OpenScenario s, int seed)
     {
-        foreach (bool powerLoss in new[] { true, false })
+        // Power loss, process kill (torn last write), and a single failed operation in a process that goes on (the
+        // failed open's cleanup runs on a working file system, then the DB is opened again).
+        foreach ((bool powerLoss, bool transient) in new[] { (true, false), (false, false), (false, true) })
         {
             long crashAt = 1;
             for (; crashAt < 600; crashAt++)
             {
-                if (!CrashDuringOpen(s, seed, crashAt, powerLoss)) break;
+                if (!CrashDuringOpen(s, seed, crashAt, powerLoss, transient)) break;
             }
             Assert.IsTrue(crashAt > 3 && crashAt < 600, s + ": unexpected number of crash points " + crashAt);
         }
@@ -653,5 +658,101 @@ public sealed class Audit9OpenCloseTests
         foreach (string op in secondaryFs.OpLog)
             Assert.IsTrue(op.Contains(secPath, StringComparison.Ordinal), "the secondary mutated a file outside its directory: " + op);
         for (int i = 10; i < 70; i++) Assert.IsNotNull(primary.Get(Key(i)), "the primary lost key " + i);
+    }
+
+    // ---- TransactionDB open ----------------------------------------------------------------------------------------
+
+    private static TransactionDatabase OpenTxnDb(IFileSystem fs, TransactionWritePolicy policy)
+    {
+        DbOptions o = Options(fs);
+        o.InfoLog = new NullLogger();
+        return TransactionDatabase.Open(Path, o, new TransactionDbOptions { WritePolicy = policy },
+            [new ColumnFamilyDescriptor("default", OpenCfOptions(8UL << 20))]);
+    }
+
+    /// <summary>
+    /// One crash point of a TransactionDB open (TransactionDB::Open: DB::Open with allow_2pc, then
+    /// PessimisticTransactionDB::Initialize rebuilding the recovered prepared transactions): committed transactions
+    /// survive, the transaction that was only prepared is recovered as prepared (and commits), nothing else appears.
+    /// </summary>
+    private static bool CrashDuringTxnDbOpen(TransactionWritePolicy policy, long crashAt, bool powerLoss)
+    {
+        string context = policy + " crashAt=" + crashAt + " powerLoss=" + powerLoss;
+        var fs = new FaultInjectionFileSystem(NewMemFs());
+        var sync = new WriteOptions { Sync = true };
+        using (TransactionDatabase db = OpenTxnDb(fs, policy))
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                using Transaction t = db.BeginTransaction(sync);
+                t.SetName("c" + i);
+                t.Put(B("c" + i), B("committed"));
+                t.Prepare();
+                t.Commit();
+                if (i == 2) db.Database.Flush(); // the prepared transaction below spans a flush
+            }
+            Transaction p = db.BeginTransaction(sync);
+            p.SetName("prepared");
+            p.Put(B("p"), B("prepared"));
+            p.Prepare();
+            db.Database.Put(sync, B("direct"), B("1"));
+            p.Dispose(); // stays prepared (the WAL keeps it)
+        }
+        fs.TornWrites = !powerLoss;
+        fs.CrashAtOperation = fs.Operations + crashAt;
+        try
+        {
+            using TransactionDatabase db = OpenTxnDb(fs, policy);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            Assert.IsTrue(fs.Crashed, "open failed without a crash: " + context + ": " + e);
+        }
+        bool crashed = fs.Crashed;
+        context += " at=" + fs.CrashedAt;
+        Assert.AreEqual(0, fs.OpenLocks, "LOCK not released: " + context);
+        Assert.AreEqual(0, fs.OpenFiles, "file handles leaked: " + context);
+        if (powerLoss) fs.PowerLoss();
+        fs.Restart();
+        fs.TornWrites = false;
+        using (TransactionDatabase db = OpenTxnDb(fs, policy))
+        {
+            for (int i = 0; i < 6; i++) Assert.AreEqual("committed", S(db.Database.Get(B("c" + i))), "c" + i + ": " + context);
+            Assert.AreEqual("1", S(db.Database.Get(B("direct"))), context);
+            Assert.IsNull(db.Database.Get(B("p")), "a prepared transaction is visible: " + context);
+            Transaction? recovered = db.GetTransactionByName("prepared");
+            Assert.IsNotNull(recovered, "the prepared transaction was not recovered: " + context);
+            Assert.AreEqual(1, db.GetAllPreparedTransactions().Count, context);
+            recovered.Commit();
+            recovered.Dispose();
+        }
+        using (TransactionDatabase db = OpenTxnDb(fs, policy))
+        {
+            Assert.AreEqual("prepared", S(db.Database.Get(B("p"))), context);
+            Assert.AreEqual(0, db.GetAllPreparedTransactions().Count, context);
+        }
+        return crashed;
+    }
+
+    /// <summary>
+    /// TransactionDB::Open (utilities/transactions/pessimistic_transaction_db.cc) with a crash at every mutating file
+    /// operation of the open: a power loss or a process kill never loses a committed transaction, never drops or
+    /// commits the prepared one (its WAL is kept by the 2PC min-log rule, PrecomputeMinLogNumberToKeep2PC), and leaves no
+    /// handle or LOCK held.
+    /// </summary>
+    [TestMethod]
+    [DataRow(TransactionWritePolicy.WriteCommitted)]
+    [DataRow(TransactionWritePolicy.WritePrepared)]
+    public void CrashAtEveryStepOfTransactionDbOpenKeepsPreparedTransactions(TransactionWritePolicy policy)
+    {
+        foreach (bool powerLoss in new[] { true, false })
+        {
+            long crashAt = 1;
+            for (; crashAt < 400; crashAt++)
+            {
+                if (!CrashDuringTxnDbOpen(policy, crashAt, powerLoss)) break;
+            }
+            Assert.IsTrue(crashAt > 3 && crashAt < 400, policy + ": unexpected number of crash points " + crashAt);
+        }
     }
 }
