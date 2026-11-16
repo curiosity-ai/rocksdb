@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Reflection;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.Table.Filters;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
@@ -146,13 +147,14 @@ public sealed class Audit8AsyncReadPathTests
     /// A DB with data in the memtable, two L0 files, L3 and L5 (CompactFiles), merges, deletes, range deletions, wide-column
     /// entities (some with blob columns) and blob values; the snapshot is taken between the rounds.
     /// </summary>
-    private static TestDb BuildDb(int seed, IFileSystem fs, bool partitioned, bool readahead = false)
+    private static TestDb BuildDb(int seed, IFileSystem fs, bool partitioned, bool readahead = false, bool rowCache = false)
     {
         var rnd = new Random(seed);
         var stats = new Statistics();
         Managed.Cache.BlockCache cache = Managed.Cache.BlockCache.CreateLru(8 << 20);
-        RocksDatabase db = RocksDatabase.Open(DbPath, new DbOptions { CreateIfMissing = true, FileSystem = fs, Statistics = stats },
-            [new ColumnFamilyDescriptor("default", CfOptions(partitioned, readahead, cache))]);
+        var dbo = new DbOptions { CreateIfMissing = true, FileSystem = fs, Statistics = stats };
+        if (rowCache) dbo.RowCache = new Managed.Cache.RowCache(1 << 20);
+        RocksDatabase db = RocksDatabase.Open(DbPath, dbo, [new ColumnFamilyDescriptor("default", CfOptions(partitioned, readahead, cache))]);
         ColumnFamily cf = db.DefaultColumnFamily;
         Snapshot? snap = null;
         int[] rounds = [1500, 900, 500, 400, 300];
@@ -179,6 +181,8 @@ public sealed class Audit8AsyncReadPathTests
                 }
                 else if (op < 75)
                 {
+                    // DeleteRange is NotSupported with a row cache (as upstream).
+                    if (rowCache) continue;
                     int span = 1 + rnd.Next(25);
                     cf.DeleteRange(K(k), K(Math.Min(KeySpace, k + span)));
                 }
@@ -351,14 +355,15 @@ public sealed class Audit8AsyncReadPathTests
     /// system whose async reads complete on other threads (partitioned and plain indexes).
     /// </summary>
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public void PointLookupsMatchSyncThroughAsyncFileSystem(bool partitioned)
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public void PointLookupsMatchSyncThroughAsyncFileSystem(bool partitioned, bool rowCache)
     {
         int seed = Environment.TickCount;
-        string trace = "seed=" + seed + " partitioned=" + partitioned;
+        string trace = "seed=" + seed + " partitioned=" + partitioned + " rowCache=" + rowCache;
         var fs = new AsyncReadFileSystem(NewFs());
-        using TestDb t = BuildDb(seed, fs, partitioned);
+        using TestDb t = BuildDb(seed, fs, partitioned, rowCache: rowCache);
         ColumnFamily cf = t.Db.DefaultColumnFamily;
         var rnd = new Random(seed + 1);
         long asyncBefore = fs.AsyncReads;
@@ -587,21 +592,28 @@ public sealed class Audit8AsyncReadPathTests
     /// what this compares).
     /// </summary>
     [TestMethod]
-    public void PointLookupStatisticsMatchSync()
+    [DataRow(false)]
+    [DataRow(true)]
+    public void PointLookupStatisticsMatchSync(bool rowCache)
     {
         int seed = Environment.TickCount;
         var fs = new AsyncReadFileSystem(NewFs());
-        using TestDb t = BuildDb(seed, fs, partitioned: seed % 2 == 0);
+        using TestDb t = BuildDb(seed, fs, partitioned: seed % 2 == 0, rowCache: rowCache);
         ColumnFamily cf = t.Db.DefaultColumnFamily;
         var keys = new byte[200][];
         var rnd = new Random(seed);
         for (int i = 0; i < keys.Length; i++) keys[i] = K(rnd.Next(KeySpace));
-        // Warm up: every table open, so the comparison does not include table opens.
-        foreach (byte[] k in keys) cf.Get(k);
+        // Warm up: every table and blob file the lookups touch is opened (and, with a row cache, every row cached), so
+        // that both phases start from the same state.
+        var snapOpts = new ReadOptions { Snapshot = t.Snapshot };
+        foreach (byte[] k in keys)
+        {
+            cf.Get(k);
+            cf.Get(snapOpts, k);
+        }
         string what = "seed=" + seed;
         AssertSameTickers(t, what + " Get", () => { foreach (byte[] k in keys) cf.Get(k); },
             () => { foreach (byte[] k in keys) Run(cf.GetAsync(k)); });
-        var snapOpts = new ReadOptions { Snapshot = t.Snapshot };
         AssertSameTickers(t, what + " Get(snapshot)", () => { foreach (byte[] k in keys) cf.Get(snapOpts, k); },
             () => { foreach (byte[] k in keys) Run(cf.GetAsync(snapOpts, k)); });
         AssertSameTickers(t, what + " GetEntity", () => { foreach (byte[] k in keys) cf.TryGetEntity(null, k, new WideColumns()); },
@@ -1001,5 +1013,77 @@ public sealed class Audit8AsyncReadPathTests
             }));
         }
         Assert.IsTrue(Task.WaitAll(tasks.ToArray(), TimeSpan.FromSeconds(60)), "readers finished");
+    }
+
+    /// <summary>
+    /// Pins: a second MoveNextAsync while the previous one waits for a file read throws InvalidOperationException instead
+    /// of moving the iterator under the pending step (which then completes with the right entry and the scan goes on);
+    /// after DisposeAsync of a ScanAsyncAndDispose enumeration, MoveNextAsync returns false (not ObjectDisposedException)
+    /// and the iterator is disposed.
+    /// </summary>
+    [TestMethod]
+    public void ScanAsyncRejectsOverlappingMoveNextAndEndsCleanlyAfterDispose()
+    {
+        var fs = new AsyncReadFileSystem(NewFs());
+        using TestDb t = BuildPlainDb(fs);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        List<string> expected = SyncRange(cf, null, K(100), K(200));
+        using Iterator it = cf.NewIterator(null);
+        t.Cache.EraseUnreferencedEntries();
+        IAsyncEnumerator<KeyValue> e = it.ScanAsync(K(100), K(200)).GetAsyncEnumerator();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fs.GateReached = reached;
+        fs.Gate = gate;
+        ValueTask<bool> first = e.MoveNextAsync();
+        WaitReached(reached);
+        fs.Gate = null;
+        Assert.ThrowsExactly<InvalidOperationException>(() => e.MoveNextAsync());
+        Assert.ThrowsExactly<InvalidOperationException>(() => it.ScanAsync(K(0), K(10)));
+        gate.SetResult();
+        Assert.IsTrue(Run(first));
+        var actual = new List<string> { Hex(e.Current.KeySpan) + "=" + Hex(e.Current.ValueSpan) };
+        while (Run(e.MoveNextAsync())) actual.Add(Hex(e.Current.KeySpan) + "=" + Hex(e.Current.ValueSpan));
+        Run(e.DisposeAsync());
+        CollectionAssert.AreEqual(expected, actual);
+
+        Iterator owned = cf.NewIterator(null);
+        IAsyncEnumerator<KeyValue> e2 = owned.ScanAsyncAndDispose(K(100), K(200)).GetAsyncEnumerator();
+        Assert.IsTrue(Run(e2.MoveNextAsync()));
+        Run(e2.DisposeAsync());
+        Assert.IsFalse(Run(e2.MoveNextAsync()));
+        Run(e2.DisposeAsync());
+        Assert.ThrowsExactly<ObjectDisposedException>(() => owned.Valid);
+    }
+
+    /// <summary>
+    /// Pins: with statistics enabled, async moves and a ScanAsync over cached blocks (completing synchronously) allocate
+    /// nothing per step, now that scans go through the iterator core and moves are tracked for disposal.
+    /// </summary>
+    [TestMethod]
+    public void AsyncMovesAndScansStayAllocationFree()
+    {
+        var fs = new AsyncReadFileSystem(NewFs()) { Asynchronous = false };
+        using TestDb t = BuildPlainDb(fs);
+        ColumnFamily cf = t.Db.DefaultColumnFamily;
+        using Iterator it = cf.NewIterator(null);
+        byte[] lo = K(10), hi = K(390);
+        void Pass()
+        {
+            it.SeekToFirstAsync().GetAwaiter().GetResult();
+            while (it.Valid) it.NextAsync().GetAwaiter().GetResult();
+            IAsyncEnumerator<KeyValue> e = it.ScanAsync(lo, hi).GetAsyncEnumerator();
+            while (e.MoveNextAsync().GetAwaiter().GetResult()) { }
+            e.DisposeAsync().GetAwaiter().GetResult();
+        }
+        Pass();
+        Pass();
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 5; i++) Pass();
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        // A Debug build of the library compiles async state machines as classes (allocated per call even when they
+        // complete synchronously): the bound holds for optimized builds (see IteratorReuseTests).
+        bool optimized = typeof(RocksDatabase).Assembly.GetCustomAttribute<System.Diagnostics.DebuggableAttribute>() is not { IsJITOptimizerDisabled: true };
+        if (optimized) Assert.AreEqual(0, allocated, "bytes allocated by 5 passes of 400 NextAsync + a 380-entry ScanAsync");
     }
 }

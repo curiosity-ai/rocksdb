@@ -417,7 +417,8 @@ public sealed class Iterator : IDisposable
 
         public void Reset(ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end, bool ownsIterator)
         {
-            if (_active) throw new InvalidOperationException("The previous ScanAsync enumeration of this iterator was not disposed.");
+            if (_active || Volatile.Read(ref _iterator._moveState) != Idle)
+                throw new InvalidOperationException("The previous ScanAsync enumeration of this iterator was not disposed.");
             _start = start;
             _end = end;
             _ownsIterator = ownsIterator;
@@ -441,8 +442,14 @@ public sealed class Iterator : IDisposable
 
         public ValueTask<bool> MoveNextAsync()
         {
+            // A disposed enumeration returns false (also when ScanAsyncAndDispose disposed the iterator with it); one whose
+            // iterator was disposed under it throws.
+            if (!_active) return new ValueTask<bool>(false);
             if (_iterator._core is null) ThrowDisposed();
             if (_done) return new ValueTask<bool>(false);
+            // IAsyncEnumerator: one MoveNextAsync at a time. A second call while a step waits for a read would move the
+            // iterator under it.
+            if (Volatile.Read(ref _iterator._moveState) != Idle) ThrowConcurrentMoveNext();
             _ct.ThrowIfCancellationRequested();
             // The moves go through the core like Seek / Next of the sync range enumerator: statistics (NUMBER_DB_SEEK /
             // NEXT, ITER_BYTES_READ), query tracing and the renewal of a tailing iterator apply to scans too.
@@ -512,6 +519,11 @@ public sealed class Iterator : IDisposable
             return true;
         }
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+        private static void ThrowConcurrentMoveNext() =>
+            throw new InvalidOperationException("MoveNextAsync was called while the previous MoveNextAsync of this scan (or an async move of its iterator) is still running.");
+
         public ValueTask DisposeAsync()
         {
             if (!_active) return ValueTask.CompletedTask;
@@ -525,7 +537,7 @@ public sealed class Iterator : IDisposable
         /// <summary>Returns the item buffer to the array pool (the iterator is disposed).</summary>
         public void ReleaseBuffer()
         {
-            _active = false;
+            // _active stays: MoveNextAsync of an enumeration whose iterator was disposed under it throws ObjectDisposedException.
             _done = true;
             _current = default;
             byte[] b = _buffer;
