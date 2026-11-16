@@ -308,13 +308,19 @@ public sealed class Audit8AsyncBackgroundIoTests
         private readonly ManualResetEventSlim _gate = new(false);
         private readonly int _maxWorkers, _maxIo, _minWorkers, _minIo;
 
-        public DeadThreadPool()
+        public DeadThreadPool() : this(block: true)
+        {
+        }
+
+        /// <param name="block">false: only cap the pool at the processor count (no thread injection above it).</param>
+        public DeadThreadPool(bool block)
         {
             ThreadPool.GetMaxThreads(out _maxWorkers, out _maxIo);
             ThreadPool.GetMinThreads(out _minWorkers, out _minIo);
             int cap = Environment.ProcessorCount;
             Assert.IsTrue(ThreadPool.SetMinThreads(Math.Min(_minWorkers, cap), _minIo));
             Assert.IsTrue(ThreadPool.SetMaxThreads(cap, _maxIo), "SetMaxThreads");
+            if (!block) return;
             for (int i = 0; i < cap; i++)
             {
                 ThreadPool.UnsafeQueueUserWorkItem(static g => ((ManualResetEventSlim)g!).Wait(), _gate);
@@ -593,6 +599,243 @@ public sealed class Audit8AsyncBackgroundIoTests
                     Assert.AreEqual(applied ? 1048576UL : before, db.GetColumnFamily("default").Options.WriteBufferSize, op + " " + file + ": SetOptions");
                 }
             }), "cancelled DropColumnFamilyAsync / SetOptionsAsync at " + op + " " + file);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // 6. Mixed sync and async callers.
+
+    /// <summary>
+    /// Sync writers on .NET thread-pool threads behind an async write leader: the leader's WAL append completes
+    /// asynchronously, so its continuation needs a pool thread, while every pool thread is a sync follower blocked until
+    /// that leader finishes the group. With the pool capped at the processor count (no thread injection) this deadlocks;
+    /// with the default pool it stalls until the pool injects a thread (hill climbing, about one per 0.5 s per blocked
+    /// round). Native has no async writers; the managed sync API is documented not to wait on thread-pool work.
+    /// </summary>
+    [TestMethod]
+    [DoNotParallelize]
+    [Ignore("audit #8 open: a sync writer that follows an async write leader waits for the leader's thread-pool continuation (WAL I/O that completes asynchronously, a stall wait); sync writers occupying the pool deadlock a capped pool and stall the default one until it injects threads")]
+    public void SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress()
+    {
+        var fs = new YieldingFileSystem(NewFs());
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        int n = Environment.ProcessorCount;
+        Task all;
+        using (new DeadThreadPool(block: false))
+        {
+            var tasks = new List<Task>();
+            for (int t = 0; t < n; t++)
+            {
+                int id = t;
+                tasks.Add(Task.Factory.StartNew(() =>
+                {
+                    for (int i = 0; i < 2000; i++) db.Put(Key(id * 100_000 + i), B("s"));
+                }, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.Default));
+            }
+            var asyncDone = new TaskCompletionSource();
+            var writer = new Thread(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 2000; i++) db.PutAsync(Key(900_000 + i), B("a")).AsTask().GetAwaiter().GetResult();
+                    asyncDone.SetResult();
+                }
+                catch (Exception e)
+                {
+                    asyncDone.SetException(e);
+                }
+            }) { IsBackground = true };
+            writer.Start();
+            tasks.Add(asyncDone.Task);
+            all = Task.WhenAll(tasks);
+            bool finished = all.Wait(Deadline);
+            if (!finished) Assert.Fail("sync writers on pool threads and an async writer made no progress within " + Deadline);
+        }
+        all.GetAwaiter().GetResult();
+    }
+
+    private static async Task ExpectCanceled(ValueTask t, CancellationTokenSource cts, string what)
+    {
+        await Task.Delay(50);
+        Assert.IsFalse(t.IsCompleted, what + " completed before the cancellation");
+        cts.Cancel();
+        try
+        {
+            await t.AsTask().WaitAsync(Deadline);
+            Assert.Fail(what + " was not cancelled");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Pins cancellation of the waits of FlushAsync (DBImpl::WaitForFlushMemTables), CompactRangeAsync (RunManualCompaction
+    /// waiting for a conflicting compaction) and WaitForCompactAsync: each ends with OperationCanceledException and leaves
+    /// no stranded waiter, manual compaction or file marked being compacted. The flush it requested still runs, the
+    /// running compaction completes, and later sync and async Flush / CompactRange / WaitForCompact and Dispose work.
+    /// </summary>
+    [TestMethod]
+    public void ControlApiWaitsCancelledLeaveNoStrandedWork()
+    {
+        var fs = new YieldingFileSystem(NewFs());
+        using var compactionGate = new ManualResetEventSlim(false);
+        using var flushGate = new ManualResetEventSlim(true);
+        int compactions = 0;
+        TestHooks.Set("DBImpl::RunCompaction:Start", () =>
+        {
+            if (Interlocked.Increment(ref compactions) == 1) compactionGate.Wait(Deadline);
+        });
+        TestHooks.Set("DBImpl::FlushMemTables:Start", () => flushGate.Wait(Deadline));
+        WithDeadline(Task.Run(async () =>
+        {
+            await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), new ColumnFamilyOptions { DisableAutoCompactions = true });
+            for (int f = 0; f < 3; f++)
+            {
+                for (int i = 0; i < 50; i++) await db.PutAsync(Key(i), Value(i, f));
+                await db.FlushAsync();
+            }
+            // A manual compaction that blocks on its compaction thread.
+            ValueTask first = db.CompactRangeAsync();
+            while (Volatile.Read(ref compactions) == 0) await Task.Delay(1);
+            // A second CompactRange conflicts with it and waits.
+            using (var cts = new CancellationTokenSource()) await ExpectCanceled(db.CompactRangeAsync(Key(0), Key(10), cts.Token), cts, "CompactRangeAsync");
+            using (var cts = new CancellationTokenSource()) await ExpectCanceled(db.WaitForCompactAsync(cts.Token), cts, "WaitForCompactAsync");
+            // A flush that blocks on its flush thread.
+            flushGate.Reset();
+            await db.PutAsync(B("flushed"), B("1"));
+            using (var cts = new CancellationTokenSource()) await ExpectCanceled(db.FlushAsync(cts.Token), cts, "FlushAsync");
+            flushGate.Set();
+            compactionGate.Set();
+            await first.AsTask().WaitAsync(Deadline);
+            await db.WaitForCompactAsync().AsTask().WaitAsync(Deadline);
+            // The cancelled flush's request still completed.
+            Assert.AreEqual("0", db.GetProperty("rocksdb.num-immutable-mem-table"));
+            Assert.AreEqual("0", db.GetProperty("rocksdb.num-running-compactions"));
+            await db.PutAsync(B("after"), B("2"));
+            await db.FlushAsync();
+            await db.CompactRangeAsync();
+            await Task.Run(() =>
+            {
+                db.Put(B("sync"), B("3"));
+                db.Flush();
+                db.CompactRange();
+                db.WaitForCompact();
+            });
+            // Every CompactRange ran: nothing is left in L0 (non-overlapping files are moved to the last level).
+            foreach (LiveFileMetadata f in db.GetLiveFilesMetadata()) Assert.AreEqual(6, f.Level, f.Name);
+        }), "cancelled control API waits");
+        using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs));
+        Assert.AreEqual("1", GetString(reopened, "flushed"));
+        Assert.AreEqual("3", GetString(reopened, "sync"));
+        Assert.AreEqual("value-49-2" + new string('x', 49), GetString(reopened, "key000049"));
+    }
+
+    /// <summary>
+    /// Pins concurrent MANIFEST writers mixing sync callers (dedicated threads) and async callers whose MANIFEST I/O
+    /// completes asynchronously (VersionSet::LogAndApply's manifest_writers_ queue): column family creates / drops,
+    /// flush installs and automatic compactions interleave, every caller gets its own outcome, the reopened MANIFEST
+    /// lists exactly the column families the callers created and did not drop, every acknowledged write is readable,
+    /// and no background task faults unobserved (TaskScheduler.UnobservedTaskException).
+    /// </summary>
+    [TestMethod]
+    public void ConcurrentSyncAndAsyncManifestWritersAgree()
+    {
+        int unobserved = 0;
+        EventHandler<UnobservedTaskExceptionEventArgs> handler = (_, e) =>
+        {
+            Interlocked.Increment(ref unobserved);
+            Console.WriteLine("unobserved: " + e.Exception);
+        };
+        TaskScheduler.UnobservedTaskException += handler;
+        try
+        {
+            var fs = new YieldingFileSystem(NewFs());
+            var expected = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>();
+            RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), new ColumnFamilyOptions { WriteBufferSize = 32 << 10, Level0FileNumCompactionTrigger = 2 });
+            try
+            {
+                var workers = new List<Task>();
+                for (int w = 0; w < 3; w++)
+                {
+                    int id = w;
+                    workers.Add(Task.Run(async () =>
+                    {
+                        for (int i = 0; i < 15; i++)
+                        {
+                            string name = "a" + id + "-" + i;
+                            ColumnFamily cf = await db.CreateColumnFamilyAsync(name, new ColumnFamilyOptions());
+                            await cf.PutAsync(B("k"), B(name));
+                            await db.PutAsync(Key(id * 1000 + i), Value(i, id));
+                            if (i % 3 == 0) await db.FlushAsync();
+                            if (i % 2 == 0) await db.DropColumnFamilyAsync(cf);
+                            else expected[name] = true;
+                        }
+                    }));
+                }
+                for (int w = 0; w < 2; w++)
+                {
+                    int id = w;
+                    var done = new TaskCompletionSource();
+                    var t = new Thread(() =>
+                    {
+                        try
+                        {
+                            for (int i = 0; i < 15; i++)
+                            {
+                                string name = "s" + id + "-" + i;
+                                ColumnFamily cf = db.CreateColumnFamily(name, new ColumnFamilyOptions());
+                                cf.Put(B("k"), B(name));
+                                db.Put(Key(10_000 + id * 1000 + i), Value(i, id));
+                                if (i % 3 == 1) db.Flush();
+                                if (i % 2 == 1) db.DropColumnFamily(cf);
+                                else expected[name] = true;
+                            }
+                            done.SetResult();
+                        }
+                        catch (Exception e)
+                        {
+                            done.SetException(e);
+                        }
+                    }) { IsBackground = true };
+                    t.Start();
+                    workers.Add(done.Task);
+                }
+                WithDeadline(Task.WhenAll(workers), "concurrent MANIFEST writers");
+                WithDeadline(db.WaitForCompactAsync().AsTask(), "WaitForCompactAsync");
+            }
+            finally
+            {
+                WithDeadline(db.DisposeAsync().AsTask(), "DisposeAsync");
+            }
+            List<string> names = RocksDatabase.ListColumnFamilies(DbPath, fs);
+            names.Remove("default");
+            var want = new List<string>(expected.Keys);
+            names.Sort(StringComparer.Ordinal);
+            want.Sort(StringComparer.Ordinal);
+            CollectionAssert.AreEqual(want, names);
+            var descriptors = new List<ColumnFamilyDescriptor> { new("default", new ColumnFamilyOptions()) };
+            foreach (string n in want) descriptors.Add(new ColumnFamilyDescriptor(n, new ColumnFamilyOptions()));
+            using (RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs), descriptors))
+            {
+                foreach (string n in want) Assert.AreEqual(n, GetString(reopened.GetColumnFamily(n), "k"));
+                for (int id = 0; id < 3; id++)
+                {
+                    for (int i = 0; i < 15; i++) Assert.IsNotNull(reopened.Get(Key(id * 1000 + i)));
+                }
+                for (int id = 0; id < 2; id++)
+                {
+                    for (int i = 0; i < 15; i++) Assert.IsNotNull(reopened.Get(Key(10_000 + id * 1000 + i)));
+                }
+            }
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert.AreEqual(0, Volatile.Read(ref unobserved));
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= handler;
         }
     }
 }
