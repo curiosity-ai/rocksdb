@@ -1060,10 +1060,18 @@ internal sealed partial class DbImpl : IAsyncDisposable
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
             // Under the WAL I/O lock: a FlushWAL called while LockWAL is held may be using them outside the write thread.
+            // CloseHelper: a failure of LogWriterNumber::ClearWriter (the WAL's WriteBuffer) is logged and the first one is
+            // returned by Close once the close has finished ("Retain the first error"); closing the file itself
+            // (~Writer) ignores its status. Nothing aborts the rest of the close.
+            RocksDbException? closeError = null;
             await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
             try
             {
-                foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
+                foreach (LogWriter closed in _closedWalsToSync)
+                {
+                    RocksDbException? walError = await ClearWalWriterAsync(closed, synchronous).ConfigureAwait(false);
+                    closeError ??= walError;
+                }
                 _closedWalsToSync.Clear();
                 CloseFreedWals();
                 LogWriter? log = _log;
@@ -1071,8 +1079,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 if (log is not null)
                 {
                     MaybeTruncateWalOnClose(log);
-                    if (synchronous) log.Dispose();
-                    else await log.DisposeAsync().ConfigureAwait(false);
+                    RocksDbException? walError = await ClearWalWriterAsync(log, synchronous).ConfigureAwait(false);
+                    closeError ??= walError;
                 }
             }
             finally
@@ -1106,8 +1114,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished
-            // (DB::Close returns the status).
-            RocksDbException? closeError = null;
+            // (DB::Close returns the status; a WAL error above comes first).
             if (!_readOnly && Versions.GetColumnFamily(0) is { } defaultCfd)
             {
                 try
@@ -1118,10 +1125,19 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 }
                 catch (Exception e) when (e is IOException or RocksDbException)
                 {
-                    closeError = RocksDbException.FromException(e);
+                    closeError ??= RocksDbException.FromException(e);
                 }
             }
-            await Versions.CloseAsync(synchronous).ConfigureAwait(false);
+            try
+            {
+                await Versions.CloseAsync(synchronous).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is IOException or RocksDbException)
+            {
+                // CloseHelper: "Unable to close MANIFEST with error"; kept if it is the first error.
+                LogError("Unable to close MANIFEST with error -- " + e.Message);
+                closeError ??= RocksDbException.FromException(e);
+            }
             lock (_mutex)
             {
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);
@@ -1151,6 +1167,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();
         }
+    }
+
+    /// <summary>
+    /// LogWriterNumber::ClearWriter (db/db_impl/db_impl.h) for close: writes out the WAL's buffer and returns its error
+    /// (logged, "Unable to clear writer for WAL"), then closes the file ignoring the close status (~Writer).
+    /// </summary>
+    private async ValueTask<RocksDbException?> ClearWalWriterAsync(LogWriter log, bool synchronous)
+    {
+        RocksDbException? error = null;
+        try
+        {
+            if (synchronous) log.WriteBuffer();
+            else await log.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            LogWarn("Unable to clear writer for WAL " + FileNames.LogFileName(WalDir, log.LogNumber) + " with error -- " + e.Message);
+            error = RocksDbException.FromException(e);
+        }
+        try
+        {
+            if (synchronous) log.Dispose();
+            else await log.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+        }
+        return error;
     }
 
     /// <summary>Drops the CF's references on its super version, memtables and version and closes its table cache. REQUIRES: mutex.</summary>

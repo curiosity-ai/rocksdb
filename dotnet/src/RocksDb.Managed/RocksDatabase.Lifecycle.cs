@@ -12,8 +12,8 @@ public sealed partial class RocksDatabase
     /// compactions are canceled. With <paramref name="wait"/> the call returns once the running background jobs finished.
     /// <para>
     /// The DB stays usable for reads; writes still reach the WAL and memtables but are no longer flushed, so a write
-    /// that needs a flush to make room can stall, and Flush / CompactRange fail with ShutdownInProgress or
-    /// ObjectDisposed. Call it before closing to stop background work early, e.g. at process shutdown; closing
+    /// that needs a flush to make room can stall, and Flush / CompactRange / WaitForCompact fail with
+    /// ShutdownInProgress. Call it before closing to stop background work early, e.g. at process shutdown; closing
     /// afterwards does not flush again. Thread-safe; calling it twice is harmless.
     /// </para>
     /// </summary>
