@@ -530,4 +530,79 @@ public sealed class Audit7ApiEdgeCasesTests
         Console.WriteLine("open files after iterator dispose: " + fs.OpenFiles);
         Assert.AreEqual(0, fs.OpenFiles);
     }
+    /// <summary>
+    /// Ingestion into a column family dropped before the call: DBImpl::ReserveFileNumbersBeforeIngestion's dummy edit
+    /// fails in VersionSet::LogAndApply ("if (0 == num_undropped_cfds) s = Status::ColumnFamilyDropped();",
+    /// db/version_set.cc). The file is not ingested and nothing is left in the DB directory. (The 11.12 package reports
+    /// InvalidArgument here, see Audit7ApiEdgeCasesCompatTests.DroppedColumnFamilyHandleMatchesNative.)
+    /// </summary>
+    [TestMethod]
+    public void IngestIntoDroppedColumnFamilyFails()
+    {
+        MemoryFileSystem fs = NewFs();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        ColumnFamily cf = db.CreateColumnFamily("cf", new ColumnFamilyOptions());
+        WriteExternalFile(fs, "/ext.sst");
+        db.DropColumnFamily(cf);
+        int before = CountTableFiles(fs);
+        RocksDbException e = Assert.ThrowsExactly<RocksDbException>(() => db.IngestExternalFiles(cf, ["/ext.sst"], new IngestExternalFileOptions()));
+        Assert.AreEqual(StatusCode.ColumnFamilyDropped, e.Code);
+        Assert.AreEqual(before, CountTableFiles(fs));
+        Assert.IsTrue(fs.FileExists("/ext.sst"));
+        Assert.IsNull(cf.Get(B("a")));
+    }
+
+    /// <summary>
+    /// A column family dropped while its ingestion is being prepared (after the file numbers were reserved): DBImpl::
+    /// IngestExternalFiles (db/db_impl/db_impl.cc ~8172) checks under the write thread, "if (cfd->IsDropped()) { status =
+    /// Status::InvalidArgument("cannot ingest an external file into a dropped CF"); break; }", and the jobs' Cleanup removes
+    /// the prepared copies. The port threw ColumnFamilyDropped. Native cannot be driven into this window through the C API
+    /// (no sync points).
+    /// </summary>
+    [TestMethod]
+    public async Task IngestIntoColumnFamilyDroppedDuringPrepareIsInvalidArgument()
+    {
+        var mem = new MemoryFileSystem();
+        mem.CreateDirectoryIfMissing(DbPath);
+        var fs = new FaultInjectionFileSystem(mem);
+        await using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        ColumnFamily cf = db.CreateColumnFamily("cf", new ColumnFamilyOptions());
+        WriteExternalFile(mem, "/ext.sst");
+        int before = CountTableFiles(mem);
+        bool dropped = false;
+        fs.OnAsyncWrite = (op, path) =>
+        {
+            // The first asynchronous append to the copy inside the DB directory: the numbers are reserved by now.
+            if (dropped || op != "AppendAsync" || !path.EndsWith(".sst", StringComparison.Ordinal)) return;
+            dropped = true;
+            db.DropColumnFamily(cf);
+        };
+        RocksDbException e = await Assert.ThrowsExactlyAsync<RocksDbException>(async () =>
+            await db.IngestExternalFilesAsync(cf, ["/ext.sst"], new IngestExternalFileOptions()));
+        fs.OnAsyncWrite = null;
+        Assert.IsTrue(dropped, "the copy did not use an asynchronous append");
+        Assert.AreEqual(StatusCode.InvalidArgument, e.Code, e.Message);
+        StringAssert.Contains(e.Message, "cannot ingest an external file into a dropped CF");
+        Assert.AreEqual(before, CountTableFiles(mem));
+        Assert.IsTrue(mem.FileExists("/ext.sst"));
+        Assert.IsNull(cf.Get(B("a")));
+    }
+
+    private static void WriteExternalFile(IFileSystem fs, string path)
+    {
+        using var w = new SstFileWriter(new ColumnFamilyOptions(), fs);
+        w.Open(path);
+        w.Put(B("a"), B("1"));
+        w.Finish();
+    }
+
+    private static int CountTableFiles(IFileSystem fs)
+    {
+        int n = 0;
+        foreach (string c in fs.GetChildren(DbPath))
+        {
+            if (c.EndsWith(".sst", StringComparison.Ordinal)) n++;
+        }
+        return n;
+    }
 }

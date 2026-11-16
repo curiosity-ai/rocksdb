@@ -158,7 +158,9 @@ internal sealed partial class DbImpl
                 try
                 {
                     ThrowIfDbStopped();
-                    if (cfd.Dropped) ThrowDropped(cfd);
+                    // DBImpl::IngestExternalFiles (db/db_impl/db_impl.cc): checked under the write thread, before the
+                    // memtable overlap check.
+                    if (cfd.Dropped) ThrowHelper.InvalidArgument("cannot ingest an external file into a dropped CF");
                     SuperVersion sv = GetReferencedSuperVersion(cfd);
                     try
                     {
