@@ -71,7 +71,7 @@ internal static class FlushJob
         Statistics? flushStatistics, FlushJobContext job, bool synchronous, CancellationToken cancellationToken)
     {
         bool stripTimestamps = cfd.TimestampsInMemtableOnly;
-        CompactionFilter? filter = CreateFlushCompactionFilter(cfd);
+        CompactionFilter? filter = CreateFlushCompactionFilter(cfd, job.Reason);
         // BuildTable: OutputValidator(enable_hash = paranoid_file_checks); the read-back after the file is finished
         // compares the hash. The hash is kept by the CompactionIterator path and the timestamp-stripping path; the plain
         // copy loop has none (it is only taken with paranoid_file_checks when a snapshot checker is set).
@@ -250,15 +250,14 @@ internal static class FlushJob
     /// <summary>
     /// BuildTable (db/builder.cc): the filter the CF's compaction filter factory creates for this table file when
     /// ShouldFilterTableFileCreation(reason) allows it (Context: not a full compaction, not manual, the CF's id, the
-    /// reason), or null. CompactionFilterFactory.ShouldFilterTableFileCreation takes "isFlush" rather than the reason, so
-    /// a recovery flush (kRecovery) asks the same question as a flush. The plain <c>compaction_filter</c> option is never
-    /// applied to flushes, like upstream (it is only ioptions.compaction_filter_factory there). A filter that does not
-    /// ignore snapshots fails the flush with NotSupported.
+    /// reason: kFlush, or kRecovery for the flushes of a WAL replay), or null. The plain <c>compaction_filter</c> option is
+    /// never applied to flushes, like upstream (it is only ioptions.compaction_filter_factory there). A filter that does
+    /// not ignore snapshots fails the flush with NotSupported.
     /// </summary>
-    private static CompactionFilter? CreateFlushCompactionFilter(ColumnFamilyData cfd)
+    private static CompactionFilter? CreateFlushCompactionFilter(ColumnFamilyData cfd, TableFileCreationReason reason)
     {
-        if (cfd.Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: true)) return null;
-        CompactionFilter? filter = factory.CreateCompactionFilter(new CompactionFilterContext(false, false, cfd.Id, IsFlush: true));
+        if (cfd.Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(reason)) return null;
+        CompactionFilter? filter = factory.CreateCompactionFilter(new CompactionFilterContext(false, false, cfd.Id, IsFlush: true) { Reason = reason });
         if (filter is not null && !filter.IgnoreSnapshots)
         {
             ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);

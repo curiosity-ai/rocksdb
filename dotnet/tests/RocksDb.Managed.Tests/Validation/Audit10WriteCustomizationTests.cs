@@ -1004,4 +1004,97 @@ public sealed class Audit10WriteCustomizationTests
         using RocksDatabase reopened = RocksDatabase.Open(Db, NewOptions(fs), cfo);
         AssertModel(reopened, model, "after failed filtered open");
     }
+
+    // ---- compaction filter factory context --------------------------------------------------------------------------
+
+    /// <summary>Removes values "drop"; records every context it is asked about and created for.</summary>
+    private sealed class ReasonFactory(bool useReasonOverload, List<string> log) : CompactionFilterFactory
+    {
+        public override string Name => "ReasonFactory";
+
+        public override bool ShouldFilterTableFileCreation(bool isFlush)
+        {
+            lock (log) log.Add("ask isFlush=" + isFlush);
+            return true;
+        }
+
+        public override bool ShouldFilterTableFileCreation(TableFileCreationReason reason)
+        {
+            if (!useReasonOverload) return base.ShouldFilterTableFileCreation(reason);
+            lock (log) log.Add("ask " + reason);
+            // Flushes and compactions, not the flushes of a WAL replay.
+            return reason != TableFileCreationReason.Recovery;
+        }
+
+        public override CompactionFilter? CreateCompactionFilter(in CompactionFilterContext context)
+        {
+            lock (log)
+            {
+                log.Add("create " + context.Reason + " flush=" + context.IsFlush + " full=" + context.IsFullCompaction + " manual="
+                    + context.IsManualCompaction + " start=" + context.InputStartLevel);
+            }
+            return new DropFilter();
+        }
+    }
+
+    private sealed class DropFilter : CompactionFilter
+    {
+        public override string Name => "DropFilter";
+
+        public override CompactionFilterDecision Filter(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
+            ReadOnlySpan<byte> existingValue, IBufferWriter<byte> newValue, IBufferWriter<byte> skipUntil) =>
+            existingValue.SequenceEqual("drop"u8) ? CompactionFilterDecision.Remove : CompactionFilterDecision.Keep;
+    }
+
+    /// <summary>
+    /// CompactionFilterFactory::ShouldFilterTableFileCreation(TableFileCreationReason) and CompactionFilter::Context
+    /// (include/rocksdb/compaction_filter.h; BuildTable sets reason = tboptions.reason, kRecovery for
+    /// DBImpl::WriteLevel0TableForRecovery; Compaction::CreateCompactionFilter sets input_start_level = start_level_ and
+    /// reason = kCompaction). A factory can filter flushes but not the flushes of a WAL replay; the legacy bool overload
+    /// still sees a recovery flush as a flush.
+    /// </summary>
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void FilterFactorySeesTheTableFileCreationReason(bool useReasonOverload)
+    {
+        var log = new List<string>();
+        MemoryFileSystem fs = NewDbFs();
+        ColumnFamilyOptions Cfo() => new()
+        {
+            CompactionFilterFactory = new ReasonFactory(useReasonOverload, log),
+            DisableAutoCompactions = true,
+        };
+        using (RocksDatabase db = RocksDatabase.Open(Db, NewOptions(fs), Cfo()))
+        {
+            // Stays in the WAL: the close does not flush (the WAL is on).
+            db.Put(B("recovered"), B("drop"));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(Db, NewOptions(fs), Cfo()))
+        {
+            // The WAL replay flushed "recovered" (reason Recovery).
+            Assert.AreEqual(useReasonOverload ? "drop" : null, GetString(db, "recovered"));
+            db.Put(B("flushed"), B("drop"));
+            db.Put(B("kept"), B("x"));
+            db.Flush();
+            Assert.IsNull(GetString(db, "flushed"));
+            db.Put(B("kept2"), B("y"));
+            db.Flush();
+            db.CompactRange();
+            Assert.IsNull(GetString(db, "recovered"), "the compaction filters it");
+            Assert.AreEqual("x", GetString(db, "kept"));
+        }
+        string all = string.Join("\n", log);
+        if (useReasonOverload)
+        {
+            StringAssert.Contains(all, "ask Recovery");
+            Assert.IsFalse(all.Contains("create Recovery", StringComparison.Ordinal), all);
+            StringAssert.Contains(all, "create Flush flush=True full=False manual=False start=-1");
+            StringAssert.Contains(all, "create Compaction flush=False full=True manual=True start=0");
+        }
+        else
+        {
+            StringAssert.Contains(all, "create Recovery flush=True full=False manual=False start=-1");
+        }
+    }
 }

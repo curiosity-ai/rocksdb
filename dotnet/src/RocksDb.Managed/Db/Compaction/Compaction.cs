@@ -685,8 +685,13 @@ internal sealed class Compaction
     public CompactionFilter? CreateCompactionFilter(uint columnFamilyId)
     {
         if (Options.CompactionFilter is { } f) return f;
-        if (Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: false)) return null;
-        return factory.CreateCompactionFilter(new CompactionFilterContext(IsFullCompaction, IsManual, columnFamilyId, IsFlush: false));
+        if (Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(TableFileCreationReason.Compaction)) return null;
+        // Compaction::CreateCompactionFilter: input_start_level = start_level_, reason = kCompaction (input_table_properties
+        // is not offered).
+        return factory.CreateCompactionFilter(new CompactionFilterContext(IsFullCompaction, IsManual, columnFamilyId, IsFlush: false)
+        {
+            InputStartLevel = StartLevel,
+        });
     }
 
     /// <summary>Compaction::InputLevelSummary, e.g. "3@0 + 2@1 files to L1".</summary>
