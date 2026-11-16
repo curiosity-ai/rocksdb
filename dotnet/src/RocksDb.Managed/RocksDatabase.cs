@@ -531,7 +531,13 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     // Close
     // =====================================================================================================
 
-    /// <summary>Closes the DB (DB::Close): waits for writes and background flushes, closes the WAL/MANIFEST, releases LOCK.</summary>
+    /// <summary>
+    /// Closes the DB (DB::Close): waits for writes and background flushes, closes the WAL/MANIFEST, releases LOCK.
+    /// Every later call throws <see cref="ObjectDisposedException"/> (closing again does nothing); calls racing the close
+    /// (queued or stalled writes, Flush, CompactRange) fail with <see cref="ObjectDisposedException"/> or ShutdownInProgress.
+    /// An error writing out the WAL's buffer or verifying the MANIFEST is thrown once the close has finished: the DB is
+    /// closed either way.
+    /// </summary>
     public void Dispose()
     {
         ReleaseAllHandles();

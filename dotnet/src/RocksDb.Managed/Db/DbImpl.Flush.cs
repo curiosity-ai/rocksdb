@@ -835,7 +835,14 @@ internal sealed partial class DbImpl
                 if (cfd.Dropped) ThrowDropped(cfd);
                 // Close stops scheduling flushes: a flush that was queued but never started will not complete, so
                 // waiters must not sleep past shutdown (CloseAsync signals after setting _shuttingDown).
-                if (_shuttingDown) ThrowDisposed();
+                // WaitForFlushMemTables: "if (shutting_down_) return Status::ShutdownInProgress()" -- also after a public
+                // CancelAllBackgroundWork, which leaves the DB open; a flush racing the close fails like the other
+                // operations racing it (ObjectDisposedException).
+                if (_shuttingDown)
+                {
+                    if (_closing) ThrowDisposed();
+                    throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+                }
                 signal = _bgSignal.Task;
             }
             if (synchronous) signal.Wait(cancellationToken);
