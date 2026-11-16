@@ -130,9 +130,8 @@ internal sealed partial class DbImpl
         }
         AddImplicitStatsColumnFamily(descriptors, state.FindColumnFamily(PersistentStatsColumnFamilyName) is not null);
 
-        string? dbId = state.DbId;
-        if (dbId is null && FileSystem.FileExists(FileNames.IdentityFileName(DbName))) dbId = FileNames.ReadIdentityFile(FileSystem, DbName);
-        dbId ??= "";
+        // DBImplReadOnly::Recover -> SetupDBId(read_only = true): as a writable open, but nothing is written.
+        string dbId = SetupDbIdFromIdentityFile(state.DbId, out _);
         Versions.DbId = dbId;
         Identity = Identity with { DbId = dbId };
 

@@ -266,11 +266,10 @@ internal sealed partial class DbImpl
         if (missing.Count > 0 && !Options.CreateMissingColumnFamilies) ThrowHelper.InvalidArgument("Column family not found: " + missing[0]);
 
         // ---- DB identity (DBImpl::SetupDBId) ----
-        string? dbId = state.DbId;
-        if (dbId is null && FileSystem.FileExists(FileNames.IdentityFileName(DbName))) dbId = FileNames.ReadIdentityFile(FileSystem, DbName);
-        dbId ??= FileNames.GenerateUniqueId();
-        if (Options.WriteIdentityFile && !FileSystem.FileExists(FileNames.IdentityFileName(DbName)))
+        string? dbId = SetupDbIdFromIdentityFile(state.DbId, out bool identityFileOk);
+        if (!identityFileOk && Options.WriteIdentityFile)
         {
+            // "Persist it to IDENTITY file if allowed": a missing, empty or mismatching IDENTITY is rewritten.
             await FileNames.SetIdentityFileAsync(FileSystem, DbName, dbId, synchronous, ct).ConfigureAwait(false);
         }
         Versions.DbId = dbId;
@@ -446,6 +445,32 @@ internal sealed partial class DbImpl
         StartStatsPersist();
         EnableBackgroundCompactions();
         RegisterRecordSeqnoTimeWorker();
+    }
+
+    /// <summary>
+    /// The IDENTITY part of DBImpl::SetupDBId (db/db_impl/db_impl_files.cc): the DB id is the MANIFEST's
+    /// (<paramref name="manifestDbId"/>), else a non-empty IDENTITY file's, else a newly generated one.
+    /// <paramref name="identityFileOk"/> is false when IDENTITY is "missing or no good" (absent, empty, or not matching
+    /// the MANIFEST), i.e. when a writable open rewrites it. Opening a new DB reads back the id NewDB wrote.
+    /// </summary>
+    private string SetupDbIdFromIdentityFile(string? manifestDbId, out bool identityFileOk)
+    {
+        identityFileOk = false;
+        if (FileSystem.FileExists(FileNames.IdentityFileName(DbName)))
+        {
+            string inFile = FileNames.ReadIdentityFile(FileSystem, DbName);
+            if (inFile.Length > 0)
+            {
+                // Loaded from file and wasn't already known from manifest, or matches the manifest.
+                if (string.IsNullOrEmpty(manifestDbId) || manifestDbId == inFile)
+                {
+                    identityFileOk = true;
+                    return inFile;
+                }
+            }
+        }
+        // Otherwise IDENTITY file is missing or no good. Generate new id if needed.
+        return string.IsNullOrEmpty(manifestDbId) ? FileNames.GenerateUniqueId() : manifestDbId;
     }
 
     /// <summary>
