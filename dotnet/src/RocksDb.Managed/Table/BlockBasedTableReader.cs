@@ -1013,14 +1013,16 @@ public sealed partial class BlockBasedTableReader : TableReader
             }
             // WART (upstream): the index block checksum is skipped when it was checked on open.
             if (kv.Key == BlockBasedTableConstants.IndexBlockName && _options.VerifyChecksums) continue;
-            RocksArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, kv.Value, verifyChecksums: true, out _));
+            BlockFetcher.ReadAndVerifyChecksumOnly(_file, _footer, kv.Value);
         }
         IndexCursor idx = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
         try
         {
             for (idx.SeekToFirst(); idx.Valid; idx.Next())
             {
-                RocksArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, idx.Handle, verifyChecksums: true, out _));
+                // Raw contents only: the blocks are not decompressed (decompress = false upstream; decompressing here
+                // without the table's dictionary failed on valid dictionary-compressed tables).
+                BlockFetcher.ReadAndVerifyChecksumOnly(_file, _footer, idx.Handle);
             }
         }
         finally
@@ -2519,9 +2521,12 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             // The tail start isn't known before the properties are read; like upstream's default tail prefetch,
             // read the last 512 KiB (at least through the metaindex). Reads outside fall back to the inner file.
-            long start = Math.Max(0, fileSize - (512 << 10));
-            if (footer.IndexHandle.Size > 0) start = Math.Min(start, (long)footer.IndexHandle.Offset);
-            start = Math.Min(start, (long)footer.MetaindexHandle.Offset);
+            // Handles come from an unverified footer: compared as unsigned, so one past the end of the file (or past
+            // long.MaxValue) never moves the start (the block read itself then reports the corruption).
+            ulong startU = (ulong)Math.Max(0, fileSize - (512 << 10));
+            if (footer.IndexHandle.Size > 0) startU = Math.Min(startU, footer.IndexHandle.Offset);
+            startU = Math.Min(startU, footer.MetaindexHandle.Offset);
+            long start = (long)startU;
             long len = fileSize - start;
             if (len <= 0 || len > 64L << 20) return;
             byte[] buf = RocksArrayPool<byte>.Shared.Rent((int)len);

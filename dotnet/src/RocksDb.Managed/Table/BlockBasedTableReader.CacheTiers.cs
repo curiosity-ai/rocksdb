@@ -201,7 +201,7 @@ public sealed partial class BlockBasedTableReader
             _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset).WriteTo(key);
             ReadOnlyMemory<byte> k = key.AsMemory(0, CacheKey.Size);
             Statistics? stats = _stats?.Owner;
-            int serializedSize = checked((int)handle.Size + BlockBasedTableConstants.BlockTrailerSize);
+            int serializedSize = BlockFetcher.CheckedLength(handle);
             PersistentCacheLookupResult hit = await pc.LookupAsync(k, ct).ConfigureAwait(false);
             if (pc.IsCompressed)
             {
@@ -276,7 +276,7 @@ public sealed partial class BlockBasedTableReader
         Span<byte> key = stackalloc byte[CacheKey.Size];
         _baseCacheKey.WithOffsetForMinSizeRecord(handle.Offset).WriteTo(key);
         Statistics? stats = _stats?.Owner;
-        int serializedSize = checked((int)handle.Size + BlockBasedTableConstants.BlockTrailerSize);
+        int serializedSize = BlockFetcher.CheckedLength(handle);
         if (pc.IsCompressed)
         {
             if (pc.TryLookup(key, out byte[] data, out int length))
