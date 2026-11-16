@@ -842,7 +842,7 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
             }
             await StopFollowerStreamAsync().ConfigureAwait(false);
             await _dbGate.DrainAsync(_cts.Token).ConfigureAwait(false);
-            await _db.DisposeAsync().ConfigureAwait(false);
+            await HostResync.CloseDatabaseAsync(_db, Log).ConfigureAwait(false);
             while (!_cts.IsCancellationRequested)
             {
                 try

@@ -429,3 +429,26 @@ public sealed class DatabaseUsageGate
 
     public void Reopen() => _gate.OpenGate();
 }
+
+/// <summary>Steps of a host's resync (snapshot restore) shared by <see cref="PairNodeHost"/> and <see cref="ClusterNodeHost"/>.</summary>
+internal static class HostResync
+{
+    /// <summary>
+    /// Closes the database a resync is about to replace. An error the close reports (RocksDatabase.DisposeAsync throws
+    /// the status of DB::Close, e.g. a WAL file that failed to close) does not stop the resync: the close has completed
+    /// and released the LOCK by then (DbImpl.CloseAsync releases it in its finally), and the files are about to be
+    /// replaced by the snapshot. Letting it escape ended the resync task with the node marked as resyncing for good.
+    /// rocksdb-sharp's hosts close with Db.Dispose(), which reports nothing (rocksdb_close has no status), and go on.
+    /// </summary>
+    public static async ValueTask CloseDatabaseAsync(RocksDatabase db, Action<string> log)
+    {
+        try
+        {
+            await db.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is RocksDbException or IOException)
+        {
+            log("closing the database for the resync reported an error (ignored, the snapshot replaces it): " + e.Message);
+        }
+    }
+}

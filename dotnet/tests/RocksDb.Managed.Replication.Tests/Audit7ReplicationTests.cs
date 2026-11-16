@@ -218,11 +218,48 @@ public sealed class Audit7ReplicationTests
     // ---------------------------------------------------------------------------------------------------
     // Raft cluster: a resync that cannot start
 
-    /// <summary>Forwards to an inner file system; while <see cref="FailLogEnd"/> is set, writing raft.logend fails.</summary>
+    /// <summary>
+    /// Forwards to an inner file system; while <see cref="FailLogEnd"/> is set, writing raft.logend fails; while
+    /// <see cref="FailWalClose"/> is set, closing the next WAL file (*.log) fails after it was closed.
+    /// </summary>
     private sealed class LogEndFailingFileSystem(IFileSystem inner) : IFileSystem
     {
         public volatile bool FailLogEnd;
+        public volatile bool FailWalClose;
         public int Failures;
+
+        private IWritableFile Wrap(string path, IWritableFile f) => path.EndsWith(".log", StringComparison.Ordinal) ? new Writable(this, f) : f;
+
+        private sealed class Writable(LogEndFailingFileSystem fs, IWritableFile inner) : IWritableFile
+        {
+            public long Size => inner.Size;
+            public void Append(ReadOnlySpan<byte> data) => inner.Append(data);
+            public ValueTask AppendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) => inner.AppendAsync(data, cancellationToken);
+            public ValueTask FlushAsync(CancellationToken cancellationToken = default) => inner.FlushAsync(cancellationToken);
+            public ValueTask SyncAsync(CancellationToken cancellationToken = default) => inner.SyncAsync(cancellationToken);
+            public void Flush() => inner.Flush();
+            public void Sync() => inner.Sync();
+
+            private void FailOnce()
+            {
+                if (!fs.FailWalClose) return;
+                fs.FailWalClose = false;
+                Interlocked.Increment(ref fs.Failures);
+                throw new RocksDbException(StatusCode.IOError, "IO error: injected failure closing a WAL");
+            }
+
+            public void Dispose()
+            {
+                inner.Dispose();
+                FailOnce();
+            }
+
+            public async ValueTask DisposeAsync()
+            {
+                await inner.DisposeAsync();
+                FailOnce();
+            }
+        }
 
         private void Check(string path)
         {
@@ -236,17 +273,17 @@ public sealed class Audit7ReplicationTests
         public IWritableFile CreateWritable(string path, bool truncate = true)
         {
             Check(path);
-            return inner.CreateWritable(path, truncate);
+            return Wrap(path, inner.CreateWritable(path, truncate));
         }
 
         public IWritableFile CreateWritable(string path, bool truncate, WritableFileOptions options)
         {
             Check(path);
-            return inner.CreateWritable(path, truncate, options);
+            return Wrap(path, inner.CreateWritable(path, truncate, options));
         }
 
-        public IWritableFile ReopenWritable(string path, WritableFileOptions options) => inner.ReopenWritable(path, options);
-        public IWritableFile ReuseWritable(string path, string oldPath, WritableFileOptions options) => inner.ReuseWritable(path, oldPath, options);
+        public IWritableFile ReopenWritable(string path, WritableFileOptions options) => Wrap(path, inner.ReopenWritable(path, options));
+        public IWritableFile ReuseWritable(string path, string oldPath, WritableFileOptions options) => Wrap(path, inner.ReuseWritable(path, oldPath, options));
         public IRandomAccessFile OpenRandomAccess(string path) => inner.OpenRandomAccess(path);
         public IRandomAccessFile OpenRandomAccess(string path, RandomAccessFileOptions options) => inner.OpenRandomAccess(path, options);
         public ISequentialFile OpenSequential(string path) => inner.OpenSequential(path);
@@ -324,10 +361,79 @@ public sealed class Audit7ReplicationTests
     [TestMethod]
     public async Task FollowerWhoseResyncCannotStartFollowsTheLeaderAgain()
     {
-        var shared = new MemoryFileSystem();
+        (ClusterHarness c, ClusterNodeHost n1, ClusterNodeHost n3, LogEndFailingFileSystem n3Fs, DuplicatingClusterClient n3ToN1) =
+            await StartClusterWithFaultyN3Async();
+        await using ClusterHarness _ = c;
+        n3Fs.FailLogEnd = true;
+        n3ToN1.DuplicateNext = true;
+        await WriteCommittedAsync(c, 60, 80);
+        await WaitUntilAsync(() => c.LogText.Contains("n3: resync not started", StringComparison.Ordinal), "n3's failed resync\n" + c.LogText);
+        Assert.AreEqual(0, n3.Resyncs);
+
+        // The disk works again: n3 must rejoin (and rebuild, since its stream showed a divergence) without a leader change.
+        n3Fs.FailLogEnd = false;
+        await WriteCommittedAsync(c, 80, 100);
+        Assert.AreEqual("n1", (await c.WaitForLeaderAsync(null)).NodeId);
+        await c.AssertConvergedAsync(n1);
+    }
+
+    /// <summary>
+    /// A resync closes the follower's database before it restores the snapshot. When that close reports an error (here:
+    /// closing the WAL file fails; the close itself completes and releases the LOCK, see DbImpl.CloseAsync), the
+    /// exception escaped the resync task: the node stayed "resyncing" for good - no database, no stream, every heartbeat
+    /// refused - until restarted. Reference: rocksdb-sharp's PerformResyncAsync closes with <c>Db.Dispose()</c>, which
+    /// never throws (rocksdb_close returns no status), and goes on to pull the snapshot.
+    /// </summary>
+    [TestMethod]
+    public async Task ResyncGoesOnWhenClosingTheOldDatabaseReportsAnError()
+    {
+        (ClusterHarness c, ClusterNodeHost n1, ClusterNodeHost n3, LogEndFailingFileSystem n3Fs, DuplicatingClusterClient n3ToN1) =
+            await StartClusterWithFaultyN3Async();
+        await using (c)
+        {
+            n3Fs.FailWalClose = true;
+            n3ToN1.DuplicateNext = true;
+            await WriteCommittedAsync(c, 60, 80);
+            await WaitUntilAsync(() => n3.Resyncs == 1, "n3's resync\n" + c.LogText);
+            Assert.AreEqual(1, n3Fs.Failures, "the close of the old database did not fail as injected\n" + c.LogText);
+            await WriteCommittedAsync(c, 80, 100);
+            await c.AssertConvergedAsync(n1);
+        }
+    }
+
+    /// <summary>The same for a pair's replica (PairNodeHost.PerformResyncAsync closes its database the same way).</summary>
+    [TestMethod]
+    public async Task PairResyncGoesOnWhenClosingTheOldDatabaseReportsAnError()
+    {
+        var memory = new MemoryFileSystem();
+        var replicaFs = new LogEndFailingFileSystem(memory);
+        await using var h = new PairHarness { FileSystemOf = id => id == "B" ? replicaFs : memory };
+        await h.StartAsync("A");
+        await h.StartAsync("B");
+        using (WriteBatch b = new WriteBatch().Put(U("before"), U("1")))
+            Assert.AreEqual(PairWriteStatus.Applied, (await h["A"].WriteAsync(b, TimeSpan.FromSeconds(2), CancellationToken.None)).Status);
+        await h.AssertConvergedAsync("A", "B");
+
+        replicaFs.FailWalClose = true;
+        h["B"].TriggerResync("audit #7");
+        await h["B"].WaitForResyncAsync().WaitAsync(TestUtil.Timeout);
+        Assert.AreEqual(1, replicaFs.Failures, "the close of the old database did not fail as injected\n" + h.LogText);
+        Assert.AreEqual(1, h["B"].Resyncs, h.LogText);
+        using (WriteBatch b = new WriteBatch().Put(U("after"), U("2")))
+            Assert.AreEqual(PairWriteStatus.Applied, (await h["A"].WriteAsync(b, TimeSpan.FromSeconds(2), CancellationToken.None)).Status);
+        await h.AssertConvergedAsync("A", "B");
+    }
+
+    /// <summary>
+    /// Three nodes on one <see cref="MemoryFileSystem"/>, n1 leading, 60 entries committed and converged; n3's file system
+    /// and its client to n1 can inject faults.
+    /// </summary>
+    private static async Task<(ClusterHarness, ClusterNodeHost N1, ClusterNodeHost N3, LogEndFailingFileSystem, DuplicatingClusterClient)>
+        StartClusterWithFaultyN3Async()
+    {
         LogEndFailingFileSystem? n3Fs = null;
         DuplicatingClusterClient? n3ToN1 = null;
-        await using var c = new ClusterHarness(3, shared)
+        var c = new ClusterHarness(3, new MemoryFileSystem())
         {
             WrapFileSystem = (id, fs) => id == "n3" ? n3Fs = new LogEndFailingFileSystem(fs) : fs,
             WrapClient = (id, peer, client) => id == "n3" && peer == "n1" ? n3ToN1 = new DuplicatingClusterClient(client) : client,
@@ -339,18 +445,7 @@ public sealed class Audit7ReplicationTests
         await WaitUntilAsync(() => c.Statuses().TrueForAll(s => s.Mode == ClusterMode.Cluster), "every node in Cluster mode\n" + c.LogText);
         await WriteCommittedAsync(c, 50, 60);
         await c.AssertConvergedAsync(n1);
-
-        n3Fs!.FailLogEnd = true;
-        n3ToN1!.DuplicateNext = true;
-        await WriteCommittedAsync(c, 60, 80);
-        await WaitUntilAsync(() => c.LogText.Contains("n3: resync not started", StringComparison.Ordinal), "n3's failed resync\n" + c.LogText);
-        Assert.AreEqual(0, n3.Resyncs);
-
-        // The disk works again: n3 must rejoin (and rebuild, since its stream showed a divergence) without a leader change.
-        n3Fs.FailLogEnd = false;
-        await WriteCommittedAsync(c, 80, 100);
-        Assert.AreEqual("n1", (await c.WaitForLeaderAsync(null)).NodeId);
-        await c.AssertConvergedAsync(n1);
+        return (c, n1, n3, n3Fs!, n3ToN1!);
     }
 
     // ---------------------------------------------------------------------------------------------------
