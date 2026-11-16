@@ -934,6 +934,12 @@ internal sealed partial class DbImpl
             }
             else
             {
+                // A user SST partitioner that threw while IsTrivialMove consulted it fails the job (see
+                // Compaction.PartitionerFailure).
+                if (c.PartitionerFailure is { } partitionerFailure)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(partitionerFailure).Throw();
+                }
                 // InitSnapshotContext: with a snapshot checker the inputs may contain values not visible to a snapshot
                 // taken after the job starts; take one so that it appears in the snapshot list.
                 SnapshotChecker? checker = CurrentSnapshotChecker;

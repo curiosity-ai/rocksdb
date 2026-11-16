@@ -106,7 +106,21 @@ internal static class FileChecksumHelper
     public static IWritableFile CreateWritable(IFileSystem fs, string path, WritableFileOptions options)
     {
         IWritableFile file = fs.CreateWritable(path, truncate: true, options);
-        FileChecksumGenerator? gen = options.FileChecksumGenFactory?.CreateFileChecksumGenerator(new FileChecksumGenContext(path, ""));
+        FileChecksumGenerator? gen;
+        try
+        {
+            gen = options.FileChecksumGenFactory?.CreateFileChecksumGenerator(new FileChecksumGenContext(path, ""));
+        }
+        catch
+        {
+            // A user factory that throws (upstream's cannot fail: WritableFileWriter's constructor) fails the file's
+            // creation; the caller never sees the file, so it is closed and removed here rather than left as an orphan.
+            file.Dispose();
+            try { fs.DeleteFile(path); }
+            catch (IOException) { }
+            catch (RocksDbException) { }
+            throw;
+        }
         return new WriterFile(file, gen);
     }
 
