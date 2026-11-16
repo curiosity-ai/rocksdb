@@ -360,7 +360,7 @@ public sealed class Audit10WriteCustomizationTests
             model["bad"] = "base,x,y";
             model["zz"] = "2";
             s.On = true;
-            db.Flush();
+            _ = Capture(db.Flush); // may report the failure of the compaction it triggers
             Assert.IsTrue(listener.Seen.Wait(Timeout), "the automatic compaction did not fail: calls " + s.Calls + " "
                 + db.GetProperty("rocksdb.levelstats"));
             Assert.IsTrue(s.Calls > 0, "the merge operator was not called");
@@ -380,8 +380,8 @@ public sealed class Audit10WriteCustomizationTests
         model["zz"] = "2";
         s.On = true;
         int callsBefore = s.Calls;
-        db.Flush();
-        Assert.AreEqual(callsBefore, s.Calls, "the flush merged");
+        _ = Capture(db.Flush); // may report the failure of the automatic compaction it triggers
+        if (!automatic) Assert.AreEqual(callsBefore, s.Calls, "the flush merged");
         Exception? failure;
         if (automatic)
         {
@@ -414,10 +414,13 @@ public sealed class Audit10WriteCustomizationTests
 
     private sealed class ThrowingFilterFactory(Switch s, bool throwOnCreate, bool flushes) : CompactionFilterFactory
     {
+        public int Created;
+
         public override string Name => "ThrowingFilterFactory";
 
         public override CompactionFilter? CreateCompactionFilter(in CompactionFilterContext context)
         {
+            Interlocked.Increment(ref Created);
             if (throwOnCreate) Boom(s, "CreateCompactionFilter");
             return new ThrowingFilter(s);
         }
@@ -437,6 +440,47 @@ public sealed class Audit10WriteCustomizationTests
     /// (CompactionIterator::InvokeFilterIfNeeded, MergeHelper::FilterMerge, CompactionJob::SetupAndValidateCompactionFilter):
     /// the compaction fails like an I/O error of the job and the DB is recoverable.
     /// </summary>
+    [TestMethod]
+    public void ThrowingFilterInOneOfParallelSubcompactions()
+    {
+        // CompactionJob::Run with max_subcompactions: one filter per subcompaction (the factory is asked once per
+        // subcompaction, "each thread of work ... will create a new CompactionFilter", compaction_filter.h); the
+        // subcompaction holding "bad" throws, the others finish their outputs, and all of them are removed.
+        var s = new Switch();
+        MemoryFileSystem fs = NewDbFs();
+        DbOptions Dbo()
+        {
+            DbOptions o = NewOptions(fs);
+            o.MaxSubcompactions = 4;
+            return o;
+        }
+        var factory = new ThrowingFilterFactory(s, throwOnCreate: false, flushes: false);
+        ColumnFamilyOptions Cfo() => new()
+        {
+            MergeOperator = new StringAppendMergeOperator(),
+            Level0FileNumCompactionTrigger = 100,
+            CompactionFilterFactory = factory,
+            TargetFileSizeBase = 16 << 10,
+        };
+        RocksDatabase db = RocksDatabase.Open(Db, Dbo(), Cfo());
+        var model = new Dictionary<string, string?>(StringComparer.Ordinal);
+        for (int f = 0; f < 3; f++)
+        {
+            for (int i = 0; i < 6000; i++)
+            {
+                string k = (i == 3000 ? "bad" : "a") + i.ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
+                string v = "v" + f + "-" + i + new string('x', 20);
+                db.Put(B(k), B(v));
+                model[k] = v;
+            }
+            db.Flush();
+        }
+        s.On = true;
+        Exception? failure = Capture(db.CompactRange);
+        Assert.IsTrue(factory.Created > 1, "the filter was not created per subcompaction: " + factory.Created);
+        AssertBackgroundFailureRecoverable(fs, db, failure, s, model, Dbo, Cfo, "parallel subcompactions");
+    }
+
     [TestMethod]
     [DataRow(FilterKind.Filter)]
     [DataRow(FilterKind.FactoryFilter)]
@@ -701,7 +745,7 @@ public sealed class Audit10WriteCustomizationTests
             Dictionary<string, string?> more = WriteWorkload(db, 2);
             foreach (KeyValuePair<string, string?> kv in more) model[kv.Key] = kv.Value;
             s.On = true;
-            db.Flush();
+            _ = Capture(db.Flush); // may report the failure of the automatic compaction it triggers
         }
         Exception? failure;
         if (automatic)
