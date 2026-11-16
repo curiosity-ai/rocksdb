@@ -157,7 +157,9 @@ public static class DbIteratorFactory
                     {
                         FileMetaData f = files[fi];
                         TableReadFlags readFlags = TableReadFlagsExtensions.FromReadOptions(sources.ReadOptions);
-                        InternalIterator child = sources.PrefixExtractor is null
+                        InternalIterator child = sources.ReadOptions?.TableFilter is { } tableFilter && !TableInternalIterator.PassesTableFilter(tc, f, tableFilter)
+                            ? new EmptyInternalIterator()
+                            : sources.PrefixExtractor is null
                             ? readFlags == TableReadFlags.None ? tc.NewIterator(f) : TableInternalIterator.Create(tc.GetReader(f), readFlags, null, null)
                             : TableInternalIterator.Create(tc.GetReader(f), readFlags, sources.ReadOptions, sources.PrefixExtractor);
                         child.SetIterateUpperBound(sources.ReadOptions?.IterateUpperBound);

@@ -955,6 +955,9 @@ internal sealed partial class DbImpl
         }
         try
         {
+            // DBImpl::FailIfTableFilterWithRangeConversion (read-write DBs only; DBImplReadOnly / DBImplSecondary do not check).
+            if (options?.TableFilter is not null && !_readOnly && sv.MutableOptions.MinTombstonesForRangeConversion > 0)
+                ThrowHelper.InvalidArgument("ReadOptions::table_filter is not supported when min_tombstones_for_range_conversion > 0");
             GetReadTimestamp(cfd, options);
             if (options?.IterStartTs is not null && options.Timestamp is null) ThrowHelper.InvalidArgument("iter_start_ts requires timestamp");
         }
