@@ -171,6 +171,7 @@ public abstract partial class Transaction : IDisposable
         (_ownedSnapshots ??= new List<Snapshot>()).Add(s);
         _snapshot = s;
         _snapshotNeeded = false;
+        ReleaseUnreferencedSnapshots();
     }
 
     /// <summary>
@@ -185,6 +186,36 @@ public abstract partial class Transaction : IDisposable
     {
         _snapshot = null;
         _snapshotNeeded = false;
+        ReleaseUnreferencedSnapshots();
+    }
+
+    /// <summary>
+    /// TransactionBaseImpl keeps snapshot_ in a shared_ptr whose deleter releases the snapshot (SetSnapshotInternal), and
+    /// every save point holds a copy: a snapshot is released as soon as neither the transaction nor a save point refers
+    /// to it (SetSnapshot / ClearSnapshot / RollbackToSavePoint / PopSavePoint / Clear), not only at Dispose.
+    /// </summary>
+    private protected void ReleaseUnreferencedSnapshots()
+    {
+        if (_ownedSnapshots is not { Count: > 0 } owned) return;
+        for (int i = owned.Count - 1; i >= 0; i--)
+        {
+            Snapshot s = owned[i];
+            if (ReferenceEquals(s, _snapshot) || IsHeldBySavePoint(s)) continue;
+            s.Dispose();
+            owned.RemoveAt(i);
+        }
+    }
+
+    private bool IsHeldBySavePoint(Snapshot s)
+    {
+        if (_savePoints is { } sps)
+        {
+            foreach (SavePoint sp in sps)
+            {
+                if (ReferenceEquals(sp.Snapshot, s)) return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>snapshot_needed_: a snapshot requested with <see cref="SetSnapshotOnNextOperation"/> was not taken yet.</summary>
@@ -819,6 +850,7 @@ public abstract partial class Transaction : IDisposable
         {
             foreach ((ColumnFamilyData cfd, byte[] key) in untracked) UnlockGetForUpdate(cfd, key);
         }
+        ReleaseUnreferencedSnapshots();
         return true;
     }
 
@@ -839,6 +871,7 @@ public abstract partial class Transaction : IDisposable
         // that if we rollback to savepoint A, we remember to unlock keys in B.
         if (sps.Count > 0) sps[^1].NewLocks.MergeFrom(top.NewLocks);
         _batch.PopSavePoint();
+        ReleaseUnreferencedSnapshots();
         return true;
     }
 
@@ -918,7 +951,11 @@ public abstract partial class Transaction : IDisposable
     /// <summary>TransactionBaseImpl::Clear: drops the writes, tracked keys and save points (snapshots are kept).</summary>
     private protected virtual void Clear()
     {
-        _savePoints?.Clear();
+        if (_savePoints is { Count: > 0 } sps)
+        {
+            sps.Clear();
+            ReleaseUnreferencedSnapshots();
+        }
         _batch.Clear();
         _tracked.Clear();
         _commitTimeBatch?.Clear();

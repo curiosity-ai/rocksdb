@@ -39,6 +39,8 @@ internal enum FaultOps
     Rename = 8,
     SyncDirectory = 16,
     All = Create | Append | Sync | Rename | SyncDirectory,
+    /// <summary>File deletions (not part of <see cref="All"/>).</summary>
+    Delete = 32,
 }
 
 /// <summary>
@@ -289,6 +291,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
     public void DeleteFile(string path)
     {
+        CheckTargeted(path, FaultOps.Delete);
         Mutate("delete", path);
         Inner.DeleteFile(path);
     }
