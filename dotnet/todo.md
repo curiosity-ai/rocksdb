@@ -460,3 +460,13 @@ Still open from this round:
 - [x] IDENTITY handled as SetupDBId (mismatch rewritten, empty regenerated, read-only writes nothing); create_if_missing message
 - [x] Crash sweeps over every mutating operation of open (12 scenarios) and close (6 scenarios), TransactionDB open sweep; file listings vs native
 - [ ] `OptimisticTransactionDatabase.Open` does not dispose the DB if its constructor throws (only on out-of-memory; unconfirmed)
+
+## Audit #10 (2026-11-16; docs/validation.md "Audit #10: user customization points")
+
+- [x] Native differentials with the same C# callbacks: custom prefix extractor, comparator, merge operator, compaction filter / factory, table filter
+- [x] Do-nothing FindShortestSeparator / FindShortSuccessor overrides keep the key; inconsistent comparator -> Corruption at flush; ReadOptions.TableFilter ported
+- [x] Throwing user code fails safely everywhere (partitioner, checksum factory, compaction service, merge operator, filters, collectors, listeners, comparators, extractors)
+- [x] Compaction filter factories see the table file creation reason
+- [ ] `CompactionFilter::Context::input_table_properties`; `MergeOperator::ShouldMerge`; `max_successive_merges`; `OnSubcompaction*` / `OnFile*Finish` listeners
+- [ ] Custom filter policy reusing the built-in compatibility name gets the built-in reader
+- [ ] Failed background compaction output possibly kept until the next open (unconfirmed)

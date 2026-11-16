@@ -2425,3 +2425,74 @@ reaches. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit9OpenCloseTests.cs`
   of leftover files at open, failed opens (unlisted column family, error_if_exists, LOCK held) leaving the same files.
 - Read-only open and close perform zero mutating file operations; a secondary follows MANIFEST rotations and its close
   deletes nothing of the primary's; Dispose with an outstanding snapshot, iterator and transaction closes like `~DBImpl`.
+
+## Audit #10: user customization points (2026-11-16)
+
+Two reviews of the features where user code plugs into the engine: read side (prefix extractors / SliceTransform,
+comparators, filter policies, read callbacks) and write side (merge operators, compaction filters and factories, table
+properties collectors, SST partitioners, WAL filters, event listeners, file checksum generators, compaction services).
+For each hook: the header contract and the engine code that calls it were read against the C++; where the C API can
+plug the same callback (custom comparator, slice transform, merge operator, compaction filter and factory, table
+filter), the same C# callback ran on native 11.12 and on the port over seeded workloads (puts, merges, deletes, range
+deletions, snapshots, flushes, compactions, reopen, with the engines swapping directories at reopen), comparing every
+read and the recorded table properties; and each hook was made to throw. Tests:
+`tests/RocksDb.Managed.Tests/Validation/Audit10*`, `tests/RocksDb.Managed.CompatTests/Audit10/` (`AUDIT10_SEED` replays).
+
+Rule for throwing user code (upstream: undefined behaviour): a foreground call (Get, MultiGet, iterator moves, read
+delegates) surfaces the exception to its caller and releases what it pinned; a background job (flush, compaction, a
+memtable insert) fails like an I/O error of that job (classified as upstream's DefaultErrorSeverityMap; fatal with
+paranoid_checks), leaves no orphan file and keeps the data intact for a reopen; nothing hangs. Each hook's XML docs
+now say so.
+
+### Fixed
+
+- A user comparator override of `FindShortestSeparator` / `FindShortSuccessor` that writes nothing produced an empty
+  separator; upstream's contract (`comparator.h`: "an implementation of this method that does nothing is correct") keeps
+  the key. With a reverse-order comparator the empty key became an index entry: the first lookup after a flush returned
+  nothing, and the native differential hung. Now an empty result keeps the key (`InternalKeyComparator.ShortenInternalKey`,
+  one length check). Native comparators created through the C API do nothing there; the differential now matches.
+- A flush with an inconsistent comparator failed with InvalidArgument (fatal); upstream's `OutputValidator` gives
+  Corruption "Compaction sees out-of-order keys." (unrecoverable). Same message and code as native now.
+- `ReadOptions::table_filter` was not ported: `ReadOptions.TableFilter` (iterators only, range tombstones of skipped
+  tables kept, InvalidArgument with `min_tombstones_for_range_conversion > 0`), matching native.
+- A throwing `SstPartitioner.CanDoTrivialMove` / `CreatePartitioner` escaped inside a flush's MANIFEST commit
+  (`EnoughRoomForCompaction` under the mutex): with paranoid_checks off `Flush()` never returned, with it on a committed
+  flush was reported as a fatal error. The failure is now recorded and fails only the compaction that asked.
+- A throwing `FileChecksumGenFactory` left an orphan table file; a throwing `CompactionService.OnInstallation` left the
+  worker's outputs in the DB directory. Both now delete what they created.
+- Compaction filter factories could not tell a flush from a WAL-recovery flush: new
+  `ShouldFilterTableFileCreation(TableFileCreationReason)` (default delegates to the bool overload) and
+  `CompactionFilterContext.Reason` / `InputStartLevel`, as `BuildTable` / `Compaction::CreateCompactionFilter`.
+
+### Upstream behaviour found
+
+- Native 11.12 crashes (SIGSEGV) on reverse iteration over a merge operand when the DB is opened without a merge operator
+  (`DBIter::FindValueForCurrentKey` only asserts the operator); Get and forward iteration return InvalidArgument. The port
+  returns InvalidArgument for all. Upstream issue draft 15.
+- With prefix_same_as_start and a seek target outside the extractor's domain upstream falls back to a legacy prefix seek
+  (undefined behaviour; native returned an older version at a snapshot); the port returns the total-order result.
+
+### Open
+
+- `CompactionFilter::Context::input_table_properties` is not offered (needs the input files' properties per compaction).
+- Not ported, unchanged: `MergeOperator::ShouldMerge`, `max_successive_merges` (accepted, ignored), listener callbacks
+  `OnSubcompaction*` and `OnFile*Finish`. No native EventListener differential.
+- A custom filter policy that reuses the built-in compatibility name gets the built-in reader (upstream calls the
+  policy's own reader). The output of a failed background compaction may stay on disk until the next open (not live;
+  upstream likely deletes it at once; unconfirmed).
+
+### Verified
+
+- Prefix extractors: built-ins line by line with `util/slice.cc`; a custom variable-length extractor with out-of-domain
+  and empty keys against native through memtable prefix bloom, SST and partitioned filters, optimize_filters_for_hits,
+  prefix_same_as_start, auto_prefix_mode, total-order seeks, snapshots, range deletions, cross-engine reopen; an extractor
+  changed between opens and through SetOptions (filters of other extractors skipped, reads correct).
+- Comparators against native (separator shortening with 256-byte blocks, range tombstones, compaction, cross-engine
+  reopen, recorded name); filter policies recorded by name, a changed policy read without its filter.
+- Merge operators against native: partial-merge groupings in flush and compaction, failing merges (reads Corruption,
+  flush / compaction unrecoverable, WAL replay Corruption), a missing or renamed operator on reopen. Compaction filters
+  and factories against native (Remove, ChangeValue, empty value, snapshots, merges, range tombstones, factory context);
+  kPurge, kRemoveAndSkipUntil, operand removal, one filter per subcompaction.
+- Table properties collectors end to end (contexts for flush / compaction / SstFileWriter, entry types, user properties
+  across reopen, NeedCompact marking); file checksum functions changing between opens; a throwing WAL filter fails the
+  open without changing the DB; throwing listeners are contained.
