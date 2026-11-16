@@ -454,13 +454,16 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     /// Native DB: keys 0..7 flushed, 8..15 in a WAL kept alive by avoid_flush_during_recovery, 16..23 in a second WAL;
     /// one put per batch, in key order.
     /// </summary>
-    private static string NativeDbWithTwoWals(TempDir dir)
+    private static string NativeDbWithTwoWals(TempDir dir) => NativeDbWithTwoWals(dir, walZstd: false);
+
+    private static string NativeDbWithTwoWals(TempDir dir, bool walZstd)
     {
         string path = Path.Combine(dir.Path, "src");
         RocksDbSharp.DbOptions Options()
         {
             var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
             RocksDbSharp.Native.Instance.rocksdb_options_set_avoid_flush_during_recovery(o.Handle, 1);
+            if (walZstd) RocksDbSharp.Native.Instance.rocksdb_options_set_wal_compression(o.Handle, 0x7); // kZSTD
             return o;
         }
         int k = 0;
@@ -596,15 +599,16 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     /// are skipped (native hangs on them, see LogReader). Seed: AUDIT7_SEED.
     /// </summary>
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public void DamagedWalOrManifestRecoversLikeNative(bool recycle)
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public void DamagedWalOrManifestRecoversLikeNative(bool recycle, bool walZstd)
     {
         int seed = Seed();
         Console.WriteLine("seed=" + seed);
         var rnd = new Random(seed);
         using var dir = new TempDir("a7walfuzz");
-        string src = recycle ? NativeRecycledDb(dir) : NativeDbWithTwoWals(dir);
+        string src = recycle ? NativeRecycledDb(dir) : NativeDbWithTwoWals(dir, walZstd);
         string[] targets = Directory.GetFiles(src).Select(Path.GetFileName).Where(n => n!.EndsWith(".log", StringComparison.Ordinal) ||
             n.StartsWith("MANIFEST-", StringComparison.Ordinal)).Select(n => n!).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Console.WriteLine("targets: " + string.Join(", ", targets));
@@ -740,6 +744,25 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
                 File.WriteAllBytes(wals[^1], last);
                 break;
             }
+            case "wal-zstd-bad-frame":
+            case "wal-zstd-truncated-frame":
+            {
+                // A compressed WAL record whose payload is not a valid zstd frame (or only its first half), with a valid CRC:
+                // ReadPhysicalRecord's Uncompress fails -> kBadRecord (buffer dropped, nothing reported).
+                List<int> offs = RecordOffsets(last);
+                int at = offs[3], len = last[at + 4] | (last[at + 5] << 8);
+                byte[] payload = last.AsSpan(at + 7, len).ToArray();
+                if (scenario == "wal-zstd-bad-frame") payload.AsSpan(payload.Length / 2).Fill(0x55);
+                else payload = payload[..(payload.Length / 2)];
+                byte[] rec = new byte[7 + payload.Length];
+                rec[4] = (byte)payload.Length;
+                rec[5] = (byte)(payload.Length >> 8);
+                rec[6] = last[at + 6];
+                payload.CopyTo(rec, 7);
+                Util.Coding.EncodeFixed32(rec, Util.Crc32C.Mask(Util.Crc32C.Value(rec.AsSpan(6))));
+                File.WriteAllBytes(wals[^1], [.. last[..at], .. rec, .. last[(at + 7 + len)..]]);
+                break;
+            }
             case "manifest-truncated-mid-record":
             {
                 byte[] m = File.ReadAllBytes(manifest);
@@ -842,6 +865,17 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     public void DamageScenarioRecoversLikeNative(string scenario, bool recycle) => CompareScenario(scenario, recycle, strictIteratorEnd: false);
 
     /// <summary>
+    /// WAL compression (kSetCompressionType record, ZSTDStreamingUncompress, log::Reader::ReadPhysicalRecord's
+    /// uncompress loop): a CRC-valid record whose compressed payload is damaged or cut, opened by both engines.
+    /// </summary>
+    [TestMethod]
+    [DataRow("wal-zstd-bad-frame")]
+    [DataRow("wal-zstd-truncated-frame")]
+    [DataRow("wal-torn-tail")]
+    [DataRow("wal-middle-crc")]
+    public void DamagedCompressedWalRecoversLikeNative(string scenario) => CompareScenario(scenario, recycle: false, strictIteratorEnd: false, walZstd: true);
+
+    /// <summary>
     /// Audit #7 open: GetUpdatesSince over a recycled WAL that holds a record of its previous use (another log number)
     /// before the end of the recovered data. WalIteratorImpl::NextImpl (db/wal_iterator_impl.cc) ends with
     /// TryAgain("Create a new iterator to fetch the new tail.") because the iterator stopped below
@@ -855,10 +889,10 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
 
     private const string NativeTryAgain = "Operation failed. Try again.: Create a new iterator to fetch the new tail.";
 
-    private static void CompareScenario(string scenario, bool recycle, bool strictIteratorEnd)
+    private static void CompareScenario(string scenario, bool recycle, bool strictIteratorEnd, bool walZstd = false)
     {
         using var dir = new TempDir("a7scen");
-        string src = recycle ? NativeRecycledDb(dir) : NativeDbWithTwoWals(dir);
+        string src = recycle ? NativeRecycledDb(dir) : NativeDbWithTwoWals(dir, walZstd);
         Damage(src, scenario);
         var lines = new List<string>();
         bool same = true;

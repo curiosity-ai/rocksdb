@@ -454,11 +454,12 @@ public sealed class Audit7MetadataCorruptionTests
     /// A DB whose keys 0..N-1 were written one per batch, in order: phase 1 flushed to an SST, phase 2 in a WAL that
     /// stays alive (avoid_flush_during_recovery on reopen), phase 3 in a second WAL.
     /// </summary>
-    private static MemoryFileSystem BuildDb(bool recycle, out int totalKeys)
+    private static MemoryFileSystem BuildDb(bool recycle, bool walZstd, out int totalKeys)
     {
         MemoryFileSystem fs = NewFs();
         DbOptions o = NewOptions(fs);
         o.AvoidFlushDuringRecovery = true;
+        if (walZstd) o.WalCompression = RocksDb.Managed.Compression.CompressionType.Zstd;
         if (recycle)
         {
             o.RecycleLogFileNum = 2;
@@ -550,14 +551,15 @@ public sealed class Audit7MetadataCorruptionTests
     /// reopens (same mode) to the same data.
     /// </summary>
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public void OpenOverMutatedMetadataFilesKeepsRecoveryContracts(bool recycle)
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    public void OpenOverMutatedMetadataFilesKeepsRecoveryContracts(bool recycle, bool walZstd)
     {
         int seed = Seed();
         TestContext.WriteLine("seed=" + seed);
         var rnd = new Random(seed);
-        Dictionary<string, byte[]> pristine = Snapshot(BuildDb(recycle, out int total), includeLogs: false);
+        Dictionary<string, byte[]> pristine = Snapshot(BuildDb(recycle, walZstd, out int total), includeLogs: false);
         var targets = new List<string>();
         foreach (string n in pristine.Keys)
         {
