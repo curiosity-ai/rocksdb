@@ -87,7 +87,8 @@ public sealed class Audit8AsyncWritePathTests
 
         private async ValueTask GoAsync()
         {
-            await Task.Yield();
+            // To the thread pool, whatever the caller's synchronization context (Task.Yield would post to it).
+            await Task.Run(static () => { }).ConfigureAwait(false);
             Interlocked.Increment(ref AsyncCompletions);
         }
 
@@ -107,8 +108,8 @@ public sealed class Audit8AsyncWritePathTests
                     file.Append(data.Span);
                     return;
                 }
-                await fs.GoAsync();
-                await file.AppendAsync(data, cancellationToken);
+                await fs.GoAsync().ConfigureAwait(false);
+                await file.AppendAsync(data, cancellationToken).ConfigureAwait(false);
             }
 
             public async ValueTask FlushAsync(CancellationToken cancellationToken = default)
@@ -118,8 +119,8 @@ public sealed class Audit8AsyncWritePathTests
                     file.Flush();
                     return;
                 }
-                await fs.GoAsync();
-                await file.FlushAsync(cancellationToken);
+                await fs.GoAsync().ConfigureAwait(false);
+                await file.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
 
             public async ValueTask SyncAsync(CancellationToken cancellationToken = default)
@@ -129,8 +130,8 @@ public sealed class Audit8AsyncWritePathTests
                     file.Sync();
                     return;
                 }
-                await fs.GoAsync();
-                await file.SyncAsync(cancellationToken);
+                await fs.GoAsync().ConfigureAwait(false);
+                await file.SyncAsync(cancellationToken).ConfigureAwait(false);
             }
 
             public async ValueTask DisposeAsync()
@@ -140,8 +141,8 @@ public sealed class Audit8AsyncWritePathTests
                     file.Dispose();
                     return;
                 }
-                await fs.GoAsync();
-                await file.DisposeAsync();
+                await fs.GoAsync().ConfigureAwait(false);
+                await file.DisposeAsync().ConfigureAwait(false);
             }
         }
 
@@ -154,8 +155,8 @@ public sealed class Audit8AsyncWritePathTests
             public async ValueTask<int> ReadAsync(long offset, Memory<byte> destination, CancellationToken cancellationToken = default)
             {
                 if (fs.InSyncCall("ReadAsync", path)) return file.Read(offset, destination.Span);
-                await fs.GoAsync();
-                return await file.ReadAsync(offset, destination, cancellationToken);
+                await fs.GoAsync().ConfigureAwait(false);
+                return await file.ReadAsync(offset, destination, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -168,8 +169,8 @@ public sealed class Audit8AsyncWritePathTests
             public async ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
             {
                 if (fs.InSyncCall("ReadAsync", path)) return file.Read(destination.Span);
-                await fs.GoAsync();
-                return await file.ReadAsync(destination, cancellationToken);
+                await fs.GoAsync().ConfigureAwait(false);
+                return await file.ReadAsync(destination, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -605,9 +606,14 @@ public sealed class Audit8AsyncWritePathTests
             if (async[i])
             {
                 Task t = db.PutAsync(options, B(keys[n]), B("v" + n)).AsTask();
+                // An asynchronous writer resumes on the thread pool, never inline on the thread of the (synchronous)
+                // leader that completed it (RunContinuationsAsynchronously), nor on a held synchronous writer.
+                Task<bool> onPool = t.ContinueWith(static _ => Thread.CurrentThread.IsThreadPoolThread, CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                 waits.Add(() =>
                 {
                     if (!((IAsyncResult)t).AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(20))) return false;
+                    Assert.IsTrue(onPool.Wait(TimeSpan.FromSeconds(20)) && onPool.Result, keys[n] + " completed on a synchronous writer's thread");
                     errors[n] = t.Exception?.InnerException;
                     if (t.Exception is { InnerExceptions.Count: not 1 } ae) errors[n] = ae;
                     return true;
@@ -791,6 +797,131 @@ public sealed class Audit8AsyncWritePathTests
         Assert.AreEqual("f", GetString(db, "follower"));
         Assert.AreEqual("s", GetString(db, "sync"));
         Assert.IsNull(db.BackgroundError);
+    }
+
+    // ---- a throwing UserWriteCallback ----------------------------------------------------------------------------
+
+    private sealed class ThrowingEnqueuedCallback : UserWriteCallback
+    {
+        public override void OnWriteEnqueued() => throw new InvalidOperationException("callback failed");
+        public override void OnWalWriteFinish() { }
+    }
+
+    /// <summary>
+    /// UserWriteCallback.OnWriteEnqueued runs in JoinBatchGroup after the writer was linked (upstream:
+    /// CheckWriteEnqueuedCallback after LinkOne). The API documents that the callbacks must not throw; when one does, the
+    /// exception leaves the write while its writer is still the write leader (or still linked in the queue), the writer
+    /// goes back to the pool, and every later write of the DB (and its close) waits forever.
+    /// </summary>
+    [TestMethod]
+    [Ignore("audit #8 open: a throwing UserWriteCallback.OnWriteEnqueued strands the write queue (documented as must not throw)")]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ThrowingOnWriteEnqueuedDoesNotStrandTheWriteQueue()
+    {
+        RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(NewFs()));
+        try
+        {
+            using (var batch = new WriteBatch())
+            {
+                batch.Put(B("k"), B("v"));
+                await Assert.ThrowsAsync<InvalidOperationException>(async () => await db.WriteWithCallbackAsync(null, batch, new ThrowingEnqueuedCallback()));
+            }
+            Task next = db.PutAsync(B("next"), B("n")).AsTask();
+            Assert.AreSame(next, await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(5))), "the write queue is stranded");
+            await next;
+        }
+        finally
+        {
+            // Close waits for the write queue too: do not let a stranded queue hang the test run.
+            Task close = Task.Run(db.Dispose);
+            Assert.AreSame(close, await Task.WhenAny(close, Task.Delay(TimeSpan.FromSeconds(5))), "close waits for the stranded write queue");
+        }
+    }
+
+    // ---- a single-threaded synchronization context ---------------------------------------------------------------
+
+    /// <summary>Runs posted callbacks on one dedicated thread (a UI-like context).</summary>
+    private sealed class SingleThreadContext : SynchronizationContext, IDisposable
+    {
+        private readonly BlockingCollection<(SendOrPostCallback, object?)> _queue = new();
+        public readonly Thread Thread;
+
+        public SingleThreadContext()
+        {
+            Thread = new Thread(() =>
+            {
+                SetSynchronizationContext(this);
+                foreach ((SendOrPostCallback d, object? s) in _queue.GetConsumingEnumerable()) d(s);
+            }) { IsBackground = true };
+            Thread.Start();
+        }
+
+        public override void Post(SendOrPostCallback d, object? state) => _queue.Add((d, state));
+
+        public override void Send(SendOrPostCallback d, object? state) => throw new NotSupportedException();
+
+        public void Dispose() => _queue.CompleteAdding();
+    }
+
+    /// <summary>
+    /// No sync-over-async that needs the caller's context: on a single-threaded synchronization context (whose thread is
+    /// the only one that can run the caller's continuations), many concurrent asynchronous writes awaited with the
+    /// context captured, interleaved with synchronous writes, flushes and FlushWAL on that same thread (which then block
+    /// it while asynchronous leaders on the thread pool commit their groups), all complete; every engine-internal await
+    /// resumes off the context (ConfigureAwait(false)), on a file system whose async members really complete
+    /// asynchronously.
+    /// </summary>
+    [TestMethod]
+    [DataRow(WriteMode.Default)]
+    [DataRow(WriteMode.Pipelined)]
+    [DataRow(WriteMode.Unordered)]
+    [DataRow(WriteMode.TwoWriteQueues)]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void WritesOnASingleThreadedContextDoNotDeadlock(WriteMode mode)
+    {
+        var fs = new ForcedAsyncFileSystem(NewFs());
+        DbOptions o = ModeOptions(fs, mode);
+        using RocksDatabase db = RocksDatabase.Open(DbPath, o, new ColumnFamilyOptions { WriteBufferSize = 32 << 10 });
+        using var context = new SingleThreadContext();
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        context.Post(_ => RunAsync().ContinueWith(t =>
+        {
+            if (t.IsFaulted) done.TrySetException(t.Exception!.InnerExceptions);
+            else done.TrySetResult();
+        }, TaskScheduler.Default), null);
+        Assert.IsTrue(done.Task.Wait(TimeSpan.FromSeconds(40)), "writes on a single-threaded context deadlock");
+        for (int i = 0; i < 400; i++) Assert.AreEqual("v" + i, GetString(db, "c" + i), "c" + i);
+        AssertNoViolations(fs);
+
+        async Task RunAsync()
+        {
+            var pending = new List<Task>();
+            for (int i = 0; i < 400; i++)
+            {
+                var wo = new WriteOptions { Sync = i % 7 == 0 };
+                if (i % 5 == 4)
+                {
+                    // A synchronous call on the context thread while asynchronous writes are in flight.
+                    ForcedAsyncFileSystem.Sync(() =>
+                    {
+                        db.Put(wo, B("c" + i), B("v" + i));
+                        if (i % 50 == 9) db.Flush();
+                        if (i % 50 == 29) db.FlushWal(sync: true);
+                    });
+                }
+                else
+                {
+                    pending.Add(AwaitOnContext(db.PutAsync(wo, B("c" + i), B("v" + i))));
+                }
+            }
+            await Task.WhenAll(pending);
+        }
+
+        async Task AwaitOnContext(ValueTask write)
+        {
+            await write; // the continuation is posted to the context
+            Assert.AreSame(context, SynchronizationContext.Current);
+        }
     }
 
     // ---- close while writes are stalled by the write buffer manager -----------------------------------------------
