@@ -399,4 +399,200 @@ public sealed class Audit8AsyncBackgroundIoTests
         using RocksDatabase reopened = RocksDatabase.Open(DbPath, NewOptions(fs));
         Assert.AreEqual("v", GetString(reopened, "k"));
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // 4. LocalFileSystem async fast paths: same bytes and IOStats as the sync members.
+
+    private static readonly System.Reflection.FieldInfo s_noWaitWriteUnavailable =
+        typeof(LocalFileSystem).Assembly.GetType("RocksDb.Managed.Env.UnixNative")!
+            .GetField("s_noWaitWriteUnavailable", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+
+    private static ulong BytesWrittenBy(Action<IWritableFile> write, string path)
+    {
+        PerfLevel before = PerfContext.Level;
+        PerfContext.Level = PerfLevel.EnableCount;
+        try
+        {
+            using IWritableFile f = LocalFileSystem.Instance.CreateWritable(path, truncate: true,
+                new WritableFileOptions { InitialBufferSize = 4096, MaxBufferSize = 4096 });
+            IOStatsContext.Current.Reset();
+            write(f);
+            return IOStatsContext.Current[IOStatsMetric.BytesWritten];
+        }
+        finally
+        {
+            PerfContext.Level = before;
+        }
+    }
+
+    /// <summary>
+    /// Pins IOSTATS bytes_written (WritableFileWriter: IOSTATS_ADD(bytes_written, ...) once per write) for the async
+    /// append / flush of LocalFileSystem on both of its synchronous-completion paths: pwritev2(RWF_NOWAIT) and the inline
+    /// small buffered write used where RWF_NOWAIT writes are unsupported (e.g. ext4). The async calls complete inline here,
+    /// so the counters are on this thread, and they must equal the sync members' counts.
+    /// </summary>
+    [TestMethod]
+    [DoNotParallelize]
+    public void AsyncLocalWritesCountBytesWrittenLikeSync()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "audit8-iostats-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        object saved = s_noWaitWriteUnavailable.GetValue(null)!;
+        try
+        {
+            byte[] small = new byte[1000];
+            byte[] large = new byte[10000];
+            ulong sync = BytesWrittenBy(f => { f.Append(small); f.Flush(); f.Append(large); f.Flush(); }, Path.Combine(dir, "sync"));
+            Assert.AreEqual((ulong)(small.Length + large.Length), sync);
+            foreach (bool noWaitUnavailable in new[] { false, true })
+            {
+                s_noWaitWriteUnavailable.SetValue(null, noWaitUnavailable || (bool)saved);
+                // Probe: the first RWF_NOWAIT write tells whether the file system supports it (ext4 does not: EINVAL).
+                BytesWrittenBy(f => { f.Append(small); f.FlushAsync().AsTask().GetAwaiter().GetResult(); }, Path.Combine(dir, "probe"));
+                if (!noWaitUnavailable && (bool)s_noWaitWriteUnavailable.GetValue(null)!)
+                {
+                    Console.WriteLine("RWF_NOWAIT writes are not supported here: only the inline path is checked");
+                    continue;
+                }
+                ulong async = BytesWrittenBy(f =>
+                {
+                    ValueTask t = f.AppendAsync(small);
+                    Assert.IsTrue(t.IsCompleted);
+                    t.GetAwaiter().GetResult();
+                    t = f.FlushAsync();
+                    Assert.IsTrue(t.IsCompleted, "the buffered flush completes inline");
+                    t.GetAwaiter().GetResult();
+                    t = f.AppendAsync(large);
+                    Assert.IsTrue(t.IsCompleted, "the write-through completes inline");
+                    t.GetAwaiter().GetResult();
+                    f.FlushAsync().GetAwaiter().GetResult();
+                }, Path.Combine(dir, "async" + noWaitUnavailable));
+                Assert.AreEqual(sync, async, "RWF_NOWAIT unavailable: " + (noWaitUnavailable || (bool)saved));
+            }
+        }
+        finally
+        {
+            s_noWaitWriteUnavailable.SetValue(null, saved);
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // 5. Cancellation of the async control APIs never leaves a half-applied operation.
+
+    /// <summary>
+    /// A token that is cancelled when the file system starts the async operation <paramref name="op"/> on a file whose
+    /// name contains <paramref name="fragment"/> (the call already began and the operation has not completed).
+    /// </summary>
+    private static CancellationTokenSource CancelAt(YieldingFileSystem fs, string op, string fragment)
+    {
+        var cts = new CancellationTokenSource();
+        fs.OnAsync = (o, path, ct) =>
+        {
+            if (o == op && path.Contains(fragment, StringComparison.Ordinal) && ct == cts.Token) cts.Cancel();
+        };
+        return cts;
+    }
+
+    /// <summary>Opens the DB with every column family its MANIFEST lists.</summary>
+    private static async Task<RocksDatabase> OpenAllAsync(IFileSystem fs)
+    {
+        var descriptors = new List<ColumnFamilyDescriptor>();
+        foreach (string n in RocksDatabase.ListColumnFamilies(DbPath, fs)) descriptors.Add(new ColumnFamilyDescriptor(n, new ColumnFamilyOptions()));
+        return await RocksDatabase.OpenAsync(DbPath, NewOptions(fs), descriptors);
+    }
+
+    /// <summary>
+    /// Pins that CreateColumnFamilyAsync cancelled while its MANIFEST record or its OPTIONS file is being written leaves
+    /// the DB and the caller in agreement (native's CreateColumnFamily has no cancellation: once the record is written the
+    /// creation completes): either OperationCanceledException and no column family in the DB, in the MANIFEST or after a
+    /// reopen, or the column family.
+    /// </summary>
+    [TestMethod]
+    public void CreateColumnFamilyAsyncCancelledMidWriteIsAtomic()
+    {
+        foreach ((string op, string file) in new[] { ("AppendAsync", "MANIFEST"), ("SyncAsync", "MANIFEST"), ("AppendAsync", "OPTIONS"), ("SyncAsync", "OPTIONS") })
+        {
+            var fs = new YieldingFileSystem(NewFs());
+            WithDeadline(Task.Run(async () =>
+            {
+                await using (RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs)))
+                {
+                    await db.PutAsync(B("k"), B("v"));
+                    using CancellationTokenSource cts = CancelAt(fs, op, file);
+                    bool created;
+                    try
+                    {
+                        await db.CreateColumnFamilyAsync("cf1", new ColumnFamilyOptions(), cts.Token);
+                        created = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        created = false;
+                    }
+                    fs.OnAsync = null;
+                    Assert.AreEqual(created, db.ColumnFamilies.Any(c => c.Name == "cf1"), op + " " + file + ": the DB's column families");
+                    Assert.AreEqual(created, RocksDatabase.ListColumnFamilies(DbPath, fs).Contains("cf1"), op + " " + file + ": the MANIFEST");
+                    // The DB stays usable.
+                    await db.PutAsync(B("k2"), B("v2"));
+                    ColumnFamily cf2 = await db.CreateColumnFamilyAsync("cf2", new ColumnFamilyOptions());
+                    await cf2.PutAsync(B("a"), B("b"));
+                }
+                await using RocksDatabase reopened = await OpenAllAsync(fs);
+                Assert.AreEqual("v2", GetString(reopened, "k2"));
+            }), "cancelled CreateColumnFamilyAsync at " + op + " " + file);
+        }
+    }
+
+    /// <summary>
+    /// Pins the same for DropColumnFamilyAsync (cancelled during its MANIFEST record or OPTIONS file) and
+    /// SetOptionsAsync (cancelled during the OPTIONS file): OperationCanceledException means nothing changed, otherwise
+    /// the change is complete; the column family list of the DB, of the MANIFEST and the live options agree.
+    /// </summary>
+    [TestMethod]
+    public void DropColumnFamilyAndSetOptionsAsyncCancelledMidWriteAreAtomic()
+    {
+        foreach ((string op, string file) in new[] { ("AppendAsync", "MANIFEST"), ("SyncAsync", "MANIFEST"), ("AppendAsync", "OPTIONS"), ("SyncAsync", "OPTIONS") })
+        {
+            var fs = new YieldingFileSystem(NewFs());
+            WithDeadline(Task.Run(async () =>
+            {
+                await using RocksDatabase db = await RocksDatabase.OpenAsync(DbPath, NewOptions(fs));
+                ColumnFamily cf1 = await db.CreateColumnFamilyAsync("cf1", new ColumnFamilyOptions());
+                using (CancellationTokenSource cts = CancelAt(fs, op, file))
+                {
+                    bool dropped;
+                    try
+                    {
+                        await db.DropColumnFamilyAsync(cf1, cts.Token);
+                        dropped = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        dropped = false;
+                    }
+                    fs.OnAsync = null;
+                    Assert.AreEqual(dropped, cf1.IsDropped, op + " " + file + ": the handle");
+                    Assert.AreEqual(!dropped, RocksDatabase.ListColumnFamilies(DbPath, fs).Contains("cf1"), op + " " + file + ": the MANIFEST");
+                }
+                if (file != "OPTIONS") return;
+                ulong before = db.GetColumnFamily("default").Options.WriteBufferSize;
+                using (CancellationTokenSource cts = CancelAt(fs, op, file))
+                {
+                    bool applied;
+                    try
+                    {
+                        await db.SetOptionsAsync([new("write_buffer_size", "1048576")], cts.Token);
+                        applied = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        applied = false;
+                    }
+                    fs.OnAsync = null;
+                    Assert.AreEqual(applied ? 1048576UL : before, db.GetColumnFamily("default").Options.WriteBufferSize, op + " " + file + ": SetOptions");
+                }
+            }), "cancelled DropColumnFamilyAsync / SetOptionsAsync at " + op + " " + file);
+        }
+    }
 }

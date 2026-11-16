@@ -500,6 +500,10 @@ internal sealed class VersionSet : IAsyncDisposable
                 if (e.Edit.IsColumnFamilyAdd || e.Edit.IsColumnFamilyDrop) ThrowHelper.InvalidArgument("column family add/drop cannot be batched");
             }
         }
+        // Cancellation is honoured only while waiting for the MANIFEST writer slot (the manifest_writers_ queue). The
+        // MANIFEST I/O below runs to completion: a record cancelled after it reached the file (and the closing writer
+        // flushes it) would commit an edit the caller was told did not happen, e.g. a column family that only a reopen
+        // finds. Native's LogAndApply cannot be interrupted either.
         if (synchronous) _manifestLock.Wait(cancellationToken);
         else await _manifestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -626,14 +630,14 @@ internal sealed class VersionSet : IAsyncDisposable
                     Wal.LogWriter sizeOf = newLog.Log;
                     var writer = new ManifestWriter(newLog) { FileSizeProvider = () => (ulong)sizeOf.File!.Size };
                     // WriteCurrentStateToManifest (synced at the end).
-                    await writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, synchronous, cancellationToken).ConfigureAwait(false);
+                    await writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, synchronous, CancellationToken.None).ConfigureAwait(false);
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
-                    await writer.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, cancellationToken).ConfigureAwait(false);
+                    await writer.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, CancellationToken.None).ConfigureAwait(false);
                     newManifestWritten = true;
                     // The new MANIFEST (snapshot and edits) plus CURRENT ("MANIFEST-nnnnnn\n").
                     editList[0].ManifestBytesWritten = (ulong)newLog.Log.File!.Size + (ulong)FileNames.DescriptorFileName(manifestNumber).Length + 1;
-                    await FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, synchronous, cancellationToken)
+                    await FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, synchronous, CancellationToken.None)
                         .ConfigureAwait(false);
                     ManifestLogWriter? old = _manifestLog;
                     // ProcessManifestWrites: last_compacted_manifest_file_size_ = new_manifest_file_size (after the
@@ -653,7 +657,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
                     long sizeBefore = _manifestLog!.Log.File!.Size;
-                    await _manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, cancellationToken).ConfigureAwait(false);
+                    await _manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, CancellationToken.None).ConfigureAwait(false);
                     editList[0].ManifestBytesWritten = (ulong)(_manifestLog!.Log.File!.Size - sizeBefore);
                 }
             }
