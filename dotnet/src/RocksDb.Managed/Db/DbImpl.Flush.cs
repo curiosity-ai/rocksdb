@@ -896,7 +896,12 @@ internal sealed partial class DbImpl
             try
             {
                 TestHooks.Invoke("DBImpl::AfterRetainUDTReschedule:cb");
-                await Task.Delay(100).ConfigureAwait(false);
+                // Upstream sleeps 100 ms inside BackgroundCallFlush (bg_flush_scheduled_ still counted, so close waits for
+                // it); a shutdown cancels the wait here, the retry then schedules nothing.
+                await Task.Delay(100, _bgCancellation.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
             }
             finally
             {
