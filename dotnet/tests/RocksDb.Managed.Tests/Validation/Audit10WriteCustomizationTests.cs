@@ -1097,4 +1097,199 @@ public sealed class Audit10WriteCustomizationTests
             StringAssert.Contains(all, "create Recovery flush=True full=False manual=False start=-1");
         }
     }
+
+    // ---- compaction filter decisions --------------------------------------------------------------------------------
+
+    /// <summary>Purge for values "purge", RemoveAndSkipUntil(value[5..]) for values "skip:&lt;key&gt;", Remove for operands "x".</summary>
+    private sealed class DecisionFilter : CompactionFilter
+    {
+        public override string Name => "DecisionFilter";
+
+        public override CompactionFilterDecision Filter(int level, ReadOnlySpan<byte> key, CompactionFilterValueType valueType,
+            ReadOnlySpan<byte> existingValue, IBufferWriter<byte> newValue, IBufferWriter<byte> skipUntil)
+        {
+            if (valueType == CompactionFilterValueType.MergeOperand)
+            {
+                return existingValue.SequenceEqual("x"u8) ? CompactionFilterDecision.Remove : CompactionFilterDecision.Keep;
+            }
+            if (existingValue.SequenceEqual("purge"u8)) return CompactionFilterDecision.Purge;
+            if (existingValue.StartsWith("skip:"u8))
+            {
+                skipUntil.Write(existingValue[5..]);
+                return CompactionFilterDecision.RemoveAndSkipUntil;
+            }
+            return CompactionFilterDecision.Keep;
+        }
+    }
+
+    /// <summary>
+    /// CompactionIterator::InvokeFilterIfNeeded (only the newest version of a user key in the compaction is filtered):
+    /// kPurge turns the value into a SingleDelete at its sequence number, so an older version kept for a snapshot stays
+    /// readable there and both disappear once the snapshot is gone; kRemoveAndSkipUntil drops [key, skip_until) from
+    /// the compaction input, every version and whatever snapshots see ("snapshots are not guaranteed to preserve the
+    /// state of the DB in the presence of kRemoveAndSkipUntil", compaction_filter.h), and a skip_until &lt;= key is
+    /// treated as kKeep; a merge operand the filter removes (MergeHelper::FilterMerge) is dropped from the chain.
+    /// </summary>
+    [TestMethod]
+    public void PurgeRemoveAndSkipUntilAndOperandRemoval()
+    {
+        MemoryFileSystem fs = NewDbFs();
+        var cfo = new ColumnFamilyOptions
+        {
+            CompactionFilter = new DecisionFilter(),
+            MergeOperator = new StringAppendMergeOperator(),
+            DisableAutoCompactions = true,
+        };
+        using RocksDatabase db = RocksDatabase.Open(Db, NewOptions(fs), cfo);
+        db.Put(B("p"), B("old"));
+        foreach (string k in new[] { "s-a", "s-c", "s-e", "s-g" }) db.Put(B(k), B("old-" + k));
+        Snapshot snap = db.GetSnapshot();
+        db.Put(B("p"), B("purge"));
+        db.Put(B("s-a"), B("skip:s-f"));
+        db.Put(B("s-g"), B("skip:s-b"));
+        db.Merge(B("m"), B("1"));
+        db.Merge(B("m"), B("x"));
+        db.Merge(B("m"), B("2"));
+        db.Flush();
+        db.CompactRange();
+        // Purge: a SingleDelete over the newest version; the snapshot still sees the old value.
+        Assert.IsNull(GetString(db, "p"));
+        Assert.AreEqual("old", GetString(db, "p", snap));
+        // RemoveAndSkipUntil(s-f) from s-a: s-a (both versions), s-c and s-e are gone, also for the snapshot.
+        foreach (string k in new[] { "s-a", "s-c", "s-e" })
+        {
+            Assert.IsNull(GetString(db, k), k);
+            Assert.IsNull(GetString(db, k, snap), k + " at the snapshot");
+        }
+        // skip_until (s-b) <= key (s-g): kept.
+        Assert.AreEqual("skip:s-b", GetString(db, "s-g"));
+        Assert.AreEqual("old-s-g", GetString(db, "s-g", snap));
+        // The operand "x" is removed (newer than every snapshot).
+        Assert.AreEqual("1,2", GetString(db, "m"));
+        snap.Dispose();
+        db.CompactRange();
+        Assert.IsNull(GetString(db, "p"));
+        using Iterator it = db.NewIterator();
+        var keys = new List<string>();
+        for (it.SeekToFirst(); it.Valid; it.Next()) keys.Add(S(it.Key.ToArray())!);
+        Assert.AreEqual("m s-g", string.Join(" ", keys));
+        // The purged key left nothing behind: no SingleDelete / Put pair survives the second compaction.
+        Assert.AreEqual(2L, db.GetPropertiesOfAllTables().Values.Sum(t => (long)t.NumEntries));
+    }
+
+    // ---- table properties collectors --------------------------------------------------------------------------------
+
+    /// <summary>Counts entries per type; NeedCompact when the file holds the key "mark".</summary>
+    private sealed class CountingCollectorFactory(List<string> contexts) : TablePropertiesCollectorFactory
+    {
+        public override string Name => "CountingCollectorFactory";
+
+        public override TablePropertiesCollector? CreateTablePropertiesCollector(TablePropertiesCollectorContext context)
+        {
+            lock (contexts) contexts.Add(context.ColumnFamilyId + "@" + context.LevelAtCreation);
+            return new Counting();
+        }
+
+        private sealed class Counting : TablePropertiesCollector
+        {
+            private readonly SortedDictionary<string, int> _types = new(StringComparer.Ordinal);
+            private string _rangeEnds = "";
+            private bool _mark;
+
+            public override string Name => "Counting";
+
+            public override void AddUserKey(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, TableEntryType type, ulong sequence, ulong fileSize)
+            {
+                _types[type.ToString()] = _types.GetValueOrDefault(type.ToString()) + 1;
+                if (type == TableEntryType.RangeDeletion) _rangeEnds += S(key.ToArray()) + "-" + S(value.ToArray()) + ";";
+                if (key.SequenceEqual("mark"u8)) _mark = true;
+            }
+
+            public override void Finish(IDictionary<string, byte[]> properties)
+            {
+                properties["audit10.types"] = B(string.Join(",", _types.Select(kv => kv.Key + "=" + kv.Value)));
+                properties["audit10.ranges"] = B(_rangeEnds);
+            }
+
+            public override bool NeedCompact => _mark;
+        }
+    }
+
+    /// <summary>
+    /// A user TablePropertiesCollector end to end (include/rocksdb/table_properties.h, table/meta_blocks.cc
+    /// NotifyCollectTableCollectorsOnAdd / OnFinish, BuildTable / CompactionOutputs marked_for_compaction): the factory
+    /// Context (column family id, level_at_creation: 0 for flushes, the output level for compactions, unknown for
+    /// SstFileWriter), AddUserKey with the entry type (range deletions with their end key as the value), user
+    /// properties persisted next to the internal ones and read back after a reopen, and NeedCompact marking the file so
+    /// that an automatic compaction picks it with CompactionReason.FilesMarkedForCompaction.
+    /// </summary>
+    [TestMethod]
+    public void TablePropertiesCollectorEndToEnd()
+    {
+        var contexts = new List<string>();
+        var reasons = new List<CompactionReason>();
+        MemoryFileSystem fs = NewDbFs();
+        ColumnFamilyOptions Cfo()
+        {
+            var o = new ColumnFamilyOptions { MergeOperator = new StringAppendMergeOperator(), Level0FileNumCompactionTrigger = 100 };
+            o.TablePropertiesCollectorFactories.Add(new CountingCollectorFactory(contexts));
+            return o;
+        }
+        DbOptions Dbo()
+        {
+            DbOptions o = NewOptions(fs);
+            o.Listeners.Add(new ReasonListener(reasons));
+            return o;
+        }
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(), Cfo()))
+        {
+            db.Put(B("a"), B("1"));
+            db.Merge(B("b"), B("2"));
+            db.Delete(B("c"));
+            db.DeleteRange(B("d"), B("f"));
+            db.Flush();
+            Assert.AreEqual("0@0", string.Join(" ", contexts));
+            RocksDb.Managed.Table.TableProperties flushed = db.GetPropertiesOfAllTables().Values.Single();
+            Assert.AreEqual("Delete=1,Merge=1,Put=1,RangeDeletion=1", S(flushed.UserCollectedProperties["audit10.types"]));
+            Assert.AreEqual("d-f;", S(flushed.UserCollectedProperties["audit10.ranges"]));
+            Assert.AreEqual(1UL, flushed.NumDeletions - flushed.NumRangeDeletions);
+            Assert.AreEqual("CountingCollectorFactory", flushed.PropertyCollectorsNames.Trim('[', ']'));
+
+            // A file with "mark" is marked for compaction and picked automatically ("a" makes it overlap the first file,
+            // so the compaction rewrites both instead of moving the file).
+            contexts.Clear();
+            db.Put(B("a"), B("2"));
+            db.Put(B("mark"), B("x"));
+            db.Flush();
+            Assert.IsTrue(SpinWait.SpinUntil(() => { lock (reasons) return reasons.Count > 0; }, Timeout), "no compaction of the marked file");
+            db.WaitForCompact();
+            lock (reasons) Assert.AreEqual(CompactionReason.FilesMarkedForCompaction, reasons[0]);
+            lock (contexts) Assert.AreEqual("0@0 0@6", string.Join(" ", contexts));
+
+            // SstFileWriter: unknown column family and level.
+            contexts.Clear();
+            using (var w = new SstFileWriter(Cfo(), fs))
+            {
+                w.Open(Db + "/ext.sst.tmp");
+                w.Put(B("z"), B("1"));
+                w.Finish();
+            }
+            Assert.AreEqual(RocksDb.Managed.Table.TableProperties.UnknownColumnFamily + "@-1", string.Join(" ", contexts));
+        }
+        using (RocksDatabase db = RocksDatabase.Open(Db, Dbo(), Cfo()))
+        {
+            foreach (RocksDb.Managed.Table.TableProperties p in db.GetPropertiesOfAllTables().Values)
+            {
+                Assert.IsTrue(p.UserCollectedProperties.ContainsKey("audit10.types"), "user properties lost after reopen");
+            }
+        }
+    }
+
+    private sealed class ReasonListener(List<CompactionReason> reasons) : EventListener
+    {
+        public override void OnCompactionCompleted(RocksDatabase? db, CompactionJobInfo info)
+        {
+            lock (reasons) reasons.Add(info.CompactionReason);
+        }
+    }
 }
