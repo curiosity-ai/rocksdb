@@ -2541,7 +2541,13 @@ Fixed:
 
 Open:
 
-- A fresh WAL tailer starting at a record still in the manual_wal_flush buffer of an empty current WAL gets NotFound
-  (its start looks purged); damage in a recycled WAL reads as the end of the log and is not escalated; a damaged record
-  length past EOF reads as an incomplete record until the next write.
+- WAL tailer edge cases (fixed 2026-11-17): a fresh tailer whose start is still in the manual_wal_flush buffer of an
+  empty current WAL waits instead of a false NotFound (`RocksDatabase.CurrentWalBaseSequence`; native's listing also
+  skips empty WALs, wal_manager.cc, and its GetUpdatesSince returns an OK, not-valid iterator); damage inside a recycled
+  WAL (log_reader.cc ends a recycled log at a bad checksum with no report) and a record length past the written end
+  (the tailing reader waits for more data) are detected by comparing where the reader stopped with the writer's flushed
+  record end (`LogWriter.FlushedRecordEnd`, kept for alive WALs of this DB instance) and reported through
+  `SkippedCorruptBytes`, so the tailer escalates to a resync. Native ends these runs with TryAgain (compared); the
+  detection exists only in the port. Limits: WALs written by an earlier instance, or no longer alive, have no mark
+  (only bytes the reader dropped count; the gap check catches the rest on the next logged write).
 - Row cache: with `ShouldMerge` and a row cache, lookups that ShouldMerge ends inside a file read the table every time.

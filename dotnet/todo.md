@@ -479,5 +479,5 @@ Still open from this round:
 - [x] Row cache + ShouldMerge truncated entry (wrong reads; upstream too, draft 16)
 - [x] GetUpdatesSince TryAgain like native (recoverable on Next: deviation); WalTailer escalates damaged WAL records to a resync
 - [x] Compaction / auto readahead without Prefetch support reads synchronously
-- [ ] WAL tailer: fresh tailer at a manual_wal_flush-buffered start; recycled-WAL damage not escalated; damaged length past EOF
-- [ ] Listener: OnBackgroundJobPressureChanged; blob direct-write creation events; SstFileWriter / SstFileReader file I/O
+- [x] WAL tailer: fresh tailer at a manual_wal_flush-buffered start; recycled-WAL damage and a length past the written end escalate (writer flushed-record-end mark)
+- [ ] Future: listener `OnBackgroundJobPressureChanged` (experimental upstream); blob direct-write `OnBlobFileCreationStarted` / `OnBlobFileCreated`; file I/O notifications for `SstFileWriter` / `SstFileReader` (needs a listener list on their options)
