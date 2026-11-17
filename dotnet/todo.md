@@ -431,3 +431,53 @@ Still open from this round:
 - [ ] Readahead: 4 KiB window alignment; readahead on the async positioning paths (would give async_io real trimming)
 - [ ] Atomic flush job ids per column family (upstream: one per flush); a failed non-atomic commit leaves later completed results of that column family to its next flush (same as upstream)
 - [ ] Best-efforts recovery verifies blob files by a direct open (BlobSource needs the DbId); loaded readers are not pinned; ingestion's file_opening_threads not ported
+
+## Audit #7 (2026-11-16; docs/validation.md "Audit #7: failure modes and edge cases")
+
+- [x] Corrupt SST / blob / compressed input: only statuses escape (mutation fuzz of every table variant); VerifyChecksum without decompression; block handle offsets and sizes from damaged files; stored uncompressed sizes bounded by the codec's expansion; plain / cuckoo index bounds
+- [x] Corrupt WAL / MANIFEST / CURRENT / OPTIONS: differential damage fuzz against native; no hang on a recyclable type in a legacy log (deliberate deviation, upstream hangs; draft `docs/upstream-issues/08-...`); MANIFEST level bound; OPTIONS parsing on torn and odd input
+- [x] Write path: close completes and releases everything after a WAL close error; ShutdownInProgress after CancelAllBackgroundWork; stalled writes give up on an unrecovered background error; no spin for operations racing the close
+- [x] API: pooled public objects pool only their state (one handle per rent, disposed once); foreign column family handles rejected; disposed MultiGetBatch rejected; ingestion into a CF dropped mid-prepare
+- [x] Transactions: timestamp writes through TransactionDB NotSupported; snapshots released when unreferenced; recovered prepared sections the rebuild cannot take fail with InvalidArgument
+- [x] Replication: progress reporter survives transport cancellations; follower rejoins after a resync that could not start; resync survives a close error
+- [ ] GetUpdatesSince ends with OK where native returns TryAgain when stopped below LastSequence on a damaged recycled record (tailing design)
+- [x] OPTIONS parsing never less strict than native (empty `comparator=`, empty / malformed `blob_compression_opts`, malformed `file_checksum_gen_factory` fixed; stricter-than-native classes accepted by rule, listed in validation.md)
+- [ ] `BlockBasedTableReader.IterPool` hands out pooled `BlockIter` (a public type): not checked whether user code can hold a stale one
+
+## Audit #8 (2026-11-16; docs/validation.md "Audit #8: the asynchronous implementation")
+
+- [x] Iterator dispose during a pending async move no longer hands its pooled core to another iterator; ScanAsync goes through the iterator core (statistics, tracing, tailing renewal) and rejects overlapping MoveNextAsync; GetAsync merge chains no longer double-count tickers
+- [x] Close no longer hangs behind write-buffer-manager stalls or waits for thread-pool work; cancelled MANIFEST writes are atomic for the caller
+- [x] Transactions: range lock granted during cancellation released; lock timeouts beyond 24.8 days
+- [x] Sync/async parity differential tests for writes, reads, iterators, transactions, backup, control APIs; public async surface inventory test
+- [x] A throwing `UserWriteCallback` (OnWriteEnqueued / OnWalWriteFinish) fails safely: hard background error, caller gets the exception, Resume() recovers (deliberate deviation; upstream: undefined behaviour)
+- [x] Sync writers behind an async leader depend on a thread-pool continuation: documented as a usage rule (never mix sync and async on one DB; sync write methods to be deprecated), repro stays ignored
+- [x] `AsyncPrefetchBuffer.TakePending` blocked on a pool continuation without `Prefetch` support: synchronous readahead (audit #11)
+
+## Audit #9 (2026-11-16; docs/validation.md "Audit #9: opening and closing the DB")
+
+- [x] Concurrent second close waits for the first (LOCK released); recovery-task and shutdown-flush failures never stop a close
+- [x] IDENTITY handled as SetupDBId (mismatch rewritten, empty regenerated, read-only writes nothing); create_if_missing message
+- [x] Crash sweeps over every mutating operation of open (12 scenarios) and close (6 scenarios), TransactionDB open sweep; file listings vs native
+- [ ] `OptimisticTransactionDatabase.Open` does not dispose the DB if its constructor throws (only on out-of-memory; unconfirmed)
+
+## Audit #10 (2026-11-16; docs/validation.md "Audit #10: user customization points")
+
+- [x] Native differentials with the same C# callbacks: custom prefix extractor, comparator, merge operator, compaction filter / factory, table filter
+- [x] Do-nothing FindShortestSeparator / FindShortSuccessor overrides keep the key; inconsistent comparator -> Corruption at flush; ReadOptions.TableFilter ported
+- [x] Throwing user code fails safely everywhere (partitioner, checksum factory, compaction service, merge operator, filters, collectors, listeners, comparators, extractors)
+- [x] Compaction filter factories see the table file creation reason
+- [x] `CompactionFilter::Context::input_table_properties`; `MergeOperator::ShouldMerge`; `max_successive_merges`; `OnSubcompaction*` / `OnFile*Finish` listeners (audit #11)
+- [x] Custom filter policy reusing the built-in compatibility name gets its own reader, as upstream (audit #11)
+- [ ] Failed background compaction output possibly kept until the next open (unconfirmed)
+
+- [ ] Deprecate, then remove, the synchronous write methods (follows from the sync/async mixing rule, audit #8)
+
+## Audit #11 (2026-11-17; docs/validation.md "Audit #11")
+
+- [x] ShouldMerge, max_successive_merges (+ strict), input_table_properties, custom filter readers, listener callbacks (subcompaction, pre-commit, creation started, manual flush scheduled, blob files, file I/O)
+- [x] Row cache + ShouldMerge truncated entry (wrong reads; upstream too, draft 16)
+- [x] GetUpdatesSince TryAgain like native (recoverable on Next: deviation); WalTailer escalates damaged WAL records to a resync
+- [x] Compaction / auto readahead without Prefetch support reads synchronously
+- [x] WAL tailer: fresh tailer at a manual_wal_flush-buffered start; recycled-WAL damage and a length past the written end escalate (writer flushed-record-end mark)
+- [ ] Future: listener `OnBackgroundJobPressureChanged` (experimental upstream); blob direct-write `OnBlobFileCreationStarted` / `OnBlobFileCreated`; file I/O notifications for `SstFileWriter` / `SstFileReader` (needs a listener list on their options)

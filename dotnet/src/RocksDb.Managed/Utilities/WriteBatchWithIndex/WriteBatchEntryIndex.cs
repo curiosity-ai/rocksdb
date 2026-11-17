@@ -18,7 +18,7 @@ internal sealed class WriteBatchEntryIndex
     private const int Branching = 4;
     private const int Head = 0;
 
-    private readonly Db.WriteBatch _batch;
+    private Db.WriteBatch _batch;
     private readonly Comparator _defaultComparator;
     private Comparator?[] _cfComparators = [];
 
@@ -41,6 +41,9 @@ internal sealed class WriteBatchEntryIndex
         _defaultComparator = defaultComparator;
         Clear();
     }
+
+    /// <summary>Points a pooled (cleared) index at the batch of its next renter.</summary>
+    public void Bind(Db.WriteBatch batch) => _batch = batch;
 
     /// <summary>WriteBatchEntryComparator::SetComparatorForCF: the first comparator registered for a CF is kept.</summary>
     public void SetComparator(uint cf, Comparator comparator)

@@ -171,6 +171,9 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         long start = Stopwatch.GetTimestamp();
         while (true)
         {
+            // Close has begun (CloseAsync announces itself before it enters the write queue, as DelayWrite observes): a
+            // stalled leader holds the queue close needs, and the memory may never be freed. Fail like DelayWriteAsync.
+            if (IsClosingForStall) ThrowDisposed();
             WbmStall stall = _wbmStall ??= new WbmStall();
             Task blocked = stall.Block();
             wbm.BeginWriteStall(stall);
@@ -196,13 +199,13 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                         retryLocalFlush = true;
                         break;
                     }
-                    if (IsDisposed || _shuttingDown) break;
+                    if (IsDisposed || _shuttingDown || IsClosingForStall) break;
                 }
             }
             else
             {
                 // Wake up periodically to notice a shutdown.
-                while (!blocked.IsCompleted && !IsDisposed && !_shuttingDown)
+                while (!blocked.IsCompleted && !IsDisposed && !_shuttingDown && !IsClosingForStall)
                 {
                     if (synchronous) blocked.Wait(100, cancellationToken);
                     else await Task.WhenAny(blocked, Task.Delay(100, cancellationToken)).ConfigureAwait(false);
@@ -221,6 +224,12 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                 _writeThread.EndWriteStall();
             }
             if (IsDisposed || _shuttingDown) throw new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+            if (IsClosingForStall)
+            {
+                // Released by close (DeregisterFromWriteBufferManager signals the stall) or noticed by the poll above.
+                wbm.RemoveDbFromQueue(stall);
+                ThrowDisposed();
+            }
             if (!retryLocalFlush || !wbm.ShouldStall()) break;
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
@@ -228,6 +237,12 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         }
         RecordWriteStall(start);
     }
+
+    /// <summary>
+    /// <see cref="_closing"/> read outside the mutex by the write buffer manager stall, which polls it (stall path only;
+    /// the flag is set once, under the mutex, and never reset).
+    /// </summary>
+    private bool IsClosingForStall => Volatile.Read(ref _closing);
 
     // ---- FlushInitiator (FlushLargestAcrossDbs) --------------------------------------------------------------
 

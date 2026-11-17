@@ -36,16 +36,55 @@ public enum WriteType : byte
 /// </para>
 /// <para>
 /// <see cref="Rent()"/> (or <see cref="RocksDatabase.CreateWriteBatchWithIndex()"/>) takes a bytewise-ordered batch from
-/// a process-wide pool; its <see cref="Dispose"/> clears it and returns it to the pool, so building a batch per
-/// operation does not allocate once the pooled batches have grown to their working size.
+/// process-wide pools (its index state and batch buffer; the objects themselves are new); its <see cref="Dispose"/>
+/// returns them, so building a batch per operation allocates only those small objects once the pooled state has grown
+/// to its working size. After Dispose the batch, its <see cref="WriteBatch"/> and its iterators throw
+/// <see cref="ObjectDisposedException"/>.
 /// </para>
 /// </summary>
 public sealed class WriteBatchWithIndex : IDisposable
 {
-    private readonly WriteBatch _batch;
-    private readonly WriteBatchEntryIndex _index;
+    // The batch and the index state; both null once disposed (every later use throws ObjectDisposedException). For a
+    // batch from Rent() the index state (index arrays + merge context) is pooled and the batch's rep buffer comes from
+    // WriteBatch's rep pool, but this object and its WriteBatch are never reused: Dispose takes the state out exactly
+    // once, so a reference kept after Dispose can never reach the state of a later renter.
+    private WriteBatch? _batchField;
+    private IndexState? _state;
     private readonly Comparator _defaultComparator;
-    private readonly MergeContext _mergeContext = new();
+
+    /// <summary>The pooled part of a rented batch: the index (rebound to each renter's batch) and the merge context.</summary>
+    private sealed class IndexState(WriteBatch batch, Comparator defaultComparator)
+    {
+        public readonly WriteBatchEntryIndex Index = new(batch, defaultComparator);
+        public readonly MergeContext MergeContext = new();
+    }
+
+    private WriteBatch Batch
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            WriteBatch? b = _batchField;
+            if (b is null) ThrowInPool();
+            return b;
+        }
+    }
+
+    private IndexState State
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            IndexState? st = _state;
+            if (st is null) ThrowInPool();
+            return st;
+        }
+    }
+
+    /// <summary>The index of the batch's entries (throws ObjectDisposedException once disposed).</summary>
+    internal WriteBatchEntryIndex Index => State.Index;
+
+    private MergeContext MergeCtx => State.MergeContext;
 
     /// <summary>A bytewise-ordered batch without overwrite_key.</summary>
     public WriteBatchWithIndex() : this(Comparator.Bytewise, 0, false, 0) { }
@@ -59,9 +98,19 @@ public sealed class WriteBatchWithIndex : IDisposable
     {
         ArgumentNullException.ThrowIfNull(defaultComparator);
         _defaultComparator = defaultComparator;
-        _batch = new WriteBatch(reservedBytes, maxBytes);
-        _index = new WriteBatchEntryIndex(_batch, defaultComparator);
+        _batchField = new WriteBatch(reservedBytes, maxBytes);
+        _state = new IndexState(_batchField, defaultComparator);
         OverwriteKey = overwriteKey;
+    }
+
+    /// <summary>A rented batch (see <see cref="Rent(bool)"/>).</summary>
+    private WriteBatchWithIndex(WriteBatch batch, IndexState state, bool overwriteKey)
+    {
+        _defaultComparator = Comparator.Bytewise;
+        _batchField = batch;
+        _state = state;
+        OverwriteKey = overwriteKey;
+        _pooled = true;
     }
 
     /// <summary>
@@ -71,7 +120,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal WriteBatchWithIndex(int maxBytes, bool withNoop) : this(Comparator.Bytewise, 0, true, maxBytes)
     {
         _withNoop = withNoop;
-        if (withNoop) _batch.InsertNoop();
+        if (withNoop) Batch.InsertNoop();
     }
 
     private readonly bool _withNoop;
@@ -85,7 +134,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         get
         {
             ThrowIfInPool();
-            return _batch;
+            return Batch;
         }
     }
 
@@ -95,23 +144,24 @@ public sealed class WriteBatchWithIndex : IDisposable
         get
         {
             ThrowIfInPool();
-            return _batch.Data;
+            return Batch.Data;
         }
     }
 
     // ---- Pooling ----------------------------------------------------------------------------------------------
 
-    private static readonly WriteBatchWithIndex?[] s_pool = new WriteBatchWithIndex?[Math.Min(64, Environment.ProcessorCount * 4)];
+    private static readonly IndexState?[] s_pool = new IndexState?[Math.Min(64, Environment.ProcessorCount * 4)];
     private const int MaxPooledBatchBytes = 1 << 20;
     private const int MaxPooledIndexEntries = 1 << 16;
-    // Rented with Rent: Dispose returns the batch to s_pool. _inPool: it is in s_pool (any use is a use after Dispose).
-    private bool _pooled;
-    private bool _inPool;
+    // Rented with Rent: Dispose returns the index state to s_pool (and the rep to WriteBatch's pool).
+    private readonly bool _pooled;
 
     /// <summary>
-    /// Gets an empty, bytewise-ordered batch without overwrite_key from a process-wide pool (or a new one, like
-    /// <see cref="WriteBatchWithIndex()"/>). <see cref="Dispose"/> clears it and returns it to the pool: the batch, its
-    /// iterators and the <see cref="WriteBatch"/> it exposes must not be used afterwards.
+    /// Gets an empty, bytewise-ordered batch without overwrite_key whose index state and batch buffer come from
+    /// process-wide pools (the <see cref="WriteBatchWithIndex"/> object and its <see cref="WriteBatch"/> are new; this
+    /// allocates only those small objects in steady state). <see cref="Dispose"/> returns the pooled parts exactly once:
+    /// afterwards every use of this object, of its <see cref="WriteBatch"/> and of its iterators throws
+    /// <see cref="ObjectDisposedException"/> and further Dispose calls do nothing.
     /// </summary>
     public static WriteBatchWithIndex Rent() => Rent(overwriteKey: false);
 
@@ -121,57 +171,34 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// </summary>
     public static WriteBatchWithIndex Rent(bool overwriteKey)
     {
-        WriteBatchWithIndex?[] pool = s_pool;
+        WriteBatch batch = WriteBatch.Rent();
+        IndexState?[] pool = s_pool;
         for (int i = 0; i < pool.Length; i++)
         {
-            WriteBatchWithIndex? b = pool[i];
-            if (b is not null && Interlocked.CompareExchange(ref pool[i], null, b) == b)
+            IndexState? st = pool[i];
+            if (st is not null && Interlocked.CompareExchange(ref pool[i], null, st) == st)
             {
-                b._inPool = false;
-                b._pooled = true;
-                b.OverwriteKey = overwriteKey;
-                return b;
+                st.Index.Bind(batch);
+                return new WriteBatchWithIndex(batch, st, overwriteKey);
             }
         }
-        return new WriteBatchWithIndex(Comparator.Bytewise, 0, overwriteKey, 0) { _pooled = true };
-    }
-
-    /// <summary>
-    /// Returns a rented batch to the pool: cleared, without column family comparators (the next renter may use other
-    /// databases) and with indexing enabled. Batches that grew very large are dropped instead.
-    /// </summary>
-    private bool TryReturnToPool()
-    {
-        _pooled = false;
-        if (_batch.Capacity > MaxPooledBatchBytes || _index.Count > MaxPooledIndexEntries) return false;
-        Clear();
-        _index.ResetComparators();
-        IndexingDisabled = false;
-        _mergeContext.Clear();
-        _inPool = true;
-        WriteBatchWithIndex?[] pool = s_pool;
-        for (int i = 0; i < pool.Length; i++)
-        {
-            if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], this, null) is null) return true;
-        }
-        _inPool = false;
-        return false;
+        return new WriteBatchWithIndex(batch, new IndexState(batch, Comparator.Bytewise), overwriteKey);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private void ThrowIfInPool()
     {
-        if (_inPool) ThrowInPool();
+        if (_state is null) ThrowInPool();
     }
 
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
     private static void ThrowInPool() => throw new ObjectDisposedException(nameof(WriteBatchWithIndex));
 
     /// <summary>Number of operations in the batch.</summary>
-    public int Count => _batch.Count;
+    public int Count => Batch.Count;
 
     /// <summary>Bytes in the batch rep (GetDataSize).</summary>
-    public int DataSize => _batch.DataSize;
+    public int DataSize => Batch.DataSize;
 
     // =====================================================================================================
     // Writes
@@ -181,7 +208,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     {
         ThrowIfInPool();
         if (cf is null) return 0;
-        _index.SetComparator(cf.Id, cf.Data.UserComparator);
+        Index.SetComparator(cf.Id, cf.Data.UserComparator);
         return cf.Id;
     }
 
@@ -204,8 +231,8 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal void PutEntity(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<WideColumn> columns)
     {
         if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
-        int offset = _batch.DataSize;
-        _batch.PutEntity(cf, key, columns);
+        int offset = Batch.DataSize;
+        Batch.PutEntity(cf, key, columns);
         AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
     }
 
@@ -236,7 +263,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary>Appends a blob that is written to the WAL but not applied (not indexed).</summary>
     public WriteBatchWithIndex PutLogData(ReadOnlySpan<byte> blob)
     {
-        _batch.PutLogData(blob);
+        Batch.PutLogData(blob);
         return this;
     }
 
@@ -251,16 +278,16 @@ public sealed class WriteBatchWithIndex : IDisposable
     public void Clear()
     {
         ThrowIfInPool();
-        _batch.Clear();
-        if (_withNoop) _batch.InsertNoop();
-        _index.Clear();
+        Batch.Clear();
+        if (_withNoop) Batch.InsertNoop();
+        Index.Clear();
         _lastSubBatchOffset = 0;
         _subBatchCount = 1;
         _hasKeyWithTimestamp = false;
     }
 
     /// <summary>Records the current state; see <see cref="RollbackToSavePoint"/>.</summary>
-    public void SetSavePoint() => _batch.SetSavePoint();
+    public void SetSavePoint() => Batch.SetSavePoint();
 
     /// <summary>
     /// Removes the updates added since the most recent save point and rebuilds the index (ReBuildIndex). Returns false
@@ -268,16 +295,16 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// </summary>
     public bool RollbackToSavePoint()
     {
-        if (!_batch.RollbackToSavePoint()) return false;
+        if (!Batch.RollbackToSavePoint()) return false;
         RebuildIndex();
         return true;
     }
 
     /// <summary>Removes the most recent save point. Returns false when there is none.</summary>
-    public bool PopSavePoint() => _batch.PopSavePoint();
+    public bool PopSavePoint() => Batch.PopSavePoint();
 
     /// <summary>User-defined timestamp size of column family <paramref name="cf"/> (its index comparator's).</summary>
-    private int TimestampSizeOf(uint cf) => _index.GetComparator(cf).TimestampSize;
+    private int TimestampSizeOf(uint cf) => Index.GetComparator(cf).TimestampSize;
 
     /// <summary>
     /// WriteBatch::Put(column_family, key, value) on a column family with timestamps: the key gets a dummy (all-zero)
@@ -313,32 +340,32 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary>Rep::AddOrUpdateIndexWithCfId (+ UpdateExistingEntryWithCfId in overwrite_key mode).</summary>
     private void AddOrUpdateIndexCore(uint cf, WriteType type, int recordOffset)
     {
-        DecodeKeyPosition(_batch.Data, recordOffset, out int keyOffset, out int keySize);
+        DecodeKeyPosition(Batch.Data, recordOffset, out int keyOffset, out int keySize);
         // MakeEntry: the index holds the user key without its timestamp.
         int tsSize = TimestampSizeOf(cf);
         if (tsSize > 0 && keySize >= tsSize) keySize -= tsSize;
         if (OverwriteKey)
         {
-            ReadOnlySpan<byte> key = _batch.Data.Slice(keyOffset, keySize);
+            ReadOnlySpan<byte> key = Batch.Data.Slice(keyOffset, keySize);
             // Seek() finds the first entry with key == `key`: the most recent update.
-            int node = _index.Seek(cf, key, long.MaxValue);
-            if (node >= 0 && _index.ColumnFamily(node) == cf &&
-                _index.GetComparator(cf).CompareWithoutTimestamp(_index.Key(node), false, key, false) == 0)
+            int node = Index.Seek(cf, key, long.MaxValue);
+            if (node >= 0 && Index.ColumnFamily(node) == cf &&
+                Index.GetComparator(cf).CompareWithoutTimestamp(Index.Key(node), false, key, false) == 0)
             {
                 // A sub-batch starts right before inserting a key that is a duplicate of a key in the last sub-batch.
-                if (_lastSubBatchOffset <= _index.RecordOffset(node))
+                if (_lastSubBatchOffset <= Index.RecordOffset(node))
                 {
                     _lastSubBatchOffset = recordOffset;
                     _subBatchCount++;
                 }
                 if (type != WriteType.Merge)
                 {
-                    _index.UpdateOffset(node, recordOffset);
+                    Index.UpdateOffset(node, recordOffset);
                     return;
                 }
             }
         }
-        _index.Insert(cf, recordOffset, keyOffset, keySize);
+        Index.Insert(cf, recordOffset, keyOffset, keySize);
     }
 
     // Rep::last_sub_batch_offset / sub_batch_cnt: the starting offset of the last sub-batch (0 = no duplicate key so far)
@@ -371,10 +398,10 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary>Rep::ReBuildIndex: re-reads every record of the batch into a fresh index.</summary>
     private void RebuildIndex()
     {
-        _index.Clear();
+        Index.Clear();
         _lastSubBatchOffset = 0;
         _subBatchCount = 1;
-        ReadOnlySpan<byte> rep = _batch.Data;
+        ReadOnlySpan<byte> rep = Batch.Data;
         int pos = WriteBatch.HeaderSize;
         while (pos < rep.Length)
         {
@@ -403,7 +430,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// <summary>ReadableWriteBatch::GetEntryFromDataOffset.</summary>
     internal WriteType GetEntry(int recordOffset, out ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
     {
-        ReadOnlySpan<byte> rep = _batch.Data;
+        ReadOnlySpan<byte> rep = Batch.Data;
         int pos = recordOffset;
         string? error = WriteBatchReader.TryReadRecord(rep, ref pos, out WriteBatchEntry e);
         if (error is not null) ThrowHelper.Corruption(error);
@@ -425,50 +452,49 @@ public sealed class WriteBatchWithIndex : IDisposable
         };
     }
 
-    internal WriteBatchEntryIndex Index => _index;
 
     // ---- internal column-family-id API (transactions) ----
 
     /// <summary>Registers the comparator ordering column family <paramref name="cf"/> (SetComparatorForCF).</summary>
-    internal void RegisterColumnFamily(uint cf, Comparator comparator) => _index.SetComparator(cf, comparator);
+    internal void RegisterColumnFamily(uint cf, Comparator comparator) => Index.SetComparator(cf, comparator);
 
     internal void Put(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        int offset = _batch.DataSize;
-        if (TimestampSizeOf(cf) != 0) _batch.Put(cf, key, PlaceholderTimestamp(cf), value);
-        else _batch.Put(cf, key, value);
+        int offset = Batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) Batch.Put(cf, key, PlaceholderTimestamp(cf), value);
+        else Batch.Put(cf, key, value);
         AddOrUpdateIndex(cf, WriteType.Put, offset);
     }
 
     internal void PutEntitySerialized(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> entity)
     {
         if (TimestampSizeOf(cf) != 0) ThrowHelper.NotSupported("PutEntity on a column family with user-defined timestamps in WriteBatchWithIndex");
-        int offset = _batch.DataSize;
-        _batch.PutEntitySerialized(cf, key, entity);
+        int offset = Batch.DataSize;
+        Batch.PutEntitySerialized(cf, key, entity);
         AddOrUpdateIndex(cf, WriteType.PutEntity, offset);
     }
 
     internal void Delete(uint cf, ReadOnlySpan<byte> key)
     {
-        int offset = _batch.DataSize;
-        if (TimestampSizeOf(cf) != 0) _batch.Delete(cf, key, PlaceholderTimestamp(cf));
-        else _batch.Delete(cf, key);
+        int offset = Batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) Batch.Delete(cf, key, PlaceholderTimestamp(cf));
+        else Batch.Delete(cf, key);
         AddOrUpdateIndex(cf, WriteType.Delete, offset);
     }
 
     internal void SingleDelete(uint cf, ReadOnlySpan<byte> key)
     {
-        int offset = _batch.DataSize;
-        if (TimestampSizeOf(cf) != 0) _batch.SingleDelete(cf, key, PlaceholderTimestamp(cf));
-        else _batch.SingleDelete(cf, key);
+        int offset = Batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) Batch.SingleDelete(cf, key, PlaceholderTimestamp(cf));
+        else Batch.SingleDelete(cf, key);
         AddOrUpdateIndex(cf, WriteType.SingleDelete, offset);
     }
 
     internal void Merge(uint cf, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        int offset = _batch.DataSize;
-        if (TimestampSizeOf(cf) != 0) _batch.Merge(cf, key, PlaceholderTimestamp(cf), value);
-        else _batch.Merge(cf, key, value);
+        int offset = Batch.DataSize;
+        if (TimestampSizeOf(cf) != 0) Batch.Merge(cf, key, PlaceholderTimestamp(cf), value);
+        else Batch.Merge(cf, key, value);
         AddOrUpdateIndex(cf, WriteType.Merge, offset);
     }
 
@@ -478,8 +504,8 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// </summary>
     internal LookupResult Lookup(uint cf, ReadOnlySpan<byte> key)
     {
-        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out _, out _);
-        return r == LookupResult.Deleted && _mergeContext.Count > 0 ? LookupResult.Found : r;
+        LookupResult r = FindLatestUpdate(cf, Index.GetComparator(cf), key, MergeCtx, out _, out _);
+        return r == LookupResult.Deleted && MergeCtx.Count > 0 ? LookupResult.Found : r;
     }
 
     /// <summary>
@@ -490,7 +516,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal bool ComputeValue(uint cf, ReadOnlySpan<byte> key, MergeOperator? mergeOperator, bool dbHasValue, ReadOnlySpan<byte> dbValue,
         IBufferWriter<byte> result)
     {
-        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        LookupResult r = FindLatestUpdate(cf, Index.GetComparator(cf), key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
         bool hasBase;
         ReadOnlySpan<byte> baseValue;
         switch (r)
@@ -512,14 +538,14 @@ public sealed class WriteBatchWithIndex : IDisposable
                 result.Write(dbValue);
                 return true;
         }
-        if (_mergeContext.Count == 0)
+        if (MergeCtx.Count == 0)
         {
             if (!hasBase) return false;
             result.Write(baseValue);
             return true;
         }
         if (mergeOperator is null) ThrowHelper.InvalidArgument("Merge operator not specified for the column family");
-        MergeHelper.TimedFullMerge(mergeOperator!, key, hasBase, baseValue, _mergeContext, result);
+        MergeHelper.TimedFullMerge(mergeOperator!, key, hasBase, baseValue, MergeCtx, result);
         return true;
     }
 
@@ -527,7 +553,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal BaseDeltaIterator NewIteratorWithBase(uint cf, Comparator comparator, MergeOperator? mergeOperator, Iterator baseIterator,
         ReadOptions? options)
     {
-        _index.SetComparator(cf, comparator);
+        Index.SetComparator(cf, comparator);
         return new BaseDeltaIterator(baseIterator, this, RentDeltaScratch(cf, comparator, options), comparator, mergeOperator);
     }
 
@@ -550,7 +576,7 @@ public sealed class WriteBatchWithIndex : IDisposable
         if (Interlocked.CompareExchange(ref _spareDeltaScratch, scratch, null) is not null) scratch.Dispose();
     }
 
-    internal Comparator ComparatorOf(ColumnFamily? cf) => cf is null ? _defaultComparator : _index.GetComparator(CfId(cf));
+    internal Comparator ComparatorOf(ColumnFamily? cf) => cf is null ? _defaultComparator : Index.GetComparator(CfId(cf));
 
     /// <summary>
     /// An iterator over the indexed entries of a column family (WriteBatchWithIndex::NewIterator): every update of each
@@ -594,10 +620,10 @@ public sealed class WriteBatchWithIndex : IDisposable
         type = WriteType.Unknown;
         value = default;
         LookupResult result = LookupResult.NotFound;
-        for (int node = _index.Seek(cf, key, long.MaxValue); node >= 0; node = _index.NextNode(node))
+        for (int node = Index.Seek(cf, key, long.MaxValue); node >= 0; node = Index.NextNode(node))
         {
-            if (_index.ColumnFamily(node) != cf || cmp.CompareWithoutTimestamp(_index.Key(node), false, key, false) != 0) break;
-            WriteType t = GetEntry(_index.RecordOffset(node), out _, out ReadOnlySpan<byte> v);
+            if (Index.ColumnFamily(node) != cf || cmp.CompareWithoutTimestamp(Index.Key(node), false, key, false) != 0) break;
+            WriteType t = GetEntry(Index.RecordOffset(node), out _, out ReadOnlySpan<byte> v);
             switch (t)
             {
                 case WriteType.Put:
@@ -640,7 +666,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     {
         ArgumentNullException.ThrowIfNull(value);
         uint cf = CfId(columnFamily);
-        LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
         switch (r)
         {
             case LookupResult.NotFound:
@@ -648,13 +674,13 @@ public sealed class WriteBatchWithIndex : IDisposable
             case LookupResult.MergeInProgress:
                 throw new RocksDbException(StatusCode.MergeInProgress, "Merge in progress");
             case LookupResult.Deleted:
-                if (_mergeContext.Count == 0) return false;
-                MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, _mergeContext, value);
+                if (MergeCtx.Count == 0) return false;
+                MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, MergeCtx, value);
                 return true;
             default: // Found
                 ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
-                if (_mergeContext.Count == 0) value.Write(baseValue);
-                else MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, true, baseValue, _mergeContext, value);
+                if (MergeCtx.Count == 0) value.Write(baseValue);
+                else MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, true, baseValue, MergeCtx, value);
                 return true;
         }
     }
@@ -677,7 +703,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     {
         ArgumentNullException.ThrowIfNull(columns);
         uint cf = CfId(columnFamily);
-        LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        LookupResult r = FindLatestUpdate(cf, ComparatorOf(columnFamily), key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
         if (r == LookupResult.MergeInProgress)
         {
             columns.Clear();
@@ -688,7 +714,7 @@ public sealed class WriteBatchWithIndex : IDisposable
 
     /// <summary>
     /// WriteBatchWithIndexInternal::GetEntityFromBatch for a settled lookup (NotFound, Deleted or Found, with the merge
-    /// operands of <c>_mergeContext</c>): the entity of the key, or false (columns emptied).
+    /// operands of <c>MergeCtx</c>): the entity of the key, or false (columns emptied).
     /// </summary>
     private bool ResolveBatchEntity(LookupResult r, WriteType type, ReadOnlySpan<byte> v, MergeOperator? mergeOperator, ReadOnlySpan<byte> key,
         WideColumns columns)
@@ -702,16 +728,16 @@ public sealed class WriteBatchWithIndex : IDisposable
                     columns.Clear();
                     return false;
                 case LookupResult.Deleted:
-                    if (_mergeContext.Count == 0)
+                    if (MergeCtx.Count == 0)
                     {
                         columns.Clear();
                         return false;
                     }
-                    MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, _mergeContext, w);
+                    MergeHelper.TimedFullMerge(RequireMergeOperator(mergeOperator), key, false, default, MergeCtx, w);
                     WrapDefault(w, columns);
                     return true;
                 default:
-                    if (_mergeContext.Count == 0)
+                    if (MergeCtx.Count == 0)
                     {
                         if (type == WriteType.PutEntity) columns.SetSerialized(v);
                         else
@@ -724,11 +750,11 @@ public sealed class WriteBatchWithIndex : IDisposable
                     MergeOperator op = RequireMergeOperator(mergeOperator);
                     if (type == WriteType.PutEntity)
                     {
-                        MergeHelper.TimedFullMerge(op, key, true, Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v), _mergeContext, w);
+                        MergeHelper.TimedFullMerge(op, key, true, Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v), MergeCtx, w);
                         ReplaceDefault(v, w, columns);
                         return true;
                     }
-                    MergeHelper.TimedFullMerge(op, key, true, v, _mergeContext, w);
+                    MergeHelper.TimedFullMerge(op, key, true, v, MergeCtx, w);
                     WrapDefault(w, columns);
                     return true;
             }
@@ -825,7 +851,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal bool GetEntityFromBatchAndDBCore<TReader>(uint cf, MergeOperator? mergeOperator, ReadOnlySpan<byte> key, WideColumns columns, ref TReader reader)
         where TReader : struct, IEntityDbReader
     {
-        LookupResult r = FindLatestUpdate(cf, _index.GetComparator(cf), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        LookupResult r = FindLatestUpdate(cf, Index.GetComparator(cf), key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
         switch (r)
         {
             case LookupResult.NotFound:
@@ -833,10 +859,10 @@ public sealed class WriteBatchWithIndex : IDisposable
             case LookupResult.MergeInProgress:
                 {
                     MergeOperator op = RequireMergeOperator(mergeOperator);
-                    // The DB read does not touch the batch: the operands collected in _mergeContext stay valid.
+                    // The DB read does not touch the batch: the operands collected in MergeCtx stay valid.
                     var existing = new WideColumns();
                     bool found = reader.TryGetEntity(key, existing);
-                    MergeEntityAcrossBatchAndDB(op, key, found, existing, _mergeContext, columns);
+                    MergeEntityAcrossBatchAndDB(op, key, found, existing, MergeCtx, columns);
                     return true;
                 }
             default:
@@ -911,7 +937,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal void MultiGetEntityFromBatchAndDBCore<TReader>(uint cf, MergeOperator? op, int timestampSize, ReadOptions? options, MultiGetBatch batch,
         ref TReader reader) where TReader : struct, IMultiEntityDbReader
     {
-        Comparator cmp = _index.GetComparator(cf);
+        Comparator cmp = Index.GetComparator(cf);
         int n = batch.Count;
         batch.EntityRun = true;
         if (CheckEntityReadTimestamp(timestampSize, options) is { } tsError)
@@ -933,7 +959,7 @@ public sealed class WriteBatchWithIndex : IDisposable
             ReadOnlySpan<byte> key = batch.GetKey(i);
             try
             {
-                LookupResult r = FindLatestUpdate(cf, cmp, key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+                LookupResult r = FindLatestUpdate(cf, cmp, key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
                 switch (r)
                 {
                     case LookupResult.NotFound:
@@ -944,7 +970,7 @@ public sealed class WriteBatchWithIndex : IDisposable
                         {
                             RequireMergeOperator(op);
                             var operands = new MergeContext();
-                            for (int j = 0; j < _mergeContext.Count; j++) operands.PushOperand(_mergeContext.GetOperandNewestFirst(j));
+                            for (int j = 0; j < MergeCtx.Count; j++) operands.PushOperand(MergeCtx.GetOperandNewestFirst(j));
                             (merges ??= new MergeContext?[n])[i] = operands;
                             dbIndex[i] = dbBatch.Count;
                             dbBatch.Add(key);
@@ -1036,20 +1062,20 @@ public sealed class WriteBatchWithIndex : IDisposable
         ColumnFamily cfh = columnFamily ?? db.DefaultColumnFamily;
         uint cf = CfId(cfh);
         if (cfh.Data.TimestampSize > 0 && options?.Timestamp is null) ThrowHelper.InvalidArgument("Must specify timestamp");
-        LookupResult r = FindLatestUpdate(cf, ComparatorOf(cfh), key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+        LookupResult r = FindLatestUpdate(cf, ComparatorOf(cfh), key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
         MergeOperator? op = cfh.Data.MergeOperator;
         switch (r)
         {
             case LookupResult.Found:
                 {
                     ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
-                    if (_mergeContext.Count == 0) value.Write(baseValue);
-                    else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, _mergeContext, value);
+                    if (MergeCtx.Count == 0) value.Write(baseValue);
+                    else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, MergeCtx, value);
                     return true;
                 }
             case LookupResult.Deleted:
-                if (_mergeContext.Count == 0) return false;
-                MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, _mergeContext, value);
+                if (MergeCtx.Count == 0) return false;
+                MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, MergeCtx, value);
                 return true;
             case LookupResult.NotFound:
                 return cfh.TryGet(options, key, value);
@@ -1059,7 +1085,7 @@ public sealed class WriteBatchWithIndex : IDisposable
                     // The DB read may reuse pooled state: keep the operands while it runs.
                     var existing = new WideColumns();
                     bool found = cfh.TryGetEntity(options, key, existing);
-                    MergeHelper.TimedFullMerge(mop, key, found, found ? existing.DefaultColumnValue : default, _mergeContext, value);
+                    MergeHelper.TimedFullMerge(mop, key, found, found ? existing.DefaultColumnValue : default, MergeCtx, value);
                     return true;
                 }
         }
@@ -1111,7 +1137,7 @@ public sealed class WriteBatchWithIndex : IDisposable
     internal void MultiGetFromBatchAndDBCore<TReader>(uint cf, MergeOperator? op, int timestampSize, ReadOptions? options, MultiGetBatch batch,
         ref TReader reader) where TReader : struct, IMultiValueDbReader
     {
-        Comparator cmp = _index.GetComparator(cf);
+        Comparator cmp = Index.GetComparator(cf);
         int n = batch.Count;
         batch.EntityRun = false; // plain values (the batch may have been used for an entity run before)
         if (timestampSize > 0 && options?.Timestamp is null)
@@ -1135,22 +1161,22 @@ public sealed class WriteBatchWithIndex : IDisposable
                 ReadOnlySpan<byte> key = batch.GetKey(i);
                 try
                 {
-                    LookupResult r = FindLatestUpdate(cf, cmp, key, _mergeContext, out WriteType type, out ReadOnlySpan<byte> v);
+                    LookupResult r = FindLatestUpdate(cf, cmp, key, MergeCtx, out WriteType type, out ReadOnlySpan<byte> v);
                     switch (r)
                     {
                         case LookupResult.Found:
                             {
                                 ReadOnlySpan<byte> baseValue = type == WriteType.PutEntity ? Db.Wide.WideColumnSerialization.GetValueOfDefaultColumn(v) : v;
                                 w.Clear();
-                                if (_mergeContext.Count == 0) w.Write(baseValue);
-                                else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, _mergeContext, w);
+                                if (MergeCtx.Count == 0) w.Write(baseValue);
+                                else MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, true, baseValue, MergeCtx, w);
                                 fromBatch[i] = w.WrittenSpan.ToArray();
                                 break;
                             }
                         case LookupResult.Deleted:
-                            if (_mergeContext.Count == 0) break; // NotFound
+                            if (MergeCtx.Count == 0) break; // NotFound
                             w.Clear();
-                            MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, _mergeContext, w);
+                            MergeHelper.TimedFullMerge(RequireMergeOperator(op), key, false, default, MergeCtx, w);
                             fromBatch[i] = w.WrittenSpan.ToArray();
                             break;
                         case LookupResult.NotFound:
@@ -1161,7 +1187,7 @@ public sealed class WriteBatchWithIndex : IDisposable
                             {
                                 RequireMergeOperator(op);
                                 var operands = new MergeContext();
-                                for (int j = 0; j < _mergeContext.Count; j++) operands.PushOperand(_mergeContext.GetOperandNewestFirst(j));
+                                for (int j = 0; j < MergeCtx.Count; j++) operands.PushOperand(MergeCtx.GetOperandNewestFirst(j));
                                 (merges ??= new MergeContext?[n])[i] = operands;
                                 dbIndex[i] = dbBatch.Count;
                                 dbBatch.Add(key);
@@ -1232,12 +1258,26 @@ public sealed class WriteBatchWithIndex : IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_inPool) return;
-        if (_pooled && _defaultComparator == Comparator.Bytewise && !_withNoop && TryReturnToPool()) return;
-        _pooled = false;
-        _batch.Dispose();
-        _mergeContext.Dispose();
+        IndexState? st = Interlocked.Exchange(ref _state, null);
+        if (st is null) return;
+        WriteBatch batch = _batchField!;
+        _batchField = null;
         Interlocked.Exchange(ref _spareDeltaScratch, null)?.Dispose();
+        bool pool = _pooled && batch.Capacity <= MaxPooledBatchBytes && st.Index.Count <= MaxPooledIndexEntries;
+        batch.Dispose();
+        if (pool)
+        {
+            // Cleared, without column family comparators (the next renter may use other databases).
+            st.Index.Clear();
+            st.Index.ResetComparators();
+            st.MergeContext.Clear();
+            IndexState?[] slots = s_pool;
+            for (int i = 0; i < slots.Length; i++)
+            {
+                if (slots[i] is null && Interlocked.CompareExchange(ref slots[i], st, null) is null) return;
+            }
+        }
+        st.MergeContext.Dispose();
     }
 }
 

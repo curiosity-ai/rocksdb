@@ -617,8 +617,13 @@ internal static class WritableFileBuffers
 /// </list>
 /// Not thread-safe: a writable file has a single writer, as in RocksDB.
 /// Async methods complete synchronously while data fits in the buffer; slow paths use pooled state machines.
+/// <para>
+/// With <see cref="WritableFileOptions.FileIoNotifier"/> (a DB listener wants file I/O notifications) every physical write
+/// is reported (WriteBuffered / WriteDirect: OnFileWriteFinish, OnIOError(kAppend / kPositionedAppend)), as are range
+/// syncs and the truncation of a direct I/O file on close; without it the only cost is a null check per physical write.
+/// </para>
 /// </summary>
-internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFile
+internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFile, Db.IFileIoWriteReporter
 {
     private readonly SafeFileHandle _handle;
     private readonly string _path;
@@ -637,12 +642,17 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
     private bool _preallocationFailed;
     private bool _disposed;
     private readonly bool _offloadAsyncSync;  // LocalFileSystem.OffloadAsyncSync
+    private readonly Db.FileIoNotifier? _io;  // WritableFileWriter::listeners_ (null: ShouldNotifyListeners() is false)
+
+    /// <summary>This file reports its physical writes to the DB's file I/O listeners.</summary>
+    public bool ReportsFileIoWrites => _io is not null;
 
     public LocalWritableFile(string path, FileMode mode, WritableFileOptions options, bool append, bool offloadAsyncSync)
     {
         _path = path;
         _offloadAsyncSync = offloadAsyncSync;
         _options = options;
+        _io = options.FileIoNotifier;
         // FileMode.Create opens with O_CREAT and then always calls ftruncate(fd, 0), even on a file it just created. On
         // ext4 a truncate to size 0 arms auto_da_alloc's "replace via truncate" heuristic, which starts the writeback of
         // the file's delayed allocations when it is closed. Upstream (PosixFileSystem::NewWritableFile) opens with
@@ -913,6 +923,58 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
     private void WriteRaw(ReadOnlySpan<byte> data, long offset)
     {
         IOStatsContext.Add(IOStatsMetric.BytesWritten, (ulong)data.Length); // WritableFileWriter: IOSTATS_ADD(bytes_written)
+        if (_io is not null)
+        {
+            WriteRawNotified(data, offset);
+            return;
+        }
+        WriteRawUncounted(data, offset);
+    }
+
+    // WriteBuffered / WriteDirect: "if (ShouldNotifyListeners()) start_ts = FileOperationInfo::StartNow()" before the
+    // write, then "NotifyOnFileWriteFinish(offset, size, start_ts, finish_ts, s); if (!s.ok()) NotifyOnIOError(s, kAppend
+    // (kPositionedAppend for direct I/O), file_name(), size, offset)". One notification per write (upstream: per rate
+    // limiter grant).
+    private void WriteRawNotified(ReadOnlySpan<byte> data, long offset)
+    {
+        long start = Db.FileIoNotifier.Start(out DateTime startTime);
+        try
+        {
+            WriteRawUncounted(data, offset);
+        }
+        catch (Exception e)
+        {
+            WriteFailed(e, offset, data.Length, startTime, start);
+            throw;
+        }
+        _io!.Finish(FileOperationType.Write, _path, Temperature.Unknown, (ulong)offset, (ulong)data.Length, startTime, start, null);
+    }
+
+    private void WriteFailed(Exception e, long offset, int length, DateTime startTime, long start)
+    {
+        _io!.Finish(FileOperationType.Write, _path, Temperature.Unknown, (ulong)offset, (ulong)length, startTime, start, e);
+        _io.IoError(e, _alignment != 0 ? FileOperationType.PositionedAppend : FileOperationType.Append, _path, (ulong)length, (ulong)offset);
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask WriteRawNotifiedAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
+    {
+        long start = Db.FileIoNotifier.Start(out DateTime startTime);
+        try
+        {
+            await WriteRawAsyncCore(data, offset, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            WriteFailed(e, offset, data.Length, startTime, start);
+            throw;
+        }
+        _io!.Finish(FileOperationType.Write, _path, Temperature.Unknown, (ulong)offset, (ulong)data.Length, startTime, start, null);
+    }
+
+    /// <summary><see cref="WriteRaw"/> without the IOSTATS count (for callers that counted the bytes already).</summary>
+    private void WriteRawUncounted(ReadOnlySpan<byte> data, long offset)
+    {
         Preallocate(offset + data.Length);
         try
         {
@@ -942,6 +1004,12 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
     private ValueTask WriteRawAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
     {
         IOStatsContext.Add(IOStatsMetric.BytesWritten, (ulong)data.Length);
+        return _io is null ? WriteRawAsyncCore(data, offset, cancellationToken) : WriteRawNotifiedAsync(data, offset, cancellationToken);
+    }
+
+    /// <summary><see cref="WriteRawAsync"/> after the IOSTATS count.</summary>
+    private ValueTask WriteRawAsyncCore(ReadOnlyMemory<byte> data, long offset, CancellationToken cancellationToken)
+    {
         if (_alignment == 0 && _options.RateLimiter is null && !data.IsEmpty)
         {
             if (UnixNative.NoWaitWriteSupported)
@@ -965,7 +1033,7 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
                 // fdatasync of SyncAsync, which blocks much longer, runs on a dedicated sync thread).
                 try
                 {
-                    WriteRaw(data.Span, offset);
+                    WriteRawUncounted(data.Span, offset); // counted above
                     return ValueTask.CompletedTask;
                 }
                 catch (Exception e)
@@ -1033,13 +1101,26 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
         long syncTo = AlignedBuffer.RoundDown(_filePos - BytesNotSyncRange, 4096);
         if (syncTo > 0 && syncTo - _lastRangeSync >= bps)
         {
-            UnixNative.TryRangeSync(_handle, _lastRangeSync, syncTo - _lastRangeSync);
+            if (_io is null || !_options.ReportRangeSyncs)
+            {
+                UnixNative.TryRangeSync(_handle, _lastRangeSync, syncTo - _lastRangeSync);
+            }
+            else
+            {
+                // WritableFileWriter::RangeSync: "NotifyOnFileRangeSyncFinish(offset, nbytes, start_ts, finish_ts, s)" (the
+                // range sync is best effort here: a failure is not an error).
+                long start = Db.FileIoNotifier.Start(out DateTime startTime);
+                UnixNative.TryRangeSync(_handle, _lastRangeSync, syncTo - _lastRangeSync);
+                _io.Finish(FileOperationType.RangeSync, _path, Temperature.Unknown, (ulong)_lastRangeSync, (ulong)(syncTo - _lastRangeSync), startTime, start, null);
+            }
             _lastRangeSync = syncTo;
         }
     }
 
     public void Sync()
     {
+        // Like SyncAsync: a closed file fails with InvalidArgument (not ObjectDisposedException from the closed handle).
+        ThrowIfDisposed();
         Flush();
         long perfSync = PerfContext.StartTimer(); // IOSTATS_TIMER_GUARD(fsync_nanos)
         UnixNative.DataSync(_handle, _path);
@@ -1089,14 +1170,27 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
     {
         if (_alignment != 0 || _preallocatedEnd > Size || _options.TruncateToSizeOnClose)
         {
+            // WritableFileWriter::Close reports the truncation of a direct I/O file: "NotifyOnFileTruncateFinish(start_ts,
+            // finish_ts, s)" (s: the status of the flush before, OK here) and "NotifyOnIOError(interim, kTruncate, ...)".
+            bool notify = _io is not null && _alignment != 0;
+            DateTime startTime = default;
+            long start = 0;
+            if (notify) start = Db.FileIoNotifier.Start(out startTime);
             try
             {
                 RandomAccess.SetLength(_handle, Size);
             }
             catch (IOException e)
             {
-                throw LocalFileSystem.MapException("While ftruncate", _path, e);
+                RocksDbException mapped = LocalFileSystem.MapException("While ftruncate", _path, e);
+                if (notify)
+                {
+                    _io!.Finish(FileOperationType.Truncate, _path, Temperature.Unknown, 0, 0, startTime, start, null);
+                    _io.IoError(mapped, FileOperationType.Truncate, _path, (ulong)Size, 0);
+                }
+                throw mapped;
             }
+            if (notify) _io!.Finish(FileOperationType.Truncate, _path, Temperature.Unknown, 0, 0, startTime, start, null);
         }
     }
 

@@ -186,6 +186,43 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>read_options.read_tier = kBlockCacheTier of the max_successive_merges read (shared, never modified).</summary>
+    private static readonly ReadOptions s_successiveMergesReadOptions = new() { ReadTier = ReadTier.BlockCacheTier };
+
+    /// <summary>
+    /// The read of MemTableInserter::MergeCF (db/write_batch.cc) once max_successive_merges is reached:
+    /// <c>db_-&gt;GetEntity(read_options, cf_handle, key, &amp;existing)</c> with <c>read_options.snapshot</c> at the
+    /// batch's <paramref name="sequence"/> ("so that we also include previous merge operations in the same batch") and,
+    /// unless <paramref name="strict"/>, <c>read_tier = kBlockCacheTier</c> ("Blocking the write path with read I/O is
+    /// typically unacceptable"): data not in the memtables or the block cache fails the read with Incomplete. Writes the
+    /// key's serialized entity (a plain value as a default-column entity, merge operands applied) to
+    /// <paramref name="entity"/>; false if the key does not exist. Throws on read errors like a Get. Reads DBImpl
+    /// directly (no transaction read callback, as upstream's db_ is the DBImpl).
+    /// </summary>
+    internal bool GetEntityForSuccessiveMerges(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ulong sequence, bool strict,
+        System.Buffers.IBufferWriter<byte> entity)
+    {
+        ReadOptions? options = strict ? null : s_successiveMergesReadOptions;
+        GetContext ctx = GetContext.Rent(cfd.MergeOperator);
+        try
+        {
+            SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
+            try
+            {
+                GetWithSuperVersion(cfd, sv, sequence, options, key, ctx);
+            }
+            finally
+            {
+                ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
+            }
+            return ctx.TryResolveEntity(key, entity);
+        }
+        finally
+        {
+            GetContext.Return(ctx);
+        }
+    }
+
     internal bool GetWithCallback(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, ReadCallback callback, System.Buffers.IBufferWriter<byte> value)
     {
         ThrowIfDisposed();
@@ -305,7 +342,7 @@ internal sealed partial class DbImpl
         int operands = ctx.MergeContext.Count;
         PerfContext.Add(PerfMetric.GetFromMemtableCount, 1); // MemTable::Get, once per memtable searched
         bool noRangeDel = ctx.IgnoreRangeDeletions;
-        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel);
+        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel, ctx.ShouldMergeOperator);
         // GetMergeOperands with continue_cb: the callback may end the lookup at an operand of this memtable.
         if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
@@ -314,7 +351,7 @@ internal sealed partial class DbImpl
         {
             operands = ctx.MergeContext.Count;
             PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
-            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel);
+            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel, ctx.ShouldMergeOperator);
             if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }
@@ -805,9 +842,11 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
-    /// Async <see cref="GetFromFile"/>: the first entry of the key is read with <see cref="BlockBasedTableReader.GetAsync"/>
-    /// (merge chains continue with the synchronous visitor). Completes without an async state machine when the table
-    /// lookup does (filter miss, cached blocks).
+    /// Async <see cref="GetFromFile"/>: the table lookup visits the key's entries like the synchronous TableCache::Get
+    /// (<see cref="BlockBasedTableReader.GetAsync{TState}"/>, data blocks read with async I/O), so the filter, the index
+    /// and the data blocks are consulted once per file as on the sync path. (A first-entry lookup that restarted the
+    /// table lookup for merge chains counted the block cache and filter accesses of those keys twice.) Completes without
+    /// an async state machine when the table lookup does (filter miss, cached blocks).
     /// </summary>
     private static ValueTask<bool> GetFromFileAsync(ColumnFamilyData cfd, FileMetaData f, ReadOnlyMemory<byte> ikey, ReadOnlyMemory<byte> userKey,
         ulong snapshot, GetContext ctx, CancellationToken cancellationToken)
@@ -815,7 +854,7 @@ internal sealed partial class DbImpl
         if (cfd.TableCache.RowCache is not null && UsesRowCache(ctx)) return GetFromFileWithRowCacheAsync(cfd, f, ikey, userKey, snapshot, ctx, cancellationToken);
         // Opening a table is synchronous (TableCache.GetReaderAsync); the super version keeps the file's version referenced.
         TableReaderLease lease = cfd.TableCache.GetReaderForVersion(f, out FragmentedRangeTombstoneList? rangeDels, ctx.ReadFlags);
-        ValueTask<TableGetResult> pending;
+        ValueTask pending;
         try
         {
             if (rangeDels is not null && !ctx.IgnoreRangeDeletions)
@@ -823,13 +862,12 @@ internal sealed partial class DbImpl
                 ulong cov = rangeDels.MaxCoveringTombstoneSeqnum(userKey.Span, snapshot);
                 if (cov > ctx.MaxCoveringTombstoneSeq) ctx.MaxCoveringTombstoneSeq = cov;
             }
-            ctx.Scratch.Clear();
             pending = lease.Reader is BlockBasedTableReader bbt
-                ? bbt.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken)
-                : lease.Reader.GetAsync(ikey, ctx.Scratch, ctx.ReadFlags, cancellationToken);
+                ? bbt.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken)
+                : lease.Reader.GetAsync(ikey, ctx, s_saveValue, ctx.ReadFlags, cancellationToken);
             if (pending.IsCompletedSuccessfully)
             {
-                SaveFileResult(lease.Reader, pending.Result, ikey.Span, ctx);
+                pending.GetAwaiter().GetResult();
                 lease.Dispose();
                 return new ValueTask<bool>(ctx.Done);
             }
@@ -839,37 +877,21 @@ internal sealed partial class DbImpl
             lease.Dispose();
             throw;
         }
-        return GetFromFileSlowAsync(lease, pending, ikey, ctx);
+        return GetFromFileSlowAsync(lease, pending, ctx);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private static async ValueTask<bool> GetFromFileSlowAsync(TableReaderLease lease, ValueTask<TableGetResult> pending, ReadOnlyMemory<byte> ikey, GetContext ctx)
+    private static async ValueTask<bool> GetFromFileSlowAsync(TableReaderLease lease, ValueTask pending, GetContext ctx)
     {
         try
         {
-            TableGetResult r = await pending.ConfigureAwait(false);
-            SaveFileResult(lease.Reader, r, ikey.Span, ctx);
+            await pending.ConfigureAwait(false);
         }
         finally
         {
             lease.Dispose();
         }
         return ctx.Done;
-    }
-
-    private static void SaveFileResult(TableReader reader, TableGetResult r, ReadOnlySpan<byte> ikey, GetContext ctx)
-    {
-        if (!r.Found) return;
-        if (r.Type == EntryType.Merge && ctx.MaxCoveringTombstoneSeq <= r.Sequence)
-        {
-            // Merge chain: the rest of the operands are most likely in the same (now cached by the OS) block.
-            if (reader is BlockBasedTableReader bbt) bbt.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
-            else reader.Get(ikey, ref ctx, s_saveValue, ctx.ReadFlags);
-        }
-        else
-        {
-            ctx.SaveEntry(r.Sequence, r.Type, ctx.Scratch.WrittenSpan);
-        }
     }
 
     // ---- iterators --------------------------------------------------------------------------------------
@@ -939,7 +961,7 @@ internal sealed partial class DbImpl
             OptimizeFiltersForHits = cfd.Options.OptimizeFiltersForHits,
             NumNonEmptyLevels = s.NumNonEmptyLevels,
             ReadCallback = callback,
-            Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot),
+            Cleanup = new SuperVersionRelease(this, sv, ownedSnapshot, options?.BackgroundPurgeOnIteratorCleanup ?? false),
         };
     }
 
@@ -970,6 +992,9 @@ internal sealed partial class DbImpl
         }
         try
         {
+            // DBImpl::FailIfTableFilterWithRangeConversion (read-write DBs only; DBImplReadOnly / DBImplSecondary do not check).
+            if (options?.TableFilter is not null && !_readOnly && sv.MutableOptions.MinTombstonesForRangeConversion > 0)
+                ThrowHelper.InvalidArgument("ReadOptions::table_filter is not supported when min_tombstones_for_range_conversion > 0");
             GetReadTimestamp(cfd, options);
             if (options?.IterStartTs is not null && options.Timestamp is null) ThrowHelper.InvalidArgument("iter_start_ts requires timestamp");
         }
@@ -1076,7 +1101,7 @@ internal sealed partial class DbImpl
     /// Releases an iterator's super version reference (CleanupSuperVersionHandle) and the snapshot it owns
     /// (WritePreparedTxnDB::IteratorState).
     /// </summary>
-    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv, Snapshot? ownedSnapshot) : IDisposable
+    private sealed class SuperVersionRelease(DbImpl db, SuperVersion sv, Snapshot? ownedSnapshot, bool backgroundPurge) : IDisposable
     {
         private int _done;
 
@@ -1084,7 +1109,7 @@ internal sealed partial class DbImpl
         {
             if (Interlocked.Exchange(ref _done, 1) == 0)
             {
-                db.ReturnSuperVersion(sv);
+                db.ReturnIteratorSuperVersion(sv, backgroundPurge);
                 ownedSnapshot?.Dispose();
             }
         }

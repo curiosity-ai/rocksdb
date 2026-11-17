@@ -204,7 +204,7 @@ internal sealed class FileInfoLogger : InfoLogger
             await _signal.WaitAsync().ConfigureAwait(false);
             Volatile.Write(ref _pendingSignals, 0);
             Drain(flush: false);
-            if (_closed && _queue.IsEmpty) return;
+            if (_closed) return;
         }
     }
 
@@ -267,8 +267,11 @@ internal sealed class FileInfoLogger : InfoLogger
     {
         if (_closed) return;
         _closed = true;
+        // Not waiting for the writer task: it runs on the .NET thread pool, and closing the DB must not depend on pool
+        // threads (a starved pool delayed every close by the wait's 5 s timeout). The drain below writes what is queued
+        // under _writeLock, which also serializes it with a writer drain in progress; a writer drain that runs later
+        // finds the file closed, and the loop ends.
         _signal.Release();
-        try { _writer.Wait(TimeSpan.FromSeconds(5)); } catch (AggregateException) { }
         Drain(flush: true);
         lock (_writeLock)
         {

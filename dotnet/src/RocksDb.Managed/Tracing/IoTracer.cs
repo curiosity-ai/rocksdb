@@ -370,9 +370,12 @@ internal sealed class IoTracingFileSystem(IFileSystem inner, IoTracer tracer) : 
         public void Dispose() => inner.Dispose();
     }
 
-    private sealed class TracedWritable(IWritableFile inner, IoTracer tracer, string path) : IWritableFile, ITruncatableWritableFile
+    private sealed class TracedWritable(IWritableFile inner, IoTracer tracer, string path) : IWritableFile, ITruncatableWritableFile, Db.IFileIoWriteReporter
     {
         public long Size => inner.Size;
+
+        /// <summary>Whether the wrapped file reports its own writes to the DB's file I/O listeners.</summary>
+        public bool ReportsFileIoWrites => inner is Db.IFileIoWriteReporter { ReportsFileIoWrites: true };
 
         /// <summary>Forwarded when the wrapped file supports it (not traced); a no-op otherwise.</summary>
         public void Truncate(long size)

@@ -50,7 +50,7 @@ public sealed partial class ColumnFamily
 
     private void WriteOne(WriteOptions? options, Op op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             Encode(b, op, key, value);
@@ -58,14 +58,14 @@ public sealed partial class ColumnFamily
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask WriteOneAsync(WriteOptions? options, Op op, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken ct)
     {
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             Encode(b, op, key.Span, value.Span);
@@ -73,7 +73,7 @@ public sealed partial class ColumnFamily
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
@@ -325,6 +325,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         batch.EntityRun = false;
+        batch.ThrowIfDisposed();
         if (batch.Count == 0) return;
         if (_db.Stats is null)
         {
@@ -351,6 +352,7 @@ public sealed partial class ColumnFamily
         ArgumentNullException.ThrowIfNull(batch);
         _db.ThrowIfDisposed();
         batch.EntityRun = false;
+        batch.ThrowIfDisposed();
         if (batch.Count == 0) return ValueTask.CompletedTask;
         return _db.MultiGetAsync(_cfd, options, batch, synchronous: false, cancellationToken);
     }

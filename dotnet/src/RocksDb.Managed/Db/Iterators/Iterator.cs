@@ -190,29 +190,29 @@ public sealed class Iterator : IDisposable
     internal void SetTraceState(DbImpl db, uint cfId, ReadOptions? options) => Core.SetTraceState(db, cfId, options);
 
     /// <summary>Async <see cref="SeekToFirst"/>: data blocks are read with async I/O; completes synchronously on cache hits.</summary>
-    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => Core.SeekToFirstAsync(cancellationToken);
+    public ValueTask SeekToFirstAsync(CancellationToken cancellationToken = default) => Track(Core.SeekToFirstAsync(cancellationToken));
 
     /// <summary>Async <see cref="SeekToLast"/>.</summary>
-    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => Core.SeekToLastAsync(cancellationToken);
+    public ValueTask SeekToLastAsync(CancellationToken cancellationToken = default) => Track(Core.SeekToLastAsync(cancellationToken));
 
     /// <summary>Async <see cref="Seek"/>.</summary>
-    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => Core.SeekAsync(target, cancellationToken);
+    public ValueTask SeekAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) => Track(Core.SeekAsync(target, cancellationToken));
 
     /// <summary>Async <see cref="SeekForPrev"/>.</summary>
     public ValueTask SeekForPrevAsync(ReadOnlyMemory<byte> target, CancellationToken cancellationToken = default) =>
-        Core.SeekForPrevAsync(target, cancellationToken);
+        Track(Core.SeekForPrevAsync(target, cancellationToken));
 
     /// <summary>Async <see cref="Next"/>.</summary>
-    public ValueTask NextAsync(CancellationToken cancellationToken = default) => Core.NextAsync(cancellationToken);
+    public ValueTask NextAsync(CancellationToken cancellationToken = default) => Track(Core.NextAsync(cancellationToken));
 
     /// <summary>Async <see cref="Prev"/>.</summary>
-    public ValueTask PrevAsync(CancellationToken cancellationToken = default) => Core.PrevAsync(cancellationToken);
+    public ValueTask PrevAsync(CancellationToken cancellationToken = default) => Track(Core.PrevAsync(cancellationToken));
 
     /// <summary>
     /// Reads the current value with async I/O if it is still pending (a value stored in a blob file is otherwise read
     /// synchronously on first access to <c>Value</c>). Iterator::PrepareValue.
     /// </summary>
-    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => Core.It.PrepareValueAsync(cancellationToken);
+    public ValueTask PrepareValueAsync(CancellationToken cancellationToken = default) => Track(Core.It.PrepareValueAsync(cancellationToken));
 
     // ------------------------------------------------------------------ refresh and bounds
 
@@ -226,20 +226,108 @@ public sealed class Iterator : IDisposable
     /// <exception cref="RocksDbException"><see cref="StatusCode.NotSupported"/> for iterators that cannot be refreshed:
     /// tailing iterators (they follow new writes on their own), iterators of WritePrepared / WriteUnprepared transaction
     /// DBs and transactions, and iterators not created by a DB (e.g. <see cref="SstFileReader"/>).</exception>
-    public void Refresh() => Core.Refresh(null);
+    /// <remarks>If the stack has to be rebuilt and that fails (the database was disposed, a table file cannot be opened,
+    /// the call was canceled), the iterator is disposed and the exception is rethrown: it no longer holds a view to read.
+    /// A snapshot of another DB, or a released one, throws InvalidArgument and leaves the iterator unchanged.</remarks>
+    public void Refresh() => Refresh(null);
 
     /// <summary>
     /// Like <see cref="Refresh()"/>, reading at <paramref name="snapshot"/> (null = the latest state) from now on
     /// (Iterator::Refresh(const Snapshot*)). The snapshot must belong to the iterator's DB and stay alive while the
     /// iterator reads at it.
     /// </summary>
-    public void Refresh(Snapshot? snapshot) => Core.Refresh(snapshot);
+    public void Refresh(Snapshot? snapshot)
+    {
+        IteratorCore core = Core;
+        try
+        {
+            core.Refresh(snapshot);
+        }
+        catch when (core.IsUnbuilt)
+        {
+            // The view was released and the rebuild failed: positioning calls would otherwise run on a parked stack and
+            // report an empty iterator.
+            Dispose();
+            throw;
+        }
+    }
 
     /// <summary>Async <see cref="Refresh()"/>: when the DB's files changed, the new table files are opened with async I/O.</summary>
-    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => Core.RefreshAsync(null, cancellationToken);
+    public ValueTask RefreshAsync(CancellationToken cancellationToken = default) => RefreshAsync(null, cancellationToken);
 
     /// <summary>Async <see cref="Refresh(Snapshot?)"/>.</summary>
-    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default) => Core.RefreshAsync(snapshot, cancellationToken);
+    public ValueTask RefreshAsync(Snapshot? snapshot, CancellationToken cancellationToken = default)
+    {
+        IteratorCore core = Core;
+        ValueTask t;
+        try
+        {
+            t = core.RefreshAsync(snapshot, cancellationToken);
+        }
+        catch when (core.IsUnbuilt)
+        {
+            Dispose();
+            throw;
+        }
+        // A rebuild that waits for a file read is a pending async move: tracked, so that a Dispose meanwhile (including the
+        // one below on a failed rebuild) defers the release of the core until the move is done.
+        return t.IsCompletedSuccessfully ? t : Track(AwaitRebuildAsync(t, core));
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask AwaitRebuildAsync(ValueTask pending, IteratorCore core)
+    {
+        try
+        {
+            await pending.ConfigureAwait(false);
+        }
+        catch when (core.IsUnbuilt && ReferenceEquals(_core, core))
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    // ------------------------------------------------------------------ async moves in flight
+    //
+    // An async move that has to wait for a file read keeps running on the core after it returned. If the iterator is
+    // disposed meanwhile, the core must not go back to the column family's pool before that move is done: the next
+    // NewIterator would rent it, and the move would then reposition (or invalidate) that other iterator. Dispose
+    // therefore hands the core over to the move, which releases it when it completes.
+
+    private const int Idle = 0, MovePending = 1, DisposeRequested = 2;
+    private int _moveState;
+    private IteratorCore? _deferredCore;
+
+    /// <summary>Returns <paramref name="move"/>; one that has not completed is tracked until it does (no allocation either way).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ValueTask Track(ValueTask move) => move.IsCompleted ? move : TrackSlowAsync(move);
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private async ValueTask TrackSlowAsync(ValueTask move)
+    {
+        BeginPendingMove();
+        try
+        {
+            await move.ConfigureAwait(false);
+        }
+        finally
+        {
+            EndPendingMove();
+        }
+    }
+
+    /// <summary>An async move (or scan step) is about to wait: Dispose defers the release of the core until <see cref="EndPendingMove"/>.</summary>
+    private void BeginPendingMove() => Volatile.Write(ref _moveState, MovePending);
+
+    /// <summary>The pending async move is done; releases the core if the iterator was disposed meanwhile.</summary>
+    private void EndPendingMove()
+    {
+        if (Interlocked.Exchange(ref _moveState, Idle) != DisposeRequested) return;
+        IteratorCore core = _deferredCore!;
+        _deferredCore = null;
+        ReleaseCore(core);
+    }
 
     /// <summary>
     /// Replaces the iterate bounds the iterator was created with (<see cref="ReadOptions.IterateLowerBound"/> inclusive,
@@ -249,7 +337,20 @@ public sealed class Iterator : IDisposable
     /// must stay unchanged while the iterator uses it. Allocation-free, except on column families with a prefix
     /// extractor, where it copies the read options once per call.
     /// </summary>
-    public void SetBounds(ReadOnlyMemory<byte>? lowerBound, ReadOnlyMemory<byte>? upperBound) => Core.SetBounds(lowerBound, upperBound);
+    public void SetBounds(ReadOnlyMemory<byte>? lowerBound, ReadOnlyMemory<byte>? upperBound)
+    {
+        IteratorCore core = Core;
+        try
+        {
+            core.SetBounds(lowerBound, upperBound);
+        }
+        catch when (core.IsUnbuilt)
+        {
+            // A prefix seek iterator rebuilds its stack here (see Refresh).
+            Dispose();
+            throw;
+        }
+    }
 
     // ------------------------------------------------------------------ foreach over a range (ref struct)
 
@@ -375,7 +476,8 @@ public sealed class Iterator : IDisposable
 
         public void Reset(ReadOnlyMemory<byte>? start, ReadOnlyMemory<byte>? end, bool ownsIterator)
         {
-            if (_active) throw new InvalidOperationException("The previous ScanAsync enumeration of this iterator was not disposed.");
+            if (_active || Volatile.Read(ref _iterator._moveState) != Idle)
+                throw new InvalidOperationException("The previous ScanAsync enumeration of this iterator was not disposed.");
             _start = start;
             _end = end;
             _ownsIterator = ownsIterator;
@@ -399,22 +501,31 @@ public sealed class Iterator : IDisposable
 
         public ValueTask<bool> MoveNextAsync()
         {
+            // A disposed enumeration returns false (also when ScanAsyncAndDispose disposed the iterator with it); one whose
+            // iterator was disposed under it throws.
+            if (!_active) return new ValueTask<bool>(false);
             if (_iterator._core is null) ThrowDisposed();
             if (_done) return new ValueTask<bool>(false);
+            // IAsyncEnumerator: one MoveNextAsync at a time. A second call while a step waits for a read would move the
+            // iterator under it.
+            if (Volatile.Read(ref _iterator._moveState) != Idle) ThrowConcurrentMoveNext();
             _ct.ThrowIfCancellationRequested();
-            DbIter it = _iterator.Core.It;
+            // The moves go through the core like Seek / Next of the sync range enumerator: statistics (NUMBER_DB_SEEK /
+            // NEXT, ITER_BYTES_READ), query tracing and the renewal of a tailing iterator apply to scans too.
+            IteratorCore core = _iterator.Core;
             ValueTask t;
             if (!_started)
             {
                 _started = true;
-                t = _start is ReadOnlyMemory<byte> s ? it.SeekAsync(s, _ct) : it.SeekToFirstAsync(_ct);
+                t = _start is ReadOnlyMemory<byte> s ? core.SeekAsync(s, _ct) : core.SeekToFirstAsync(_ct);
             }
             else
             {
-                t = it.NextAsync(_ct);
+                t = core.NextAsync(_ct);
             }
             if (!t.IsCompletedSuccessfully) return MoveNextSlowAsync(t);
             t.GetAwaiter().GetResult();
+            DbIter it = core.It;
             // A value in a blob file is read with async I/O before it is captured.
             if (it.Valid)
             {
@@ -428,10 +539,19 @@ public sealed class Iterator : IDisposable
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         private async ValueTask<bool> MoveNextSlowAsync(ValueTask pending)
         {
-            await pending.ConfigureAwait(false);
-            DbIter it = _iterator.Core.It;
-            if (it.Valid) await it.PrepareValueAsync(_ct).ConfigureAwait(false);
-            return Capture();
+            // A disposal of the iterator meanwhile keeps the core and the item buffer until this step is done (see Track).
+            _iterator.BeginPendingMove();
+            try
+            {
+                await pending.ConfigureAwait(false);
+                DbIter it = _iterator.Core.It;
+                if (it.Valid) await it.PrepareValueAsync(_ct).ConfigureAwait(false);
+                return Capture();
+            }
+            finally
+            {
+                _iterator.EndPendingMove();
+            }
         }
 
         private bool Capture()
@@ -458,6 +578,11 @@ public sealed class Iterator : IDisposable
             return true;
         }
 
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+        private static void ThrowConcurrentMoveNext() =>
+            throw new InvalidOperationException("MoveNextAsync was called while the previous MoveNextAsync of this scan (or an async move of its iterator) is still running.");
+
         public ValueTask DisposeAsync()
         {
             if (!_active) return ValueTask.CompletedTask;
@@ -471,7 +596,7 @@ public sealed class Iterator : IDisposable
         /// <summary>Returns the item buffer to the array pool (the iterator is disposed).</summary>
         public void ReleaseBuffer()
         {
-            _active = false;
+            // _active stays: MoveNextAsync of an enumeration whose iterator was disposed under it throws ObjectDisposedException.
             _done = true;
             _current = default;
             byte[] b = _buffer;
@@ -486,6 +611,15 @@ public sealed class Iterator : IDisposable
         IteratorCore? core = Interlocked.Exchange(ref _core, null);
         if (core is null) return;
         _it = null;
+        // An async move still waiting for a file read releases the core when it completes (EndPendingMove).
+        _deferredCore = core;
+        if (Interlocked.CompareExchange(ref _moveState, DisposeRequested, MovePending) == MovePending) return;
+        _deferredCore = null;
+        ReleaseCore(core);
+    }
+
+    private void ReleaseCore(IteratorCore core)
+    {
         _scan?.ReleaseBuffer();
         core.Release();
     }

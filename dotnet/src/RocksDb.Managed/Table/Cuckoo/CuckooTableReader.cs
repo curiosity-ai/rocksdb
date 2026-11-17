@@ -170,10 +170,12 @@ public sealed class CuckooTableReader : TableReader
         lock (_sortLock)
         {
             if (_sortedBucketIds is not null) return _sortedBucketIds;
-            var list = new List<uint>((int)Math.Min(_props.NumEntries, int.MaxValue));
+            ulong numBuckets = _tableSize + _cuckooBlockSize - 1;
+            // sorted_bucket_ids_.reserve(num_entries) upstream (a corrupt count throws out of reserve); here the
+            // capacity is also capped by the bucket count the open validated against the data size.
+            var list = new List<uint>((int)Math.Min(Math.Min(_props.NumEntries, numBuckets), (ulong)Math.Min(_data.Length, int.MaxValue)));
             if (_props.NumEntries > 0)
             {
-                ulong numBuckets = _tableSize + _cuckooBlockSize - 1;
                 if (numBuckets >= uint.MaxValue) ThrowHelper.Corruption("too many cuckoo buckets");
                 for (uint bucketId = 0; bucketId < numBuckets; ++bucketId)
                 {

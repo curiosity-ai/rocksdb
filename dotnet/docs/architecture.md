@@ -73,6 +73,7 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `db/db_impl/db_impl_experimental.cc`, `db/multi_scan.cc`, `db/history_trimming_iterator.h` | `Db/DbImpl.Experimental.cs`, `MultiScan.cs`, `Db/Compaction/HistoryTrimmingIterator.cs` |
 | `db_impl_readonly.cc`, `db_impl_secondary.cc`, `ReactiveVersionSet` / `ManifestTailer` (`version_set.cc`, `version_edit_handler.h`) | `Db/DbImpl.ReadOnly.cs` |
 | `db/error_handler.cc`, `db/event_helpers.cc`, `include/rocksdb/listener.h` | `Db/ErrorHandler.cs`, `Db/EventListener.cs`, `Db/EventListener.Notifications.cs` |
+| listener notifications of `file/random_access_file_reader.cc`, `file/writable_file_writer.cc`, `file/sequence_file_reader.cc` | `Db/FileIoNotifier.cs` (file wrappers, only when a listener wants file I/O), `Env/LocalFileSystem.cs` (physical writes, range syncs) |
 | `db/blob/*` | `Db/Blob/*` |
 | `db/wide/*` | `Db/Wide/*`, `ColumnFamily.Entities.cs` |
 | `DBImpl::SetOptions`, `SetDBOptions` | `Db/DbImpl.Options.cs`, `ColumnFamily.Options.cs` |
@@ -187,8 +188,16 @@ Followers wait in one of two ways:
 - **sync writers** (`Put`, `Write`) wait like upstream's `AwaitState`: a short busy spin, then (with
   `enable_write_thread_adaptive_yield`) `Thread.Yield` for up to `write_thread_max_yield_usec` while the yield credit
   says yielding pays off, then a blocking wait on a monitor that the waker only touches if the waiter registered as
-  blocked (`STATE_LOCKED_WAITING`). A sync writer that becomes leader does the group's I/O on its own thread, so the
-  sync API never waits on thread-pool work.
+  blocked (`STATE_LOCKED_WAITING`). A sync writer that becomes leader does the group's I/O on its own thread.
+
+**Do not mix sync and async writers on one database.** A sync follower blocks its thread until its leader completes the
+group. When the leader is an async writer whose WAL write (a truly asynchronous file system, `OffloadAsyncSync` with
+synced writes, very large batches) or stall wait (write controller, `WriteBufferManager`) does not complete inline, the
+leader's remaining work (memtable insert, waking the followers) is a thread-pool continuation. Sync followers that are
+themselves pool threads can then exhaust the pool: the group waits for the pool's thread injection, or deadlocks with a
+capped pool (`SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`, ignored repro in `Audit8AsyncBackgroundIoTests`).
+Upstream has no such case: no async writers, no shared pool. Decision (2026-11-17): documented as a usage rule rather
+than fixed; the sync write methods are expected to be deprecated and removed, so new code should be async-only.
 
 "Unbatched" writers (memtable switches and other exclusive operations) form a group of their own. Write stalls and
 delayed writes (`Db/Compaction/WriteController.cs`) delay the leader with a token bucket, as upstream does.
@@ -219,7 +228,8 @@ their reads carry a `ReadCallback` and their flushes / compactions a `SnapshotCh
   (`max_compaction_trigger_wakeup_seconds`: re-evaluates TTL / periodic / read-triggered compaction on idle DBs) and,
   with `preserve_internal_time_seconds` / `preclude_last_level_data_seconds`, the seqno-to-time recorder.
 - **Listener notifications** are queued and drained on the thread pool (`EventListener.Notifications.cs`), so a slow
-  listener does not hold the mutex.
+  listener does not hold the mutex. File I/O notifications (`ShouldBeNotifiedOnFileIO`) run on the thread doing the I/O;
+  without such a listener no file is wrapped.
 - **Error recovery** (`Db/ErrorHandler.cs`) runs automatic resume for retryable background errors as a task; `Resume`
   runs the same recovery on demand.
 - On close, scheduling stops, running jobs finish or are cancelled, and anyone waiting in `FlushAsync` or

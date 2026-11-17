@@ -65,6 +65,9 @@ internal sealed class BlobSource : IDisposable
     /// </summary>
     public HistogramImpl? BlobFileReadHistogram { get; init; }
 
+    /// <summary>The DB's file I/O listeners, given to the readers. Null: none.</summary>
+    internal FileIoNotifier? FileIo { get; init; }
+
     /// <summary>
     /// Blob direct write of the column family: blob indexes from memtables may reference its files before a flush
     /// registers them in a version (BlobFilePartitionManager::ResolveBlobDirectWriteIndex). Null without direct write.
@@ -137,7 +140,7 @@ internal sealed class BlobSource : IDisposable
                 return e;
             }
             if (_readers.Count >= _capacity) EvictUnused(_readers.Count - _capacity + 1);
-            e = new ReaderEntry(BlobFileReader.Open(_fs, FileNames.BlobFileName(_blobDir, fileNumber), _columnFamilyId, _stats, BlobFileReadHistogram))
+            e = new ReaderEntry(BlobFileReader.Open(_fs, FileNames.BlobFileName(_blobDir, fileNumber), _columnFamilyId, _stats, BlobFileReadHistogram, FileIo))
             {
                 Refs = 1,
                 LastUse = Environment.TickCount64,

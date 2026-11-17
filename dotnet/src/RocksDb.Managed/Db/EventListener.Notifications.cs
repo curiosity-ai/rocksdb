@@ -107,6 +107,25 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>
+    /// DBImpl::NotifyOnManualFlushScheduled: one ManualFlushInfo per column family; skipped while shutting down. Called
+    /// without the mutex, on the thread of the manual flush.
+    /// </summary>
+    private void NotifyOnManualFlushScheduled(IReadOnlyList<ColumnFamilyData> cfds, FlushReason reason)
+    {
+        if (!HasListeners) return;
+        lock (_mutex)
+        {
+            if (_shuttingDown) return;
+        }
+        var infos = new ManualFlushInfo[cfds.Count];
+        for (int i = 0; i < infos.Length; i++)
+        {
+            infos[i] = new ManualFlushInfo { ColumnFamilyId = cfds[i].Id, ColumnFamilyName = cfds[i].Name, FlushReason = reason };
+        }
+        InvokeListeners((IReadOnlyList<ManualFlushInfo>)infos, static (l, db, i) => l.OnManualFlushScheduled(db, i), nameof(EventListener.OnManualFlushScheduled));
+    }
+
+    /// <summary>
     /// DBImpl::NotifyOnFlushCompleted with the FlushJobInfo of FlushJob::GetFlushJobInfo: the file number and path are
     /// the ones allocated for the flush, also when the flush kept no file. Called without the mutex, after the flush
     /// result was installed.
@@ -150,6 +169,24 @@ internal sealed partial class DbImpl
     }
 
     // ---- table files ------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// EventHelpers::NotifyTableFileCreationStarted: a flush (BuildTable), compaction (OpenCompactionOutputFile), recovery
+    /// or trivial copy is about to create <paramref name="path"/>. Called without the mutex.
+    /// </summary>
+    internal void NotifyOnTableFileCreationStarted(ColumnFamilyData cfd, int jobId, string path, TableFileCreationReason reason)
+    {
+        if (!HasListeners) return;
+        var info = new TableFileCreationBriefInfo
+        {
+            DbName = DbName,
+            ColumnFamilyName = cfd.Name,
+            FilePath = path,
+            JobId = jobId,
+            Reason = reason,
+        };
+        InvokeListeners(info, static (l, _, i) => l.OnTableFileCreationStarted(i), nameof(EventListener.OnTableFileCreationStarted));
+    }
 
     /// <summary>EventHelpers::LogAndNotifyTableFileCreationFinished. Called without the mutex.</summary>
     internal void NotifyOnTableFileCreated(ColumnFamilyData cfd, int jobId, string path, ulong size, TableFileCreationReason reason,
@@ -312,18 +349,22 @@ internal sealed partial class DbImpl
         IsTrivialMove = i.IsTrivialMove,
     };
 
+
     /// <summary>
-    /// The table file creation events of a finished compaction job's outputs (CompactionJob::FinishCompactionOutputFile
-    /// -> LogAndNotifyTableFileCreationFinished). Called without the mutex, before the result is installed.
+    /// DBImpl::NotifyOnCompactionPreCommit: once per compaction whose OnCompactionBegin was raised, skipped while shutting
+    /// down. Called without the mutex, before the MANIFEST write (or before a failed compaction releases its inputs).
     /// </summary>
-    private void NotifyOnCompactionOutputsCreated(ColumnFamilyData cfd, CompactionJob job, int jobId)
+    private void NotifyOnCompactionPreCommit(ColumnFamilyData cfd, Compaction c, CompactionJob? job, int jobId, Exception? failure)
     {
         if (!HasListeners) return;
-        foreach (FileMetaData f in job.AllOutputs)
+        lock (_mutex)
         {
-            NotifyOnTableFileCreated(cfd, jobId, FileNames.TableFileName(DbPaths, f.FileNumber, f.PathId), f.FileSize,
-                TableFileCreationReason.Compaction, null, TryGetTableProperties(cfd, f));
+            if (_shuttingDown) return;
         }
+        if (!c.NotifyOnCompactionCompleted || c.PreCommitNotified) return;
+        c.PreCommitNotified = true;
+        CompactionJobInfo info = NewCompactionJobInfo(cfd, c, job, jobId, failure);
+        InvokeListeners(info, static (l, db, i) => l.OnCompactionPreCommit(db, i), nameof(EventListener.OnCompactionPreCommit));
     }
 
     /// <summary>
@@ -340,6 +381,133 @@ internal sealed partial class DbImpl
         if (!c.NotifyOnCompactionCompleted) return;
         CompactionJobInfo info = NewCompactionJobInfo(cfd, c, job, jobId, failure);
         InvokeListeners(info, static (l, db, i) => l.OnCompactionCompleted(db, i), nameof(EventListener.OnCompactionCompleted));
+    }
+
+    // ---- I/O errors outside the file wrappers --------------------------------------------------------------
+
+    /// <summary>
+    /// OnIOError raised by the DB itself rather than by a file reader or writer: VersionSet::Close's MANIFEST checks
+    /// (kVerify) notify every listener, whatever ShouldBeNotifiedOnFileIO returns. Called without the mutex.
+    /// </summary>
+    internal void NotifyOnIOErrorToAllListeners(Exception failure, FileOperationType operation, string path, ulong length, ulong offset)
+    {
+        if (!HasListeners) return;
+        var info = new IOErrorInfo(RocksDbException.FromException(failure), operation, path, length, offset);
+        InvokeListeners(info, static (l, _, i) => l.OnIOError(i), nameof(EventListener.OnIOError));
+    }
+
+    // ---- blob files ---------------------------------------------------------------------------------------
+
+    /// <summary>EventHelpers::NotifyBlobFileCreationStarted. Called without the mutex.</summary>
+    internal void NotifyOnBlobFileCreationStarted(string cfName, int jobId, string path, BlobFileCreationReason reason)
+    {
+        if (!HasListeners) return;
+        var info = new BlobFileCreationBriefInfo { DbName = DbName, ColumnFamilyName = cfName, FilePath = path, JobId = jobId, Reason = reason };
+        InvokeListeners(info, static (l, _, i) => l.OnBlobFileCreationStarted(i), nameof(EventListener.OnBlobFileCreationStarted));
+    }
+
+    /// <summary>
+    /// EventHelpers::LogAndNotifyBlobFileCreationFinished, listener part (the EVENT_LOG line is written when the job
+    /// installs its result): the checksum "" and function "Unknown" when none was computed. Called without the mutex.
+    /// </summary>
+    internal void NotifyOnBlobFileCreated(string cfName, int jobId, string path, BlobFileCreationReason reason, ulong blobCount, ulong blobBytes,
+        Exception? failure, byte[] checksum, string checksumMethod)
+    {
+        if (!HasListeners) return;
+        var info = new BlobFileCreationInfo
+        {
+            DbName = DbName,
+            ColumnFamilyName = cfName,
+            FilePath = path,
+            JobId = jobId,
+            Reason = reason,
+            TotalBlobCount = blobCount,
+            TotalBlobBytes = blobBytes,
+            Status = failure is null ? null : RocksDbException.FromException(failure),
+            FileChecksum = checksum.Length == 0 ? "" : Convert.ToHexString(checksum),
+            FileChecksumFuncName = checksumMethod.Length == 0 ? FileMetaData.UnknownFileChecksumFuncName : checksumMethod,
+        };
+        InvokeListeners(info, static (l, _, i) => l.OnBlobFileCreated(i), nameof(EventListener.OnBlobFileCreated));
+    }
+
+    /// <summary>EventHelpers::LogAndNotifyBlobFileDeletion, listener part. Called without the mutex.</summary>
+    private void NotifyOnBlobFileDeleted(string path, int jobId, Exception? failure)
+    {
+        if (!HasListeners) return;
+        var info = new BlobFileDeletionInfo
+        {
+            DbName = DbName,
+            FilePath = path,
+            JobId = jobId,
+            Status = failure is null ? null : RocksDbException.FromException(failure),
+        };
+        InvokeListeners(info, static (l, _, i) => l.OnBlobFileDeleted(i), nameof(EventListener.OnBlobFileDeleted));
+    }
+
+    // ---- subcompactions -----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// SubcompactionState::BuildSubcompactionJobInfo + the job id and thread id of CompactionJob::NotifyOnSubcompaction*.
+    /// The stats are those FinalizeSubcompactionJobStats puts in the subcompaction's compaction_job_stats (input side).
+    /// </summary>
+    private static SubcompactionJobInfo NewSubcompactionJobInfo(ColumnFamilyData cfd, Compaction c, CompactionJob sub, Exception? failure)
+    {
+        CompactionJobStats s = sub.Stats;
+        CompactionIterationStats it = s.IterStats;
+        return new SubcompactionJobInfo
+        {
+            ColumnFamilyId = cfd.Id,
+            ColumnFamilyName = cfd.Name,
+            Status = failure is null ? null : RocksDbException.FromException(failure),
+            ThreadId = Environment.CurrentManagedThreadId,
+            JobId = sub.JobId,
+            SubcompactionJobId = sub.SubJobId,
+            BaseInputLevel = c.StartLevel,
+            OutputLevel = c.OutputLevel,
+            CompactionReason = c.Reason,
+            Compression = c.OutputCompression,
+            BlobCompressionType = c.Options.BlobCompressionType,
+            NumInputRecords = s.NumInputRecords,
+            NumInputDeletionRecords = it.NumInputDeletionRecords,
+            TotalInputRawKeyBytes = it.TotalInputRawKeyBytes,
+            TotalInputRawValueBytes = it.TotalInputRawValueBytes,
+            NumSingleDelFallthru = it.NumSingleDelFallthru,
+            NumSingleDelMismatch = it.NumSingleDelMismatch,
+            CpuMicros = s.CpuMicros,
+        };
+    }
+
+    /// <summary>
+    /// CompactionJob::NotifyOnSubcompactionBegin: skipped without listeners, while shutting down and for a manual
+    /// compaction that was canceled (manual_compaction_canceled_). Returns whether it was raised
+    /// (notify_on_subcompaction_completion). Called without the mutex, on the subcompaction's thread.
+    /// </summary>
+    internal bool NotifyOnSubcompactionBegin(ColumnFamilyData cfd, Compaction c, CompactionJob sub, bool canceled)
+    {
+        if (!HasListeners) return false;
+        lock (_mutex)
+        {
+            if (_shuttingDown) return false;
+        }
+        if (c.IsManual && canceled) return false;
+        SubcompactionJobInfo info = NewSubcompactionJobInfo(cfd, c, sub, null);
+        InvokeListeners(info, static (l, _, i) => l.OnSubcompactionBegin(i), nameof(EventListener.OnSubcompactionBegin));
+        return true;
+    }
+
+    /// <summary>
+    /// CompactionJob::NotifyOnSubcompactionCompleted with the subcompaction's status and stats; skipped while shutting
+    /// down. Called without the mutex, on the subcompaction's thread, after its outputs were finished.
+    /// </summary>
+    internal void NotifyOnSubcompactionCompleted(ColumnFamilyData cfd, Compaction c, CompactionJob sub, Exception? failure)
+    {
+        if (!HasListeners) return;
+        lock (_mutex)
+        {
+            if (_shuttingDown) return;
+        }
+        SubcompactionJobInfo info = NewSubcompactionJobInfo(cfd, c, sub, failure);
+        InvokeListeners(info, static (l, _, i) => l.OnSubcompactionCompleted(i), nameof(EventListener.OnSubcompactionCompleted));
     }
 
     // ---- ingestion / column families ---------------------------------------------------------------------

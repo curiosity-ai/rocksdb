@@ -31,9 +31,20 @@ public interface IFilterBitsReader
 }
 
 /// <summary>CONTRACT (owned by stream C). Port of rocksdb::FilterPolicy (bloom / ribbon).</summary>
+/// <remarks>
+/// A filter block is found by <see cref="CompatibilityName"/>: tables written with another policy are read without a
+/// filter. Readers are trusted like upstream (a false negative loses keys). A builder that throws fails the flush or
+/// compaction with a fatal background error (no table is installed); a reader factory that throws fails the call that
+/// opens the table (DB open, or the read).
+/// </remarks>
 public abstract class FilterPolicy
 {
-    /// <summary>Name persisted in table properties (e.g. "rocksdb.BuiltinBloomFilter").</summary>
+    /// <summary>
+    /// Name persisted in table properties (e.g. "rocksdb.BuiltinBloomFilter"); a table's filter is read only by policies
+    /// with the same compatibility name. A custom policy that wraps a built-in one (choosing a Bloom or Ribbon builder per
+    /// level, for example) returns the wrapped policy's name so its filters stay readable by the built-in policies and
+    /// native RocksDB; a policy with its own format returns its own name (usually <see cref="Name"/>).
+    /// </summary>
     public abstract string CompatibilityName { get; }
     /// <summary>
     /// Policy class name (Customizable::Name), persisted as the "rocksdb.filter.policy" table property whenever a
@@ -47,7 +58,14 @@ public abstract class FilterPolicy
     /// everything but the format version.
     /// </summary>
     public virtual IFilterBitsBuilder CreateBuilder(in FilterBuildingContext context) => CreateBuilder(context.FormatVersion);
-    /// <summary>Creates a reader over filter contents; the reader may reference <paramref name="contents"/> (no copy).</summary>
+    /// <summary>
+    /// Creates a reader over filter contents; the reader may reference <paramref name="contents"/> (no copy). Port of
+    /// GetFilterBitsReader: tables read with this policy use this reader for every full filter and filter partition
+    /// stored under <see cref="CompatibilityName"/>, whichever policy wrote it. A policy that returns the built-in name
+    /// "rocksdb.BuiltinBloomFilter" therefore reads filters written by the built-in Bloom and Ribbon policies (and by
+    /// native RocksDB) and should delegate to a built-in policy's reader (e.g.
+    /// <c>BloomFilterPolicy.CreateReader</c>), which reads every built-in format.
+    /// </summary>
     public abstract IFilterBitsReader CreateReader(ReadOnlyMemory<byte> contents);
 }
 

@@ -403,6 +403,9 @@ public sealed class ManifestReplayer
         return r;
     }
 
+    /// <summary>Level numbers at or above this are rejected while replaying (see <see cref="ApplyFileChanges"/>).</summary>
+    internal const int MaxRecoverableLevels = 4096;
+
     private static void ApplyFileChanges(ColumnFamilyVersion cf, VersionEdit edit, int recordedTimestampSize)
     {
         if (recordedTimestampSize > 0 && edit.NewFiles.Count > 0)
@@ -472,6 +475,16 @@ public sealed class ManifestReplayer
                                        current.ToString(CultureInfo.InvariantCulture));
             }
             if (nf.Level < 0) ThrowHelper.Corruption("VersionBuilder: invalid level for table file #" + number.ToString(CultureInfo.InvariantCulture));
+            if (nf.Level >= MaxRecoverableLevels)
+            {
+                // VersionBuilder counts files on levels >= num_levels (invalid_level_sizes_) and recovery then fails with
+                // CheckConsistencyForNumLevels' InvalidArgument. Levels are kept in a dense list here, so a level number
+                // from a damaged record (up to 2^31 - 1) would allocate a list per level; no configurable num_levels comes
+                // near this bound, so fail now with the status recovery would end with. (Deviation: upstream would still
+                // open if a later edit deleted that file again.)
+                ThrowHelper.InvalidArgument("db has more levels than options.num_levels (file #" + number.ToString(CultureInfo.InvariantCulture) +
+                                            " on level " + nf.Level.ToString(CultureInfo.InvariantCulture) + ")");
+            }
             cf.MutableLevel(nf.Level).Add(nf.Meta);
             cf.FileLevels[number] = nf.Level;
         }

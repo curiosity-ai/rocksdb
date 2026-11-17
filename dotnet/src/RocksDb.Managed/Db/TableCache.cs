@@ -299,6 +299,9 @@ internal sealed class TableCache : ITableCache, IDisposable
     private readonly bool _ownsStore;
     private volatile bool _disposed;
 
+    /// <summary>The DB's file I/O listeners: the table files opened are wrapped to report their reads. Null: none.</summary>
+    internal FileIoNotifier? FileIo { get; init; }
+
     /// <summary>A view on the DB-wide <paramref name="store"/>.</summary>
     /// <param name="dbPaths">db_paths (index = path id); the first entry is the DB directory.</param>
     public TableCache(TableCacheStore store, IFileSystem fs, IReadOnlyList<string> dbPaths, TableReaderOptions readerOptions)
@@ -537,7 +540,8 @@ internal sealed class TableCache : ITableCache, IDisposable
     internal void Open(TableCacheStore.Handle h, FileMetaData file, bool prefetchIndexAndFilterInCache)
     {
         string path = TableFilePath(file);
-        IRandomAccessFile f = _fs.OpenRandomAccess(path);
+        // TableCache::GetTableReader: RandomAccessFileReader(..., ioptions_.listeners, file_temperature, ...).
+        IRandomAccessFile f = FileIoNotifier.Wrap(FileIo, _fs.OpenRandomAccess(path), path, file.Temperature);
         Statistics?.RecordTick(Ticker.NoFileOpens); // TableCache::GetTableReader, after NewRandomAccessFile succeeded
         if (Statistics is { } st)
         {

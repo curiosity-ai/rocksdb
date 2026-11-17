@@ -53,6 +53,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
         // FileSystemTracingWrapper (DBImpl::fs_): records file operations while an IO trace runs.
         FileSystem = new Tracing.IoTracingFileSystem(options.FileSystem, IoTracer);
+        FileIo = FileIoNotifier.Create(options.Listeners, LogWarn);
+        ManifestFileSystem = FileIoNotifier.ManifestFileSystem(FileIo, FileSystem);
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
         // SanitizeOptions (db_impl_open.cc): db_paths as given (path id i = db_paths[i]), or {dbname, UINT64_MAX}.
         var paths = new List<string>();
@@ -69,7 +71,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         DbPaths = paths;
         DbPathTargetSizes = targetSizes;
-        Versions = new VersionSet(this, FileSystem, dbname);
+        Versions = new VersionSet(this, ManifestFileSystem, dbname);
         ErrorHandler = new ErrorHandler(this);
         _allowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite;
         _pipelined = options.EnablePipelinedWrite;
@@ -130,6 +132,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public string DbName { get; }
     public DbOptions Options { get; }
     public IFileSystem FileSystem { get; }
+
+    /// <summary>
+    /// The listeners that want file I/O notifications (EventListener::ShouldBeNotifiedOnFileIO), or null when none does:
+    /// then no file is wrapped and the I/O paths are those of a DB without listeners.
+    /// </summary>
+    internal FileIoNotifier? FileIo { get; }
+
+    /// <summary><see cref="FileSystem"/> with the MANIFEST files reporting to <see cref="FileIo"/> (VersionSet, recovery).</summary>
+    internal IFileSystem ManifestFileSystem { get; }
+
     public string WalDir { get; }
     public IReadOnlyList<string> DbPaths { get; }
 
@@ -240,6 +252,9 @@ internal sealed partial class DbImpl : IAsyncDisposable
         {
             SuperVersion sv = cfd.Super;
             if (sv.TryRef()) return sv;
+            // The DB was closed meanwhile (an iterator Refresh, a read or a CompactRange racing the close): its super
+            // version is gone and is not replaced, so retrying would spin forever.
+            if (cfd.Closed) ThrowDisposed();
             if (cfd.Dropped) ThrowDropped(cfd);
             Thread.SpinWait(1);
         }
@@ -311,6 +326,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         st?.RecordTick(Ticker.NumberSuperversionReleases);
     }
 
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
     private static void ThrowDropped(ColumnFamilyData cfd) =>
         throw new RocksDbException(StatusCode.ColumnFamilyDropped, "Column family drop: column family " + cfd.Name + " was dropped");
 
@@ -320,6 +336,65 @@ internal sealed partial class DbImpl : IAsyncDisposable
         if (sv.Unref())
         {
             lock (_mutex) CleanupSuperVersion(sv);
+        }
+    }
+
+    /// <summary>
+    /// Port of DBImpl::CleanupIteratorSuperVersion (db/db_impl/db_impl.cc), the release of an iterator's super version:
+    /// unlike a point read's release (ReturnAndCleanupSuperVersion, which leaves the files the dropped version made
+    /// obsolete for the next flush, compaction or close), the last reference also runs FindObsoleteFiles +
+    /// PurgeObsoleteFiles, so the inputs of a compaction that finished while the iterator was open are deleted when it
+    /// is released. With <paramref name="backgroundPurge"/> (ReadOptions::background_purge_on_iterator_cleanup) or
+    /// avoid_unnecessary_blocking_io the purge runs on a background thread (SchedulePurge). Nothing is purged once the
+    /// DB is closing (the close purges, and an iterator that outlives its DB must not touch the directory).
+    /// </summary>
+    internal void ReturnIteratorSuperVersion(SuperVersion sv, bool backgroundPurge)
+    {
+        if (!sv.Unref()) return;
+        lock (_mutex)
+        {
+            CleanupSuperVersion(sv);
+            if (_closing || IsDisposed) return;
+            if (backgroundPurge || Options.AvoidUnnecessaryBlockingIo)
+            {
+                // SchedulePurge (bg_purge_scheduled_): the close waits for it like for any background job.
+                _backgroundJobs++;
+                BackgroundThreadPool.High.Schedule(new PurgeRun(this));
+                return;
+            }
+        }
+        PurgeObsoleteFilesQuietly();
+    }
+
+    /// <summary>BGWorkPurge: a purge scheduled by <see cref="ReturnIteratorSuperVersion"/>.</summary>
+    private sealed class PurgeRun(DbImpl db) : IThreadPoolWorkItem
+    {
+        public void Execute()
+        {
+            try
+            {
+                db.PurgeObsoleteFilesQuietly();
+            }
+            finally
+            {
+                lock (db._mutex)
+                {
+                    db._backgroundJobs--;
+                    db.SignalBackgroundWork();
+                }
+            }
+        }
+    }
+
+    /// <summary>PurgeObsoleteFiles, best effort (deleting obsolete files never fails the caller).</summary>
+    private void PurgeObsoleteFilesQuietly()
+    {
+        try
+        {
+            PurgeObsoleteFiles();
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
         }
     }
 
@@ -777,8 +852,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
             b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             b.Cfd.BlobDirectWrite?.Forget(b.BlobFileNumber);
-            Exception? failure = DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
+            string blobPath = FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber);
+            Exception? failure = DeleteDbFile(blobPath, DbPaths[0]);
             LogFileDeletionEvent("blob_file_deletion", 0, b.BlobFileNumber, failure); // EventHelpers::LogAndNotifyBlobFileDeletion
+            NotifyOnBlobFileDeleted(blobPath, 0, failure);
         }
         if (releasedBlobs is not null)
         {
@@ -930,7 +1007,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (dataFiles is not null && dataFiles.TryGetValue(p, out (FileType Type, ulong Number, string Directory) f))
             {
                 if (f.Type == FileType.TableFile) DeleteObsoleteTableFile(p, f.Number);
-                else LogFileDeletionEvent("blob_file_deletion", 0, f.Number, DeleteDbFile(p, f.Directory));
+                else
+                {
+                    Exception? failure = DeleteDbFile(p, f.Directory);
+                    LogFileDeletionEvent("blob_file_deletion", 0, f.Number, failure);
+                    NotifyOnBlobFileDeleted(p, 0, failure);
+                }
             }
             else TryDeleteFile(p);
         }
@@ -998,6 +1080,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private void ForgetAliveWalSize(ulong number)
     {
         if (_aliveWalSizes.Remove(number, out long size)) Interlocked.Add(ref _walsTotalSize, -size);
+        _closedWalWrittenEnds.Remove(number);
     }
 
     private void TryDeleteFile(string path)
@@ -1019,6 +1102,42 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// LOCK file. The WAL is flushed to the OS but not fsynced (like upstream).
     /// </summary>
     public async ValueTask CloseAsync(bool synchronous)
+    {
+        // DBImpl::Close / ~DBImpl hold closing_mutex_ for the whole close: a close made while another one runs returns
+        // only once that one has finished (LOCK released), like a close after it. Its error is reported to its caller
+        // only (closing again does nothing here; upstream returns closing_status_ again).
+        TaskCompletionSource? running = Volatile.Read(ref _closeCompletion);
+        if (running is null)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return; // a failed open (AbortOpen)
+            var mine = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            running = Interlocked.CompareExchange(ref _closeCompletion, mine, null);
+            if (running is null)
+            {
+                try
+                {
+                    await CloseCoreAsync(synchronous).ConfigureAwait(false);
+                }
+                finally
+                {
+                    // A close that failed before it took over the DB (nothing closed yet) can be retried by a later close.
+                    if (Volatile.Read(ref _disposed) == 0) Volatile.Write(ref _closeCompletion, null);
+                    mine.TrySetResult();
+                }
+                return;
+            }
+        }
+        // A close from OnErrorRecoveryEnd raised by the recovery task (ErrorHandler.EndAutoRecoveryAsync) must not wait:
+        // the running close may itself be waiting for that task. It returns; the running close completes the close.
+        if (running.Task.IsCompleted || ErrorHandler.CurrentRecoveryEndNotification is not null) return;
+        if (synchronous) running.Task.GetAwaiter().GetResult();
+        else await running.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>Set by the first <see cref="CloseAsync"/>, completed when it has finished (closing_mutex_ / closed_).</summary>
+    private TaskCompletionSource? _closeCompletion;
+
+    private async ValueTask CloseCoreAsync(bool synchronous)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
         // DBImpl::DelayWrite stops waiting once shutting_down_ is set (CancelAllBackgroundWork signals bg_cv_). Close needs
@@ -1043,6 +1162,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             ExitUnbatchedQueues();
+            WriteThread.Return(w, synchronous);
             return;
         }
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
@@ -1060,10 +1180,18 @@ internal sealed partial class DbImpl : IAsyncDisposable
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
             // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
             // Under the WAL I/O lock: a FlushWAL called while LockWAL is held may be using them outside the write thread.
+            // CloseHelper: a failure of LogWriterNumber::ClearWriter (the WAL's WriteBuffer) is logged and the first one is
+            // returned by Close once the close has finished ("Retain the first error"); closing the file itself
+            // (~Writer) ignores its status. Nothing aborts the rest of the close.
+            RocksDbException? closeError = null;
             await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
             try
             {
-                foreach (LogWriter closed in _closedWalsToSync) CloseQuietly(closed);
+                foreach (LogWriter closed in _closedWalsToSync)
+                {
+                    RocksDbException? walError = await ClearWalWriterAsync(closed, synchronous).ConfigureAwait(false);
+                    closeError ??= walError;
+                }
                 _closedWalsToSync.Clear();
                 CloseFreedWals();
                 LogWriter? log = _log;
@@ -1071,8 +1199,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 if (log is not null)
                 {
                     MaybeTruncateWalOnClose(log);
-                    if (synchronous) log.Dispose();
-                    else await log.DisposeAsync().ConfigureAwait(false);
+                    RocksDbException? walError = await ClearWalWriterAsync(log, synchronous).ConfigureAwait(false);
+                    closeError ??= walError;
                 }
             }
             finally
@@ -1106,8 +1234,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 catch (Exception e) when (e is IOException or RocksDbException) { }
             }
             // VersionSet::Close: verify_manifest_content_on_close. A failure is reported once the close has finished
-            // (DB::Close returns the status).
-            RocksDbException? closeError = null;
+            // (DB::Close returns the status; a WAL error above comes first).
             if (!_readOnly && Versions.GetColumnFamily(0) is { } defaultCfd)
             {
                 try
@@ -1118,10 +1245,19 @@ internal sealed partial class DbImpl : IAsyncDisposable
                 }
                 catch (Exception e) when (e is IOException or RocksDbException)
                 {
-                    closeError = RocksDbException.FromException(e);
+                    closeError ??= RocksDbException.FromException(e);
                 }
             }
-            await Versions.CloseAsync(synchronous).ConfigureAwait(false);
+            try
+            {
+                await Versions.CloseAsync(synchronous).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is IOException or RocksDbException)
+            {
+                // CloseHelper: "Unable to close MANIFEST with error"; kept if it is the first error.
+                LogError("Unable to close MANIFEST with error -- " + e.Message);
+                closeError ??= RocksDbException.FromException(e);
+            }
             lock (_mutex)
             {
                 foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);
@@ -1153,6 +1289,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// LogWriterNumber::ClearWriter (db/db_impl/db_impl.h) for close: writes out the WAL's buffer and returns its error
+    /// (logged, "Unable to clear writer for WAL"), then closes the file ignoring the close status (~Writer).
+    /// </summary>
+    private async ValueTask<RocksDbException?> ClearWalWriterAsync(LogWriter log, bool synchronous)
+    {
+        RocksDbException? error = null;
+        try
+        {
+            if (synchronous) log.WriteBuffer();
+            else await log.WriteBufferAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+            LogWarn("Unable to clear writer for WAL " + FileNames.LogFileName(WalDir, log.LogNumber) + " with error -- " + e.Message);
+            error = RocksDbException.FromException(e);
+        }
+        try
+        {
+            if (synchronous) log.Dispose();
+            else await log.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is IOException or RocksDbException)
+        {
+        }
+        return error;
+    }
+
     /// <summary>Drops the CF's references on its super version, memtables and version and closes its table cache. REQUIRES: mutex.</summary>
     private void ReleaseColumnFamilyResources(ColumnFamilyData cfd)
     {
@@ -1168,6 +1332,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// </summary>
     private void ReleaseColumnFamilyMemTables(ColumnFamilyData cfd)
     {
+        cfd.Closed = true; // before the super version is released: see GetReferencedSuperVersion
         SuperVersion? sv = cfd.SuperOrNull();
         cfd.LocalSuperVersions.Reset(this);
         if (sv is not null && sv.Unref()) CleanupSuperVersion(sv);

@@ -77,6 +77,18 @@ internal sealed class GetContext
     public ulong ReadSequence = DbFormat.MaxSequenceNumber;
     public MergeOperator? MergeOperator;
     /// <summary>
+    /// The merge operator whose <see cref="Managed.MergeOperator.ShouldMerge"/> is asked after each operand found
+    /// (GetContext::SaveValue / MemTable's HandleTypeMerge with do_merge_): the column family's operator when it
+    /// overrides ShouldMerge, else null (the default answer is false). Cleared for lookups that only collect operands
+    /// (GetMergeOperands, do_merge_ = false).
+    /// </summary>
+    public MergeOperator? ShouldMergeOperator;
+    /// <summary>
+    /// <see cref="ShouldMergeOperator"/> ended the lookup: <see cref="State"/> is Found (kFound) and the operands in
+    /// <see cref="MergeContext"/> are merged with no base value (MergeWithNoBaseValue).
+    /// </summary>
+    private bool _mergeWithoutBase;
+    /// <summary>
     /// Read callback (GetContext::callback_, WritePrepared / WriteUnprepared transactions): entries it reports as
     /// invisible are skipped (CheckCallback). Null for plain reads.
     /// </summary>
@@ -195,6 +207,8 @@ internal sealed class GetContext
         IgnoreRangeDeletions = false;
         ReadSequence = DbFormat.MaxSequenceNumber;
         MergeOperator = mergeOperator;
+        ShouldMergeOperator = mergeOperator is { OverridesShouldMerge: true } ? mergeOperator : null;
+        _mergeWithoutBase = false;
         Callback = null;
         ContinueCallback = null;
         OperandsStopped = false;
@@ -308,6 +322,19 @@ internal sealed class GetContext
             case EntryType.Merge:
                 State = GetState.Merge;
                 MergeContext.PushOperand(value);
+                // GetContext::SaveValue, kTypeMerge: with do_merge_, ShouldMerge(GetOperandsDirectionBackward()) true
+                // ends the lookup with a merge of the operands collected so far and no base value (kFound).
+                if (ShouldMergeOperator is { } op && op.ShouldMerge(MergeContext.OperandsNewestFirst))
+                {
+                    // Deviation (fixes upstream, docs/upstream-issues/16): the lookup ends before the file's last entry
+                    // for the key, so the entries recorded so far are not the file's complete row cache entry. A later
+                    // lookup reaching the file with fewer operands (a snapshot read, GetMergeOperands) would replay
+                    // them and continue with older files. Discard the log: TableCache::Get / MultiGet insert only a
+                    // non-empty one.
+                    ReplayLog?.Clear();
+                    StopForMergeWithoutBase();
+                    return false;
+                }
                 if (ContinueCallback is { } cb && !cb(value))
                 {
                     StopAtOperand();
@@ -344,12 +371,32 @@ internal sealed class GetContext
             case MemTableGetResult.Corruption:
                 State = GetState.Corrupt;
                 return true;
+            case MemTableGetResult.MergeWithoutBase:
+                StopForMergeWithoutBase();
+                return true;
             default:
                 return false;
         }
     }
 
     public bool Done => State is GetState.Found or GetState.Deleted or GetState.Corrupt;
+
+    /// <summary>
+    /// <see cref="ShouldMergeOperator"/> returned true (MergeWithNoBaseValue): the lookup is finished (kFound) and its
+    /// operands are merged with no base value when resolved.
+    /// </summary>
+    private void StopForMergeWithoutBase()
+    {
+        _mergeWithoutBase = true;
+        Value.Clear();
+        ValueIsEntity = false;
+        ValueIsBlobIndex = false;
+        ValueEntityHasBlobColumns = false;
+        State = GetState.Found;
+    }
+
+    /// <summary>A base value was found for the operands (kFound by a value, not by <see cref="StopForMergeWithoutBase"/>).</summary>
+    private bool HasBaseValue => State == GetState.Found && !_mergeWithoutBase;
 
     /// <summary>
     /// GetContext::GetBlobValue: replaces a found blob index with the blob it references, read through
@@ -485,7 +532,7 @@ internal sealed class GetContext
         }
         // Merge operands present: combine with the base value (if found) or with no base (deleted / nothing older).
         if (MergeOperator is null) throw RocksDbException.InvalidArgument("merge_operator is not properly initialized.");
-        bool hasBase = State == GetState.Found;
+        bool hasBase = HasBaseValue;
         PooledBufferWriter output = ObjectPools.RentWriter();
         try
         {
@@ -531,7 +578,7 @@ internal sealed class GetContext
             return true;
         }
         if (MergeOperator is null) throw RocksDbException.InvalidArgument("merge_operator is not properly initialized.");
-        bool hasBase = State == GetState.Found;
+        bool hasBase = HasBaseValue;
         PooledBufferWriter output = ObjectPools.RentWriter();
         try
         {
@@ -597,6 +644,7 @@ internal sealed class GetContext
     public static void Return(GetContext c)
     {
         c.MergeOperator = null;
+        c.ShouldMergeOperator = null;
         c.Callback = null;
         if (c.Value.Capacity > 1 << 20 || c.MergeContext.Count > 64)
         {

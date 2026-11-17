@@ -67,7 +67,11 @@ public readonly struct WalChunk
 /// <para>
 /// Errors: a requested sequence number whose WAL was already purged throws <see cref="RocksDbException"/> with
 /// <see cref="StatusCode.NotFound"/> - the replica must be rebuilt from a checkpoint; an unreadable WAL throws
-/// <see cref="StatusCode.Corruption"/>. Not thread-safe (one reader).
+/// <see cref="StatusCode.Corruption"/>. The iterator's <see cref="StatusCode.TryAgain"/> (the database is ahead of what
+/// the WAL holds: writes with <see cref="WriteOptions.DisableWal"/> or ingestion at the end of the log, manual WAL flush
+/// data still buffered) is not an error: the tail waits with a short back-off. A gap behind such writes throws NotFound
+/// once a later batch shows it; a damaged WAL record that nothing readable follows throws NotFound once a second read of
+/// the WAL confirms it (see <see cref="TransactionLogIterator.SkippedCorruptBytes"/>). Not thread-safe (one reader).
 /// Dispose the tailer before closing the database.
 /// </para>
 /// </summary>
@@ -94,6 +98,8 @@ public sealed class WalTailer : IDisposable
     private TransactionLogIterator? _iterator;
     private byte[] _buffer;
     private ulong _nextSequenceNumber;
+    // The next sequence number at which the iterator was reopened to confirm damaged WAL data (HandleDamagedTail).
+    private ulong _damageCheckedAt = ulong.MaxValue;
     private bool _started;
     private bool _disposed;
 
@@ -167,14 +173,16 @@ public sealed class WalTailer : IDisposable
             if (!it.Valid)
             {
                 if (entryCount > 0) break;
-                it.ThrowIfError();
-                // An exhausted iterator picks up records appended since (and follows WAL rotation) when moved again.
+                ThrowIfRunEnded(it);
+                // An exhausted iterator picks up records appended since (and follows WAL rotation) when moved again,
+                // also after it ended with TryAgain.
                 it.Next();
                 if (!it.Valid)
                 {
-                    it.ThrowIfError();
+                    ThrowIfRunEnded(it);
                     if (!_started) ThrowIfStartPurged();
                     else ThrowIfRotationCannotBeFollowed(it);
+                    if (HasUpdates && it.SkippedCorruptBytes > 0) HandleDamagedTail(it);
                     break;
                 }
             }
@@ -231,7 +239,8 @@ public sealed class WalTailer : IDisposable
         if (HasUpdates)
         {
             // Published but not readable through the WAL (e.g. writes with DisableWal, or manual_wal_flush data still
-            // buffered): the write path will not signal again for these, so back off briefly.
+            // buffered; the iterator ended with TryAgain): the write path will not signal again for these, so back off
+            // briefly. Damaged data is reported by TryReadChunk instead.
             await Task.Delay(1, cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -257,13 +266,53 @@ public sealed class WalTailer : IDisposable
     }
 
     /// <summary>
+    /// Ends the read with the iterator's error unless it is <see cref="StatusCode.TryAgain"/>, which only says that the
+    /// iterator cannot read further now although the database is ahead (WalIteratorImpl::NextImpl); a later Next
+    /// retries.
+    /// </summary>
+    private static void ThrowIfRunEnded(TransactionLogIterator iterator)
+    {
+        if (iterator.Error is { Code: not StatusCode.TryAgain }) iterator.ThrowIfError();
+    }
+
+    /// <summary>
+    /// The database is ahead and the iterator cannot read further because its log reader dropped damaged data after the
+    /// last record it read (bad checksum, malformed record) with nothing readable behind it - a damaged record below the
+    /// database's last sequence that no later read gets past (a later write would show up as a gap, but the tail must
+    /// not wait for one). Writes that bypass the WAL, ingestion and manual WAL flush data still buffered never drop data,
+    /// so they keep waiting. The first time at a sequence number the iterator is reopened there and reads the WAL again
+    /// from its start (a fresh reader, nothing buffered); if that read stops at damaged data again, the tail throws
+    /// NotFound and the replica has to be rebuilt.
+    /// </summary>
+    private void HandleDamagedTail(TransactionLogIterator iterator)
+    {
+        if (_damageCheckedAt != _nextSequenceNumber)
+        {
+            _damageCheckedAt = _nextSequenceNumber;
+            iterator.Dispose();
+            _iterator = null;
+            _iterator = _db.GetUpdatesSince(_nextSequenceNumber);
+            return;
+        }
+        throw new RocksDbException(StatusCode.NotFound,
+            "NotFound: WAL data for sequence " + _nextSequenceNumber + " is damaged in WAL #" + iterator.CurrentWalNumber + " (" +
+            iterator.SkippedCorruptionReason + ") and cannot be read; the database is at sequence " + _db.GetLatestSequenceNumber());
+    }
+
+    /// <summary>
     /// Before the first batch: the database is at or past the requested sequence but the iterator found nothing. If no
     /// WAL can contain it any more (all purged, or the oldest starts later), report NotFound now instead of waiting for
-    /// a later write to reveal the gap.
+    /// a later write to reveal the gap. The current WAL can still deliver any sequence above
+    /// <see cref="RocksDatabase.CurrentWalBaseSequence"/>, also while it holds no record on disk (manual_wal_flush keeps
+    /// it buffered; the listing skips empty WALs, WalManager::GetSortedWalsOfType): such a start waits instead.
     /// </summary>
     private void ThrowIfStartPurged()
     {
         if (!HasUpdates) return;
+        // Read before the listing: a WAL switch in between writes the old WAL's buffer out before the base moves, so
+        // the listing then shows the old WAL with its first record.
+        ulong currentBase = _db.CurrentWalBaseSequence;
+        if (_db.CurrentWalNumber != 0 && _nextSequenceNumber > currentBase) return;
         IReadOnlyList<WalFileInfo> files = _db.GetSortedWalFiles();
         foreach (WalFileInfo f in files)
         {

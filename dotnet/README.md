@@ -140,8 +140,16 @@ await db.CompactRangeAsync();                               // full manual compa
 ```
 
 Async calls complete synchronously when nothing has to wait (memtable and block-cache hits, page-cache hits through
-`preadv2(RWF_NOWAIT)` on Linux), so they cost about as much as the sync calls. The sync API never blocks on thread-pool
-work: a synchronous writer that becomes the write-group leader does the WAL I/O on its own thread.
+`preadv2(RWF_NOWAIT)` on Linux), so they cost about as much as the sync calls. A synchronous writer that becomes the
+write-group leader does the WAL I/O on its own thread.
+
+> **Use either the sync or the async API on a database, not both.** Writes are group-committed: one writer (the leader)
+> writes the WAL and memtable for every writer queued behind it. A sync writer (`Put`, `Write`, ...) waits for its
+> leader by blocking its thread. If that leader is an async writer (`PutAsync`, `WriteAsync`, ...) whose WAL write or
+> write-stall wait does not complete inline, the rest of the leader's work runs on the .NET thread pool, so blocked sync
+> writers that occupy pool threads (e.g. sync `Put` calls from ASP.NET request handlers) can starve it: the writes stall
+> until the pool injects threads, or deadlock under a capped pool. All-sync and all-async use are not affected. The sync
+> write methods may be deprecated and removed in a future version; new code should use the async API.
 
 ## API tour
 
@@ -399,6 +407,10 @@ Upstream's built-in operators are included under their native names, and an OPTI
 (`MergeSortOperator`), `BytesXorOperator` (`BytesXOR`) and the aggregation operator
 `Utilities.AggMerge.AggMergeOperator` (`AggMergeOperator.v1`, with `Aggregator`s registered through
 `AggMerge.AddAggregator`). `MergeOperator.CreateBuiltin(id)` resolves the same ids.
+
+As upstream, `MergeOperator.ShouldMerge` (operands passed newest first) lets point lookups stop collecting operands
+and merge without the base value, and `ColumnFamilyOptions.MaxSuccessiveMerges` (with `StrictMaxSuccessiveMerges`)
+folds a key's merge operands into a value at write time once that many are in the memtable.
 
 <!-- snippet:merge-operator-class -->
 ```csharp
@@ -1063,6 +1075,13 @@ Set `DbOptions.WalTtlSeconds` / `WalSizeLimitMb` to archive obsolete WALs for re
 [src/RocksDb.Managed.Replication](src/RocksDb.Managed.Replication/README.md). A held iterator, `TailUpdatesAsync` and
 `WaitForSequenceAsync` allocate nothing per batch, also while they wait (see [docs/allocations.md](docs/allocations.md)).
 
+A `GetUpdatesSince` run ends like native: `Error` null when caught up, `TryAgain` when the DB is ahead of what the WAL
+can deliver (writes with `DisableWal` or ingested files at the end of the log, `ManualWalFlush` data not flushed yet,
+a damaged record - `SkippedCorruptBytes` tells that one apart, also for a recycled WAL's damaged record or a record
+length past the end of the data, which the log reader itself takes for the end of the log), `NotFound` on a gap. Unlike native, `Next()` after
+`TryAgain` retries from where the iterator stopped; `TailUpdatesAsync` waits `TryAgain` out and ends with `NotFound`
+at a damaged record.
+
 ### Read-only and secondary instances
 
 <!-- snippet:read-only-secondary -->
@@ -1359,8 +1378,7 @@ Not ported yet (tracked in [todo.md](todo.md)):
 - Options typed and persisted (round-tripped with native 11.12, accepted by SetOptions / SetDBOptions where upstream
   marks them mutable) but without behaviour yet: `paranoid_memory_checks`, `memtable_verify_per_key_checksum_on_seek`,
   `memtable_op_scan_flush_trigger` / `memtable_avg_op_scan_flush_trigger`, `memtable_batch_lookup_optimization`,
-  `min_tombstones_for_range_conversion`, `strict_max_successive_merges` (and `max_successive_merges` itself),
-  `blob_compression_opts` (blob files use the codec's default settings), `compression_opts.auto_skip` /
+  `min_tombstones_for_range_conversion`, `blob_compression_opts` (blob files use the codec's default settings), `compression_opts.auto_skip` /
   `auto_skip_min_sample_every`,
   `uncache_aggressiveness` (a cache hint; obsolete files' blocks are left to normal eviction), `compression_manager`
   (only `nullptr`; a named manager is NotSupported at open / SetOptions), `fast_sst_open`, `open_files_async`,

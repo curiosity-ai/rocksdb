@@ -163,6 +163,15 @@ internal sealed class IteratorGraph : IDisposable
     /// tombstones visible at it) change. False when the column family installed another super version (before or after
     /// the sequence was read): the caller then releases and rebuilds the graph.
     /// </summary>
+    /// <summary>False once <see cref="Release"/> ran and no view was built since (a failed rebuild leaves it so).</summary>
+    public bool IsBuilt => _sv is not null;
+
+    /// <summary>Throws InvalidArgument for a snapshot of another DB or a released one (before anything is released).</summary>
+    public void ValidateSnapshot(Snapshot? snapshot)
+    {
+        if (snapshot is not null) _db.IteratorReadSequence(snapshot);
+    }
+
     public bool TryRefreshInPlace(Snapshot? snapshot)
     {
         SuperVersion? sv = _sv;
@@ -419,12 +428,13 @@ internal sealed class IteratorGraph : IDisposable
         ParkChildren();
         SuperVersion? sv = _sv;
         Snapshot? own = _ownedSnapshot;
+        bool backgroundPurge = _options?.BackgroundPurgeOnIteratorCleanup ?? false;
         _sv = null;
         _ownedSnapshot = null;
         _callback = null;
         _options = null;
         _hasTombstones = false;
-        if (sv is not null) _db.ReturnSuperVersion(sv);
+        if (sv is not null) _db.ReturnIteratorSuperVersion(sv, backgroundPurge);
         own?.Dispose();
     }
 

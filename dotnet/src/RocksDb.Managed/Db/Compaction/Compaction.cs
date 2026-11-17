@@ -309,6 +309,12 @@ internal sealed class Compaction
     /// <summary>Compaction::ShouldNotifyOnCompactionCompleted: set once OnCompactionBegin was raised for this compaction.</summary>
     internal bool NotifyOnCompactionCompleted { get; set; }
 
+    /// <summary>
+    /// Compaction::WasNotifyOnCompactionPreCommitCalled: OnCompactionPreCommit fires at most once per compaction, although
+    /// it is raised before the MANIFEST write and again (as a safety net) before a failed compaction releases its files.
+    /// </summary>
+    internal bool PreCommitNotified { get; set; }
+
     /// <summary>CompactFiles with a compaction_job_info output: the job builds <see cref="JobInfo"/> when it finishes.</summary>
     internal bool BuildJobInfo { get; set; }
 
@@ -491,7 +497,15 @@ internal sealed class Compaction
             return false;
         if (OutputLevel + 1 < NumberLevels)
         {
-            SstPartitioner? partitioner = CreateSstPartitioner();
+            SstPartitioner? partitioner;
+            try
+            {
+                partitioner = CreateSstPartitioner();
+            }
+            catch (Exception e)
+            {
+                return TrivialMoveCheckFailed(e);
+            }
             var grandparents = new List<FileMetaData>();
             foreach (FileMetaData file in _inputs[0].Files)
             {
@@ -500,16 +514,37 @@ internal sealed class Compaction
                 ulong size = file.FileSize;
                 foreach (FileMetaData g in grandparents) size += g.FileSize;
                 if (size > MaxCompactionBytes) return false;
-                if (partitioner is not null
-                    && !partitioner.CanDoTrivialMove(DbFormat.ExtractUserKey(file.Smallest), DbFormat.ExtractUserKey(file.Largest)))
+                if (partitioner is null) continue;
+                bool allowed;
+                try
                 {
-                    return false;
+                    allowed = partitioner.CanDoTrivialMove(DbFormat.ExtractUserKey(file.Smallest), DbFormat.ExtractUserKey(file.Largest));
                 }
+                catch (Exception e)
+                {
+                    return TrivialMoveCheckFailed(e);
+                }
+                if (!allowed) return false;
             }
         }
         // PerKeyPlacement compaction should never be trivial move.
         if (SupportsPerKeyPlacement) return false;
         return true;
+    }
+
+    /// <summary>
+    /// The exception a user SST partitioner (factory) threw while <see cref="IsTrivialMove"/> consulted it, or null.
+    /// Upstream's SstPartitioner cannot fail; IsTrivialMove runs under the DB mutex from the compaction scheduler
+    /// (EnoughRoomForCompaction, the bottom-priority forwarding check) and from property reads, where an exception would
+    /// leave a registered compaction half scheduled. The check answers "not a trivial move" instead and the compaction
+    /// job rethrows this exception when it runs, so it fails like any other user-callback failure of the job.
+    /// </summary>
+    internal Exception? PartitionerFailure { get; private set; }
+
+    private bool TrivialMoveCheckFailed(Exception e)
+    {
+        PartitionerFailure ??= e;
+        return false;
     }
 
     /// <summary>Port of Compaction::AddInputDeletions.</summary>
@@ -652,12 +687,69 @@ internal sealed class Compaction
         return min;
     }
 
-    /// <summary>Creates the compaction filter (CreateCompactionFilter): the CF's filter, or one from its factory.</summary>
-    public CompactionFilter? CreateCompactionFilter(uint columnFamilyId)
+    /// <summary>
+    /// Creates the compaction filter (CreateCompactionFilter): the CF's filter, or one from its factory, whose context
+    /// carries the input files' table properties read through <paramref name="tableCache"/>.
+    /// </summary>
+    public CompactionFilter? CreateCompactionFilter(uint columnFamilyId, TableCache tableCache, DbImpl? log)
     {
         if (Options.CompactionFilter is { } f) return f;
-        if (Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(isFlush: false)) return null;
-        return factory.CreateCompactionFilter(new CompactionFilterContext(IsFullCompaction, IsManual, columnFamilyId, IsFlush: false));
+        if (Options.CompactionFilterFactory is not { } factory || !factory.ShouldFilterTableFileCreation(TableFileCreationReason.Compaction)) return null;
+        // Compaction::CreateCompactionFilter: input_start_level = start_level_, reason = kCompaction,
+        // input_table_properties = GetInputTableProperties() (filled by GetOrInitInputTableProperties before the
+        // subcompactions run; here on the first filter creation, as only filters use it in the port).
+        IReadOnlyDictionary<string, Table.TableProperties> props = GetOrInitInputTableProperties(tableCache, log);
+        if (props.Count == 0)
+        {
+            log?.LogWarn("Unable to set `input_table_properties` of `CompactionFilter::Context` for compaction.");
+        }
+        return factory.CreateCompactionFilter(new CompactionFilterContext(IsFullCompaction, IsManual, columnFamilyId, IsFlush: false)
+        {
+            InputStartLevel = StartLevel,
+            InputTableProperties = props,
+        });
+    }
+
+    private IReadOnlyDictionary<string, Table.TableProperties>? _inputTableProperties;
+    private readonly Lock _inputTablePropertiesLock = new();
+
+    /// <summary>
+    /// Port of Compaction::GetOrInitInputTableProperties / InitInputTableProperties (db/compaction/compaction.cc): the
+    /// table properties of every input file keyed by its path (TableFileName). Read from the readers in
+    /// <paramref name="tableCache"/> (opened there if needed; the compaction's input iterators then reuse them), instead
+    /// of upstream's Version::GetTableProperties, which reads the properties block without opening a reader when the
+    /// table is not cached. When a file's properties cannot be loaded the error is logged and the result is empty (not
+    /// cached, so a later call retries), as upstream. Thread-safe (subcompactions create their filters concurrently).
+    /// </summary>
+    internal IReadOnlyDictionary<string, Table.TableProperties> GetOrInitInputTableProperties(TableCache tableCache, DbImpl? log)
+    {
+        IReadOnlyDictionary<string, Table.TableProperties>? cached = Volatile.Read(ref _inputTableProperties);
+        if (cached is not null) return cached;
+        lock (_inputTablePropertiesLock)
+        {
+            if (_inputTableProperties is { } again) return again;
+            var result = new Dictionary<string, Table.TableProperties>(StringComparer.Ordinal);
+            foreach (CompactionInputFiles level in _inputs)
+            {
+                foreach (FileMetaData f in level.Files)
+                {
+                    try
+                    {
+                        using TableReaderLease lease = tableCache.GetReader(f);
+                        result[tableCache.TableFilePath(f)] = lease.Reader.Properties;
+                    }
+                    catch (Exception e) when (e is RocksDbException or IOException or UnauthorizedAccessException)
+                    {
+                        log?.LogError("Unable to load table properties for file " + f.FileNumber.ToString(CultureInfo.InvariantCulture) + " --- " +
+                                      e.Message);
+                        return System.Collections.ObjectModel.ReadOnlyDictionary<string, Table.TableProperties>.Empty;
+                    }
+                }
+            }
+            var frozen = new System.Collections.ObjectModel.ReadOnlyDictionary<string, Table.TableProperties>(result);
+            Volatile.Write(ref _inputTableProperties, frozen);
+            return frozen;
+        }
     }
 
     /// <summary>Compaction::InputLevelSummary, e.g. "3@0 + 2@1 files to L1".</summary>

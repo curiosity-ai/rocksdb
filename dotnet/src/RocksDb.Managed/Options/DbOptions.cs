@@ -373,7 +373,11 @@ public sealed class DbOptions : PersistedOptions<DbOptions>
         // AsCustomSharedPtr<FileChecksumGenFactory> (kByNameAllowFromNull): the factory's name; only the built-in
         // FileChecksumGenCrc32cFactory is recreated from an OPTIONS file, other names load as null.
         .Add("file_checksum_gen_factory", static o => o.FileChecksumGenFactory?.Name ?? "nullptr",
-            static (o, v) => o.FileChecksumGenFactory = OptionStrings.UnwrapId(v) == FileChecksumGenCrc32cFactory.ClassName ? FileChecksumGenCrc32cFactory.Instance : null)
+            static (o, v) =>
+            {
+                // A malformed "{..." cannot create the Customizable: ignored like native (see OptionStrings.TryUnwrapId).
+                if (OptionStrings.TryUnwrapId(v, out string id)) o.FileChecksumGenFactory = id == FileChecksumGenCrc32cFactory.ClassName ? FileChecksumGenCrc32cFactory.Instance : null;
+            })
         .Bool("enforce_single_del_contracts", static o => o.EnforceSingleDelContracts, static (o, v) => o.EnforceSingleDelContracts = v)
         .Enum("lowest_used_cache_tier", OptionEnumMaps.CacheTier, static o => o.LowestUsedCacheTier, static (o, v) => o.LowestUsedCacheTier = v)
         .Enum("info_log_level", OptionEnumMaps.InfoLogLevel, static o => o.InfoLogLevel, static (o, v) => o.InfoLogLevel = v)

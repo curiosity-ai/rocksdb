@@ -67,8 +67,9 @@ internal sealed partial class DbImpl
                 await FlushColumnFamilyAsync(cfd, wait: true, FlushReason.ShutDown, synchronous, CancellationToken.None).ConfigureAwait(false);
             }
         }
-        catch (RocksDbException e)
+        catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException)
         {
+            // CancelAllBackgroundWork: "Shutdown flush failed" is logged, never returned (the close goes on).
             LogWarn("Shutdown flush failed: " + e.Message);
         }
     }

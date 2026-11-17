@@ -98,6 +98,11 @@ public sealed class TableInternalIterator : InternalIterator
     internal static InternalIterator OpenOrRecycle(ITableCache tableCache, FileMetaData file, InternalIterator? reuse, TableReadFlags flags,
         ReadOptions? readOptions, SliceTransform? prefixExtractor)
     {
+        if (readOptions?.TableFilter is { } tableFilter && !PassesTableFilter(tableCache, file, tableFilter))
+        {
+            reuse?.Dispose();
+            return new EmptyInternalIterator();
+        }
         if (prefixExtractor is null)
         {
             InternalIterator it = flags == TableReadFlags.None
@@ -115,6 +120,17 @@ public sealed class TableInternalIterator : InternalIterator
         }
         reuse?.Dispose();
         return Create(lease, flags, readOptions, prefixExtractor);
+    }
+
+    /// <summary>
+    /// TableCache::NewIterator with ReadOptions::table_filter (db/table_cache.cc): whether the iterator reads
+    /// <paramref name="file"/> (the filter sees the table's properties; when it returns false the table gets an empty
+    /// iterator, while its range tombstones are still added by the caller).
+    /// </summary>
+    internal static bool PassesTableFilter(ITableCache tableCache, FileMetaData file, Func<TableProperties, bool> tableFilter)
+    {
+        using TableReaderLease lease = tableCache.GetReader(file);
+        return tableFilter(lease.Reader.Properties);
     }
 
     public override bool Valid { [MethodImpl(MethodImplOptions.AggressiveOptimization)] get => _it.Valid; }

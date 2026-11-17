@@ -824,6 +824,13 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 // divergence ask again.
                 Log("resync not started: recording the log end failed: " + ex.Message);
                 lock (_followerLock) _resyncing = false;
+                // The follower stream that asked for this resync has ended, and nothing else restarts one under a stable
+                // leader: attach again (after the retry delay, so a disk that keeps failing is not hammered), so that the
+                // divergence is seen again and the resync retried. rocksdb-sharp's PerformResyncAsync (Tests/ClusterTest)
+                // likewise always ends with EnsureFollowerStream.
+                await Task.Delay(_cfg.RetryDelay, _cts.Token).ConfigureAwait(false);
+                string? leaderId = _node.CurrentLeaderId;
+                if (leaderId != null && leaderId != _cfg.NodeId) EnsureFollowerStream(leaderId);
                 return;
             }
             Task? follower;
@@ -846,7 +853,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             }
             // Wait until no RPC handler uses the old instance, then close it.
             await _dbGate.DrainAsync(_cts.Token).ConfigureAwait(false);
-            await _db.DisposeAsync().ConfigureAwait(false);
+            await HostResync.CloseDatabaseAsync(_db, Log).ConfigureAwait(false);
 
             while (!_cts.IsCancellationRequested)
             {

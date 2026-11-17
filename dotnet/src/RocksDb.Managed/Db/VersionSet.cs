@@ -500,6 +500,10 @@ internal sealed class VersionSet : IAsyncDisposable
                 if (e.Edit.IsColumnFamilyAdd || e.Edit.IsColumnFamilyDrop) ThrowHelper.InvalidArgument("column family add/drop cannot be batched");
             }
         }
+        // Cancellation is honoured only while waiting for the MANIFEST writer slot (the manifest_writers_ queue). The
+        // MANIFEST I/O below runs to completion: a record cancelled after it reached the file (and the closing writer
+        // flushes it) would commit an edit the caller was told did not happen, e.g. a column family that only a reopen
+        // finds. Native's LogAndApply cannot be interrupted either.
         if (synchronous) _manifestLock.Wait(cancellationToken);
         else await _manifestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -626,14 +630,14 @@ internal sealed class VersionSet : IAsyncDisposable
                     Wal.LogWriter sizeOf = newLog.Log;
                     var writer = new ManifestWriter(newLog) { FileSizeProvider = () => (ulong)sizeOf.File!.Size };
                     // WriteCurrentStateToManifest (synced at the end).
-                    await writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, synchronous, cancellationToken).ConfigureAwait(false);
+                    await writer.WriteCurrentStateAsync(snapshot, TimestampSizeOfColumnFamily, synchronous, CancellationToken.None).ConfigureAwait(false);
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
-                    await writer.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, cancellationToken).ConfigureAwait(false);
+                    await writer.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, CancellationToken.None).ConfigureAwait(false);
                     newManifestWritten = true;
                     // The new MANIFEST (snapshot and edits) plus CURRENT ("MANIFEST-nnnnnn\n").
                     editList[0].ManifestBytesWritten = (ulong)newLog.Log.File!.Size + (ulong)FileNames.DescriptorFileName(manifestNumber).Length + 1;
-                    await FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, synchronous, cancellationToken)
+                    await FileNames.SetCurrentFileAsync(_fs, _dbname, manifestNumber, syncDirectory: true, synchronous, CancellationToken.None)
                         .ConfigureAwait(false);
                     ManifestLogWriter? old = _manifestLog;
                     // ProcessManifestWrites: last_compacted_manifest_file_size_ = new_manifest_file_size (after the
@@ -653,7 +657,7 @@ internal sealed class VersionSet : IAsyncDisposable
                     ulong next = CurrentNextFileNumber;
                     foreach (VersionEdit e in editList) e.NextFileNumber = next;
                     long sizeBefore = _manifestLog!.Log.File!.Size;
-                    await _manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, cancellationToken).ConfigureAwait(false);
+                    await _manifest!.AddEditsAsync(editList, tsSizes, atomicGroup, synchronous, CancellationToken.None).ConfigureAwait(false);
                     editList[0].ManifestBytesWritten = (ulong)(_manifestLog!.Log.File!.Size - sizeBefore);
                 }
             }
@@ -899,6 +903,7 @@ internal sealed class VersionSet : IAsyncDisposable
         string path;
         long expected;
         string? status = null;
+        Exception? failure = null;
         await LockManifestAsync(synchronous).ConfigureAwait(false);
         try
         {
@@ -916,6 +921,7 @@ internal sealed class VersionSet : IAsyncDisposable
             catch (Exception e) when (e is IOException or RocksDbException)
             {
                 status = e.Message;
+                failure = e;
             }
         }
         finally
@@ -932,12 +938,17 @@ internal sealed class VersionSet : IAsyncDisposable
                 if (size == expected) return;
                 // "This means the size is not as expected. So we treat it as a corruption".
                 status = "Corruption: ";
+                failure = new RocksDbException(StatusCode.Corruption, status);
             }
             catch (Exception e) when (e is IOException or RocksDbException)
             {
                 status = e.Message;
+                failure = e;
             }
         }
+        // "IOErrorInfo io_error_info(io_s, FileOperationType::kVerify, manifest_file_name, /*length=*/size, /*offset=*/0);
+        // for (auto& listener : cfd->ioptions().listeners) listener->OnIOError(io_error_info);" (every listener).
+        _db.NotifyOnIOErrorToAllListeners(failure!, FileOperationType.Verify, path, (ulong)size, 0);
         _db.LogError("MANIFEST verification on Close, filename " + path + ", expected size " + expected.ToString(System.Globalization.CultureInfo.InvariantCulture)
             + " failed with status " + status + " and actual size " + size.ToString(System.Globalization.CultureInfo.InvariantCulture));
         await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous, CancellationToken.None).ConfigureAwait(false);
@@ -980,6 +991,10 @@ internal sealed class VersionSet : IAsyncDisposable
             }
             if (!corrupt) return; // Manifest is healthy, no need to check again
             _db.Stats?.RecordTick(Ticker.ManifestValidationFailureCount);
+            // IOErrorInfo(IOStatus::Corruption("MANIFEST content validation failed"), kVerify, content_manifest_name, 0, 0)
+            // to every listener.
+            _db.NotifyOnIOErrorToAllListeners(new RocksDbException(StatusCode.Corruption, "Corruption: MANIFEST content validation failed"),
+                FileOperationType.Verify, path, 0, 0);
             if (check == 0)
             {
                 // First check failed -- rewrite and verify again.

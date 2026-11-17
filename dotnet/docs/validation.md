@@ -2076,3 +2076,478 @@ Properties, memory and open:
 - Atomic flush (AtomicFlushMemTablesToOutputFiles / InstallMemtableAtomicFlushResults), concurrent as upstream: several atomic flush jobs may run at once, a new one scheduled once the previous one has picked; each job picks every column family's unpicked memtables up to the newest completed switch in one mutex hold; a job waits (atomic_flush_install_cv_, here the background signal) until its first memtable is the oldest in each of its column families, and aborts on a MANIFEST error, shutdown, or (non-recovery) a background error that stopped background work; one MANIFEST atomic group, memtables removed and super versions installed in the LogAndApply critical section; on failure every column family of the flush is rolled back (RollbackMemtableFlush without succeeding memtables). The error-recovery flush (force_atomic_flush) is an ordinary atomic flush, no longer exclusive. Deviations: recovery waits for running atomic flushes before it picks (closes the window between WaitForBackgroundWork and the pick, where an older flush that rolls back would leave the recovery flush waiting); no second SetBGError after an install-wait failure (it would fire OnBackgroundError twice); job ids per column family; global retry back-off. num-running-flushes now counts an atomic flush once, as upstream. Tests: ConcurrentAtomicFlushTests (ports of BgThreadNoWaitAfterManifestError, DBStuckAfterAtomicFlushError, AtomicFlushRollbackSomeJobs). Open, same in upstream: a failed non-atomic commit (RemoveMemTablesOrRestoreFlags) restores only its own batch; later completed results of that column family wait for its next non-atomic flush.
 - Best-efforts recovery (VersionEditHandlerPointInTime): table files are verified and loaded through the column families' table caches, as upstream. VerifyFile = VersionSet::VerifyFileMetadata: a size mismatch counts as missing; with verify_sst_unique_id_in_manifest the file is opened through TableCache::FindTable, so a wrong unique id is Corruption, i.e. missing. LoadTables of each point-in-time version = VersionBuilder::LoadTableHandlers via TableHandlerLoader (max_file_opening_threads, initial-load limit min(16, capacity/4), prefetch off); Corruption or PathNotFound skips the point in time. Statuses follow ApplyFileAddition: PathNotFound, NotFound and Corruption are missing, any other error fails that MANIFEST (before, an I/O error quietly counted as missing). Column families the DB does not open are not checked. The readers opened during recovery are adopted by the ColumnFamilyData (ColumnFamilyData.NewTableCache), so nothing is opened twice, and they survive a failed MANIFEST attempt. Deviations: blob files are verified by a direct open, not through BlobSource (it needs the DbId, known only after the replay); the size check uses the file's own path id where upstream uses cf_paths[0] (looks like an upstream bug); loaded readers are not pinned (pin_table_handle); intermediate_files_ (ManifestTailer only) not ported. Tests: BestEffortsRecoveryTableCacheTests.
 
+
+## Audit #7: failure modes and edge cases (2026-11-16)
+
+Six parallel reviews of what the port does on bad input and bad conditions: corrupt or truncated SST, blob, WAL,
+MANIFEST, CURRENT and OPTIONS bytes; I/O errors at every step of the write, flush, compaction and close paths; misuse of
+the public API (use after dispose, foreign handles, boundary arguments); transaction, WriteBatchWithIndex, backup and
+checkpoint failure paths; and the replication / switchover / Raft layer under transport faults. Every finding was checked
+against the C++ (file and function cited in the fix and the test) and, wherever the C API can reach the path, against
+native 11.12 in-process side by side (`tests/RocksDb.Managed.CompatTests/Audit7/`). Where native cannot be driven (no C
+API, undefined behaviour, or a native crash), the reason is stated. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit7*`,
+`tests/RocksDb.Managed.CompatTests/Audit7/`, `tests/RocksDb.Managed.Replication.Tests/Audit7ReplicationTests.cs`. Seeded
+fuzzers (`AUDIT7_TABLE_SEED` / `AUDIT7_TABLE_ROUNDS`, `AUDIT7_SEED`) log their seed.
+
+### Fixed
+
+Corrupt input (SST, blob, compression):
+
+- `SstFileReader.VerifyChecksum` decompressed blocks, without the table's dictionary: a valid LZ4 / ZSTD / zlib table with
+  a compression dictionary failed with Corruption. Now raw block + checksum only (`BlockBasedTable::VerifyChecksumInBlocks`,
+  BlockFetcher with decompress = false). Native `rocksdb_verify_checksum`: OK.
+- Block handles from a damaged footer or index: an offset of 2^63 or more reached the file layer as a negative offset
+  (ArgumentOutOfRangeException), a size near 2^32 overflowed (`OverflowException` in the cache tiers). Now IOError for an
+  offset above long.MaxValue (pread's EINVAL), truncated-read Corruption past the end, Corruption "block too large"; the
+  async tail prefetch compares offsets unsigned. Native (ingestion of the damaged file): same codes; native aborts
+  (`bad_alloc`) on a 2^40 size and segfaults on a wrapping one, the port returns Corruption.
+- A damaged stored uncompressed size: OutOfMemoryException above `Array.MaxLength`, ArgumentOutOfRangeException for a
+  snappy length above int.MaxValue, and ~2 GiB allocated (and pooled) per corrupt block below. Now Corruption when the
+  size exceeds `Array.MaxLength` or the codec's maximum expansion of the payload (snappy 22x, LZ4 256x + 64, deflate
+  1040x + 4 KiB, zstd 32768x + 128 KiB; no valid stream is rejected; native-written maximally compressible blocks read
+  back). Native: Corruption for all four codecs, except the LZ4 upstream bug below.
+- Plain table: a sub-index offset out of range threw ArgumentOutOfRangeException (C++: unchecked, undefined behaviour);
+  cuckoo: a damaged `rocksdb.num.entries` sized a `List` of up to int.MaxValue (C++: `reserve` throws). Both Corruption.
+
+Corrupt metadata (WAL, MANIFEST, OPTIONS):
+
+- DB open hung forever on a single bit flip of a WAL or MANIFEST record type to a recyclable type in a non-recycled log
+  (`log_reader.cc` `ReadPhysicalRecord`: `if (first_record_read_ && !recycled_) return kBadRecord;` without consuming
+  the header, and `ReadRecord` parses it again; same in `FragmentBufferedReader::TryReadFragment`). **Deliberate
+  deviation**: the record is dropped and reported as a checksum mismatch (its CRC covers the type byte), so
+  PointInTime / SkipAny keep the records before it and TolerateCorruptedTail / AbsoluteConsistency fail with Corruption.
+  Native 11.12 (child process): open hangs. Upstream issue draft: `upstream-issues/08-log-reader-recyclable-type-hang.md`.
+- A damaged level number in a MANIFEST new-file record (up to 2^31 - 1) built one level list per level: out of memory or
+  minutes of work. Now InvalidArgument "db has more levels than options.num_levels" at once for levels >= 4096 (C++:
+  `invalid_level_sizes_` then `CheckConsistencyForNumLevels`). Native: the same code for levels 7, 4096, 1e9, int.MaxValue.
+  Deviation: upstream would still open if a later edit deleted that file.
+- OPTIONS files: `options_file_version` overflow threw ArgumentOutOfRangeException (now wraps like `ParseVersionNumber`);
+  a torn last line without '\n' was parsed (`LineFileReader::ReadLine` drops it); unknown or malformed
+  `memtable_factory` / `table_factory` / `flush_block_policy_factory` ids were rejected (native ignores them,
+  `ignore_unsupported_options` defaults to true); `read_amp_bytes_per_bit` uses upstream's truncating ParseUint64 and
+  `block_protection_bytes_per_key` is a uint8. All compared with `rocksdb_load_latest_options`.
+
+Write path, background errors, close:
+
+- Close with a WAL that fails to close stopped half way: the MANIFEST writer stayed open, table caches and memtables were
+  not released, file handles leaked. Now as `CloseHelper`: each WAL is cleared (`ClearWriter`: only the buffer write-out
+  is reported, the file close is not), the first error is kept and thrown after the close completes; MANIFEST close
+  errors likewise.
+- Flush (and WaitForCompact) after `CancelAllBackgroundWork` threw ObjectDisposedException on an open DB; now
+  ShutdownInProgress (`WaitForFlushMemTables`). Native 11.12: "Shutdown in progress" for both.
+- A write stalled on stopped writes waited forever behind a soft background error that nothing would recover; now
+  Incomplete with the background error when no recovery is in progress (`DelayWrite`).
+- An operation racing the close (CompactRange, a slow-path read, `Iterator.Refresh` after Dispose) spun a core forever in
+  `GetReferencedSuperVersion` on the released super version; close now marks the column family closed first and the
+  loop throws ObjectDisposedException. Found by a randomized close race test (a few hangs per 40-60 runs). A failed
+  iterator Refresh / RefreshAsync / SetBounds now disposes the iterator and rethrows (before, it silently iterated
+  nothing); a foreign or released snapshot is rejected before the iterator's view is released.
+
+- Releasing an iterator never purged the files its super version kept alive: the inputs of a compaction that ran while
+  the iterator was open stayed on disk until the next flush, compaction or close. Now as `CleanupIteratorSuperVersion`:
+  on the last reference the iterator release runs FindObsoleteFiles / PurgeObsoleteFiles, in the background (HIGH pool)
+  with `background_purge_on_iterator_cleanup` / `avoid_unnecessary_blocking_io`. Native 11.12 (`.sst` files on disk:
+  2 L0 files, iterator open, CompactRange, iterator disposed): 2 -> 3 -> 1; managed was 2 -> 3 -> 3, now 2 -> 3 -> 1.
+  Point reads keep upstream behaviour (`ReturnAndCleanupSuperVersion` does not purge: a Get that drops the last reference
+  leaves the files to the next purge), which made `FailedCompactionLeavesNoOrphanOutputs` flaky; that test now triggers a
+  purge before comparing, and `PointReadReleasingTheLastReferenceLeavesCompactionInputsToTheNextPurge` pins the race.
+
+Public API:
+
+- Pooled public objects (`WriteBatch`, `WriteBatchWithIndex`, `PooledValue`): a stale second Dispose after the object was
+  rented again cleared the next renter's batch (or returned its buffer) while it was in use, losing its writes; two
+  Disposes without a rent in between handed the next renter a batch without a header. Each rent now returns a new
+  handle and only the inner state (rep buffer, index, value buffer) is pooled; Dispose takes it out once
+  (`Interlocked.Exchange`), later use throws ObjectDisposedException, a second Dispose does nothing, writing a disposed
+  batch throws instead of writing an empty batch. The engine's single-key writes use an internal pool never handed to
+  callers, so `db.Put` is unchanged. Cost (Release, bytes per operation): `WriteBatch.Rent` + Put + Dispose 0 -> 88,
+  WBWI 0 -> 152, `GetPooled` + Dispose 0 -> 32 (docs/allocations.md). No native counterpart (no pool; a C++ batch is
+  deleted once, rocksdb-sharp's Dispose is idempotent).
+- `DropColumnFamily`, `IngestExternalFiles` and `NewIterator` with another DB's column family handle: the drop went through
+  the wrong DB's MANIFEST and the memtables were released twice at close. Now InvalidArgument (C++: undefined behaviour).
+- Ingestion into a column family dropped during the ingestion's prepare: InvalidArgument "cannot ingest an external file
+  into a dropped CF" (`db_impl.cc`, IngestExternalFiles), was ColumnFamilyDropped.
+- A disposed `MultiGetBatch` ran as an empty batch; now ObjectDisposedException.
+
+Transactions:
+
+- TransactionDB direct writes on a column family with user timestamps: NotSupported (`FailIfCfEnablesTs`), was
+  InvalidArgument; WriteCommitted `Write(batch)` with timestamped keys: NotSupported (`FailIfBatchHasTs`), was unchecked.
+  Native: both NotSupported.
+- Transaction snapshots are released once neither the transaction nor a save point refers to them (C++: `shared_ptr`
+  with `ReleaseSnapshot` as deleter); before, every `SetSnapshot` stayed live until Dispose (100 calls, 100 snapshots).
+- A recovered prepared section with a DeleteRange / TimedPut / blob index fails the open with InvalidArgument
+  "DeleteRangeCF not implemented" etc. (the `WriteBatch::Handler` defaults reached by `RebuildFromWriteBatch`), was
+  NotSupported; every recovered transaction is disposed when one rebuild fails. Native: same message.
+
+Replication layer (reference: rocksdb-sharp):
+
+- `ProgressReporter`: a send failing with the transport's own OperationCanceledException (a call timeout) ended the loop
+  for good: a Raft leader could no longer commit that follower's entries, `WriteAck = Replica` answered NotReplicated,
+  archived WALs were never retired. Only the reporter's own token ends it now (rocksdb-sharp's hosts swallow any failure).
+- A cluster follower whose resync could not start (recording the log end failed) never followed a stable leader again;
+  it now re-attaches after the retry delay (rocksdb-sharp's `PerformResyncAsync` always ends with `EnsureFollowerStream`).
+- A resync whose close of the old database reported an error left the node "resyncing" for good; the close error is
+  logged and the restore goes on (native `rocksdb_close` reports nothing).
+
+### Upstream behaviour found (the port matches native unless noted)
+
+- LZ4 with a stored size of 0xFFFFFFFF: `LZ4_DecompressBlock` passes the size as int -1 and treats LZ4's -1 as success,
+  so native accepts 4 GiB of uninitialized memory as the block. The port returns Corruption. Not driven in-process by the
+  compat test (it crashed the test host).
+- Native aborts on footer handles with a 2^40 or wrapping size, and on a TimedPut WriteBatch record whose value is shorter
+  than 8 bytes (`ParsePackedValueWithWriteTime`, `std::length_error`); the port returns Corruption.
+- A backup restore whose deletion of a stale WAL in the destination fails reports success, and the next open replays
+  that WAL (`BackupEngineImpl::DeleteChildren` ignores errors). Port matches native (compat test with `chattr +i`).
+- Silent data loss without an error, in every recovery mode: a zeroed record header, a CRC-valid broken zstd WAL frame, a
+  removed or empty WAL, a whole record cut out (sequence gap). Port matches native.
+
+- Upstream issue drafts, each reproduced with a C API program against native 11.12 and checked unchanged on `main`
+  (`upstream-issues/`): 08 log reader hang on a recyclable type, 09 LZ4 size 0xFFFFFFFF accepted, 10 huge block handle
+  aborts the process, 11 short TimedPut value aborts every open, 12 restore ignores a failed stale-WAL delete, 13 WAL
+  records dropped without a report (a zeroed header mid-log leaves a hole; a CRC-valid broken zstd frame), 14
+  UserWriteCallback not exception safe (audit #8).
+
+### Open
+
+- `GetUpdatesSince` stopped below LastSequence ended with OK where native returns TryAgain. **Fixed in audit #11**
+  (see there).
+
+The port may be stricter than native when reading OPTIONS files, never less strict (project rule). Fixed to that rule:
+an empty `comparator=` is InvalidArgument "Missing configurable object" (`OptionTypeInfo::Prepare` / `Validate`, no
+kAllowNull); `blob_compression_opts` takes the legacy ':' form like `compression_opts` and rejects an empty or malformed
+value ("unable to parse the specified CF option", `cf_options.cc` ParseCompressionOptions); a malformed
+`file_checksum_gen_factory={` keeps the factory set earlier (native ignores it as unsupported). The compat fuzz
+`MutatedOptionsFileAcceptedOrRejectedLikeNative` fails only when native rejects and the port accepts (240 seeds x 3,000
+mutations: none). Stricter than native, accepted by the rule: a malformed Customizable struct (`compression_manager={`),
+escaped characters in struct field names (native unescapes the whole value first), unbalanced braces in struct values,
+dotted names (`comparator.`, `filter_policy.`, ...; `OptionTypeInfo::Find` maps the prefix), a bare `memtable`, `int`
+options whose value or k/m/g shift overflows (native wraps), stricter integers in
+`max_bytes_for_level_multiplier_additional`. Resulting option values are not compared (the C API cannot read most back).
+
+### Known deviations recorded by this audit
+
+- A malformed WriteBatch is validated before it is written to the WAL (native writes it, fails the memtable insert and
+  stops the DB with a background error; neither shows any of its keys).
+- New-WAL creation failure in SwitchMemtable is WAL-related (C++: not), so with manual_wal_flush a retryable error is fatal
+  instead of auto-recovered; `LogWriter.WriteBuffer` ignores the seen-error flag at close (native Close reports it);
+  DelayWrite with a hard error during a recovery throws at once (C++ waits); the shutdown flush is skipped with a
+  background error set (C++ attempts it and fails).
+- WriteUnprepared: a failed rollback of a started transaction keeps it (locks, unprep_seqs) for a retry; upstream
+  `Clear()`s it (read only, not drivable).
+- Replication: cancelling a write that waits on a held write gate throws OperationCanceledException (rocksdb-sharp:
+  false); `ReplicaFollower.FollowAsync` does not report its start position before its first chunk (a new replica is not
+  tracked for WAL retirement until then; recovers through a resync; not tested).
+- `db.NewIterator(foreignCf)` is InvalidArgument (C++: undefined behaviour). Ingestion into a column family dropped
+  before the call is ColumnFamilyDropped (main's `LogAndApply`); native 11.12 returns InvalidArgument.
+- IOError for a block offset above long.MaxValue carries no file name.
+
+### Verified
+
+- Mutation fuzz of block-based tables (format_version 2-8, every checksum type, every codec with and without a
+  dictionary, binary / hash / partitioned / first-key / trie indexes, data block hash index, separated key/value blocks,
+  all filter kinds, range deletions; sync, async and adaptive open; Get / MultiGet / iterators sync and async;
+  VerifyChecksum): only statuses escape, every operation terminates. Plain, cuckoo and blob file fuzz likewise; DB-level
+  fuzz with full checksums returns only correct values. Corrupt filter metadata reads as "may match" like native.
+- Differential WAL / MANIFEST damage against native (about 1,000-2,000 damaged copies per seed and row, four recovery modes,
+  legacy / recycled / zstd WALs) and 27 fixed damage scenarios, also read-only: same status and same recovered keys.
+  CURRENT variants, WriteBatch bytes (2,400+ mutated batches against native), VersionEdit decode fuzz, OPTIONS fuzz. A
+  failed open changes no file.
+- Transient I/O error sweep over every mutating file operation, four write modes, manual and automatic resume: no
+  acknowledged write lost after reopen. Close racing async writers, stalls, compactions and flushes: every call completes.
+  Canceled writes are all-or-nothing. Every call after close is ObjectDisposed. Failed compactions leave no orphan output.
+- API edge cases side by side with native: dropped column family handles, DeleteRange / CompactRange with reversed
+  bounds, open errors (missing DB, LOCK held, unlisted column family, error_if_exists), checkpoint into an existing
+  directory, SstFileWriter misuse, ingestion inputs, MultiGet with duplicate and empty keys, read-only and secondary
+  misuse.
+- Transaction state machines, save points (3000 nested), lock timeouts / cancellation / LockBatch failure, 2PC recovery
+  across reopens, optimistic conflicts, WBWI against a randomized model; backup and checkpoint with a fault at every
+  mutation; 40 random bit flips / truncations of backup files always Corruption on verify and restore.
+- Replication: plain follower against a transport that duplicates, loses and reorders chunks (each chunk applied once),
+  cancellation at chunk boundaries, GetUpdatesSince / WalTailer statuses, snapshot receiver validation, Raft term map and
+  log end durability, every catch block in Hosting / Switchover / Cluster.
+
+## Audit #8: the asynchronous implementation (2026-11-16)
+
+Four parallel reviews of the async side of the port: the async primitives and the write path; the read path and
+iterators; the file layer, background work and the async control APIs; transactions, utilities and the public async
+surface. Native RocksDB has no async API, so the reference for an async call is the port's sync path (one implementation
+for both, `synchronous: true`) and, below it, the C++ semantics of the operation; native was compared where it can
+observe the outcome. The reviews ran the sync and async APIs side by side on file systems whose async members really
+complete asynchronously (and out of order), under a deliberately exhausted thread pool, and on a single-threaded
+`SynchronizationContext`. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit8*`.
+
+### Fixed
+
+- Disposing an iterator while one of its async moves waited for a file read returned its pooled core immediately; the
+  next `NewIterator` rented it and the stale move then repositioned that unrelated iterator (k00300 -> k00305 in the
+  test). Pending async moves are now tracked (pooled, no cost when a move completes synchronously) and Dispose hands the
+  release to the move. A pending scan step then fails with ObjectDisposedException.
+- `ScanAsync` moved the inner DB iterator directly instead of going through the iterator core: no NUMBER_DB_SEEK / NEXT /
+  FOUND / ITER_BYTES_READ, no query tracing, and a tailing iterator was not renewed (after a flush ScanAsync missed writes
+  the sync `Range()` returns). Overlapping `MoveNextAsync` calls moved the iterator under a pending step; they now throw
+  InvalidOperationException, and `MoveNextAsync` after the enumeration's DisposeAsync returns false.
+- `GetAsync` restarted the table lookup synchronously for merge chains, counting block cache, filter and bytes-read
+  tickers twice (values were correct); it now uses the sync path's entry-visiting table lookup.
+- Close hung behind writes stalled by a shared `WriteBufferManager` (allow_stall): close released the first stalled
+  write, the next queued writer stalled again, and the stall loop did not observe the closing flag. It now leaves the
+  queue with ObjectDisposedException, as `DelayWrite` does (C++: DelayWrite stops at shutting_down_).
+- Dispose could block up to 35 s on a starved thread pool: the private SstFileManager's delete scheduler and the info LOG
+  writer waited for their thread-pool tasks. Dispose now waits only for a deletion in progress and drains the LOG queue
+  itself (C++ CloseHelper joins only the DB's own threads).
+- A cancelled MANIFEST write (`CreateColumnFamilyAsync`, `DropColumnFamilyAsync`, `SetOptionsAsync`) could leave the change
+  committed in the MANIFEST while the caller saw OperationCanceledException; the OPTIONS write and WAL switch after a
+  commit honoured the token too. The token now only bounds the wait for the MANIFEST writer slot; post-commit steps use
+  no token (C++ `LogAndApply` cannot be interrupted).
+- Range locks: a lock granted while its waiter was being cancelled was kept in the lock tree but never tracked by the
+  transaction, so it was never released. The grant now stands (as on the point-lock path).
+- Lock timeouts beyond int.MaxValue ms (`TimeSpan.MaxValue`, a far holder expiration) threw ArgumentOutOfRangeException
+  from the point lock manager and the default custom mutex; sync and async also diverged between 24.8 and 49.7 days.
+  Waits are now stepped (C++ `AcquireWithTimeout` / `TryLockFor` take any int64).
+- Async writes counted IOSTATS bytes_written twice on file systems without RWF_NOWAIT buffered writes (ext4);
+  `Sync()` and `SyncAsync()` on a closed file threw different exceptions; the OpenAsync documentation claimed asynchronous
+  recovery reads.
+
+- A user `UserWriteCallback` whose `OnWriteEnqueued` or `OnWalWriteFinish` throws left its writer linked in the write
+  queue: every later write and Dispose hung. Upstream calls these void, non-noexcept callbacks with no exception safety
+  (`WriteThread::JoinBatchGroup`: `LinkOne`, then `CheckWriteEnqueuedCallback()`), so a throw is undefined behaviour there.
+  **Deliberate deviation** (decided by the maintainers): the exception is recorded on the writer, the writer completes its
+  group normally (the other writers get their own outcome), then the DB sets a hard background error (Aborted,
+  `BackgroundErrorReason.WriteCallback`, no auto-recovery; managed-only `ErrorHandler.SetHardBgError`, because upstream's
+  severity maps make every WriteCallback / MemTable status fatal) and the caller gets the original exception. Later writes
+  fail until `Resume()`; the throwing write's outcome is indeterminate (documented). Before, a throwing `OnWalWriteFinish`
+  also failed every writer of its group after their WAL record was written. `ThrowingUserWriteCallbackFailsSafely`: 40
+  rows (5 write modes x both callbacks x leader / follower x sync / async). Upstream issue draft in
+  `upstream-issues/`.
+
+### Open
+
+- A sync writer queued behind an async write leader waits for the leader's thread-pool continuation (async WAL I/O,
+  stall waits); with the pool full of sync writers a capped pool deadlocks and the default pool stalls until it injects
+  threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`. **Decision (2026-11-17): not fixed;
+  documented as a usage rule** (README, architecture.md, `RocksDatabase` remarks: do not mix the sync and async API on
+  one database). The sync write methods are expected to be deprecated and removed.
+- `AsyncPrefetchBuffer.TakePending` blocked a compaction thread (or a sync CompactRange / scan) on a read continuation
+  that needs a pool thread when the file system has no `Prefetch`. **Fixed in audit #11** (synchronous readahead).
+
+### Known deviations recorded by this audit
+
+- NUMBER_SUPERVERSION_ACQUIRES / RELEASES differ between sync and async (the per-processor slot is held across an await);
+  FILE_READ_*_MICROS histograms, PerfContext timers and async read bytes_read are thread-local and not recorded (or
+  under-counted) for reads that complete on another thread.
+- GetAsync and async iterator moves do not apply `ReadOptions.Deadline` (documented); entity blob columns, the pessimistic
+  snapshot check, the optimistic commit check and backup's session-id read use synchronous I/O inside async calls.
+- Disposing an iterator whose sync moves left an async_io readahead in flight waits for the read (C++: AbortIO).
+- Queued and follower writers ignore their CancellationToken (documented); a cancelled delayed leader still consumed its
+  write-controller delay; cancelled rate-limiter waiters keep their bytes charged.
+- `CancelAllBackgroundWorkAsync(bool)` and `ResumeAsync()` take no CancellationToken (upstream has none);
+  `TryGetForUpdateAsync` rejects a null value buffer where the sync form accepts it; `TransactionDatabase` has no
+  `SingleDeleteAsync` and WriteBatchWithIndex no async GetFromBatchAndDB.
+
+### Verified
+
+- Sync/async parity, seeded: writes in all five write modes (statuses, sequence numbers, tickers, contents, invalid
+  writes), point reads and MultiGet across 13 ReadOptions variants over memtable + L0 + deeper levels with merges, range
+  deletions, entities and blob values, iterator moves incl. randomly mixed sync/async moves, ScanAsync vs Range(),
+  transactions (WriteCommitted / WritePrepared / WriteUnprepared, optimistic), backup / restore / checkpoint directories,
+  WAL tailing, control APIs (same DB files after the same program).
+- The sync API never reaches an async file member (no `SyncValueTask` fallback), also from the background work it
+  triggers. With the thread pool exhausted, sync Open / Put / Flush / CompactRange / WaitForCompact / Get / iteration /
+  Dispose progress.
+- No deadlock on a single-threaded SynchronizationContext (sync calls on the context thread, async calls awaited on it,
+  incl. a lock wait released by a sync commit); every await in the library uses ConfigureAwait (except the deliberate
+  `BackgroundThreadPool.SwitchTo`); no AggregateException escapes.
+- Cancellation: async reads cancelled while waiting for I/O leave nothing pinned and pooled objects reusable; canceled
+  writes are all-or-nothing; FlushAsync / CompactRangeAsync / WaitForCompactAsync cancellation strands nothing;
+  DisposeAsync racing them releases everyone; point-lock cancellation cleans the wait-for graph; backup cancelled
+  mid-copy is garbage-collected.
+- Mixed sync/async write groups, a failed insert reaching every writer once, async writers never resumed on a sync
+  leader's thread; concurrent sync and async MANIFEST writers; FileSyncWorkers (800 concurrent offloaded syncs, each
+  completed once, shared across DBs); async moves and scans allocate nothing in Release.
+- Public async surface inventory (300 methods): every one takes a CancellationToken and has a sync counterpart, except
+  listed and justified cases; the test fails on any change.
+
+## Audit #9: opening and closing the DB (2026-11-16)
+
+A dedicated review of the open and close sequences against `db_impl_open.cc` (DB::Open, Recover, RecoverLogFiles,
+SetupDBId, WriteOptionsFile, DeleteObsoleteFiles at open), `db_impl.cc` (Close / CloseHelper / ~DBImpl),
+`db_impl_readonly.cc`, `db_impl_secondary.cc` and `destroy_db.cc`, with native 11.12 compared side by side where the C API
+reaches. Tests: `tests/RocksDb.Managed.Tests/Validation/Audit9OpenCloseTests.cs`,
+`tests/RocksDb.Managed.CompatTests/Audit9/`.
+
+### Fixed
+
+- A second Dispose made while a close was running returned at once, before the first close released the LOCK: a thread
+  that disposed and reopened got "lock ... already held by process" (sync and async). Now as `DBImpl::Close` /
+  `~DBImpl` holding `closing_mutex_`: later closes wait for the running one (except a close from OnErrorRecoveryEnd raised
+  by the recovery task the running close waits for); a close that failed before taking over the DB can be retried; the
+  losing writer is returned to the pool; column family handle deletion is notified once. Native: concurrent `delete db`
+  is undefined behaviour, argued from the source.
+- An unexpected exception from the auto-recovery task escaped Close before anything was closed (e.g.
+  `bgerror_resume_retry_interval = ulong.MaxValue` overflowed `TimeSpan`), leaving the LOCK and every file open. The
+  interval is clamped to Task.Delay's maximum, the close tolerates any recovery-task failure (C++ CloseHelper:
+  `CancelErrorRecoveryForShutDown`, then waits for `ReadyForShutdown`), and shutdown-flush I/O errors no longer stop a
+  close (C++ logs "Shutdown flush failed").
+- IDENTITY handling now follows `SetupDBId`: an IDENTITY that does not match the MANIFEST's db id is rewritten, an empty
+  one gets a new id, and a read-only open generates an id without writing. Native (`rocksdb_get_db_identity`): same in
+  all three cases.
+- Opening a missing DB without create_if_missing: InvalidArgument "<db>/CURRENT: does not exist (create_if_missing is
+  false)", native's message.
+- The retry delay of a flush rescheduled to retain user-defined timestamps observes close (upstream also waits 100 ms
+  inside the job; hardening).
+
+### Known deviations recorded by this audit
+
+- A missing column family without create_missing_column_families fails before recovery; native recovers first and
+  leaves a new WAL, MANIFEST and flushed SST behind. Opening while the LOCK is held leaves the running DB's LOG alone
+  (native renames it to LOG.old, its logger is created before LockFile). Opening a missing directory without
+  create_if_missing creates nothing (native creates the directory, LOG and LOCK). A leftover `OPTIONS-*.dbtmp` is deleted
+  at open (native keeps it). A secondary writes no info LOG. A failed OPTIONS persist at open is the raw IOError (native
+  wraps the message, same code).
+- No public `Close()` returning Aborted for unreleased snapshots: Dispose behaves like `~DBImpl` / `rocksdb_close`.
+
+### Verified
+
+- Crash during open: power loss, process kill with a torn last write, and a single transient failure at every mutating
+  file operation of an open (and of the close after it) in 12 scenarios (replay and flush, avoid_flush_during_recovery,
+  flushes during replay, partly flushed column families, create_missing_column_families, WAL recycling, separate
+  wal_dir, track_and_verify_wals_in_manifest, after a process kill, best-efforts recovery, new DB, MANIFEST roll): the DB
+  reopens twice with exactly the durable writes, nothing resurrected, the same DB id, every handle and the LOCK released.
+- Crash during close in 6 scenarios (unflushed memtables, manual_wal_flush, shutdown flush of disableWAL writes,
+  avoid_flush_during_shutdown, a pending compaction, a dropped column family purged at close): synced and flushed writes
+  survive, the state is a prefix of the issued writes, unlogged writes are all or nothing.
+- TransactionDB open crash sweep (WriteCommitted, WritePrepared): committed transactions survive, the prepared one is
+  recovered as prepared.
+- Against native: the files left after open/close sequences (LOG.old rotation, MANIFEST, 2 OPTIONS kept, WALs kept or
+  flushed, SSTs), info log trimming, the last sequence number after every reopen, a fresh db_session_id per open, cleanup
+  of leftover files at open, failed opens (unlisted column family, error_if_exists, LOCK held) leaving the same files.
+- Read-only open and close perform zero mutating file operations; a secondary follows MANIFEST rotations and its close
+  deletes nothing of the primary's; Dispose with an outstanding snapshot, iterator and transaction closes like `~DBImpl`.
+
+## Audit #10: user customization points (2026-11-16)
+
+Two reviews of the features where user code plugs into the engine: read side (prefix extractors / SliceTransform,
+comparators, filter policies, read callbacks) and write side (merge operators, compaction filters and factories, table
+properties collectors, SST partitioners, WAL filters, event listeners, file checksum generators, compaction services).
+For each hook: the header contract and the engine code that calls it were read against the C++; where the C API can
+plug the same callback (custom comparator, slice transform, merge operator, compaction filter and factory, table
+filter), the same C# callback ran on native 11.12 and on the port over seeded workloads (puts, merges, deletes, range
+deletions, snapshots, flushes, compactions, reopen, with the engines swapping directories at reopen), comparing every
+read and the recorded table properties; and each hook was made to throw. Tests:
+`tests/RocksDb.Managed.Tests/Validation/Audit10*`, `tests/RocksDb.Managed.CompatTests/Audit10/` (`AUDIT10_SEED` replays).
+
+Rule for throwing user code (upstream: undefined behaviour): a foreground call (Get, MultiGet, iterator moves, read
+delegates) surfaces the exception to its caller and releases what it pinned; a background job (flush, compaction, a
+memtable insert) fails like an I/O error of that job (classified as upstream's DefaultErrorSeverityMap; fatal with
+paranoid_checks), leaves no orphan file and keeps the data intact for a reopen; nothing hangs. Each hook's XML docs
+now say so.
+
+### Fixed
+
+- A user comparator override of `FindShortestSeparator` / `FindShortSuccessor` that writes nothing produced an empty
+  separator; upstream's contract (`comparator.h`: "an implementation of this method that does nothing is correct") keeps
+  the key. With a reverse-order comparator the empty key became an index entry: the first lookup after a flush returned
+  nothing, and the native differential hung. Now an empty result keeps the key (`InternalKeyComparator.ShortenInternalKey`,
+  one length check). Native comparators created through the C API do nothing there; the differential now matches.
+- A flush with an inconsistent comparator failed with InvalidArgument (fatal); upstream's `OutputValidator` gives
+  Corruption "Compaction sees out-of-order keys." (unrecoverable). Same message and code as native now.
+- `ReadOptions::table_filter` was not ported: `ReadOptions.TableFilter` (iterators only, range tombstones of skipped
+  tables kept, InvalidArgument with `min_tombstones_for_range_conversion > 0`), matching native.
+- A throwing `SstPartitioner.CanDoTrivialMove` / `CreatePartitioner` escaped inside a flush's MANIFEST commit
+  (`EnoughRoomForCompaction` under the mutex): with paranoid_checks off `Flush()` never returned, with it on a committed
+  flush was reported as a fatal error. The failure is now recorded and fails only the compaction that asked.
+- A throwing `FileChecksumGenFactory` left an orphan table file; a throwing `CompactionService.OnInstallation` left the
+  worker's outputs in the DB directory. Both now delete what they created.
+- Compaction filter factories could not tell a flush from a WAL-recovery flush: new
+  `ShouldFilterTableFileCreation(TableFileCreationReason)` (default delegates to the bool overload) and
+  `CompactionFilterContext.Reason` / `InputStartLevel`, as `BuildTable` / `Compaction::CreateCompactionFilter`.
+
+### Upstream behaviour found
+
+- Native 11.12 crashes (SIGSEGV) when a DB with merge operands in table files is opened without a merge operator and a
+  read merges an operand with an older value or runs backwards: Get / MultiGet of a key whose operand is above an older
+  base value (`GetContext::SaveValue` only asserts the operator), Prev / SeekForPrev (`DBIter::FindValueForCurrentKey`
+  only asserts it). Forward iteration and keys with operands only return InvalidArgument. The port returns InvalidArgument
+  in every case. Upstream issue draft 15. (Operands only in the WAL cannot crash: replay stops at the first Merge record,
+  which upstream reports as a corrupted record, so under PointInTime recovery later writes are dropped.)
+- With prefix_same_as_start and a seek target outside the extractor's domain upstream falls back to a legacy prefix seek
+  (undefined behaviour; native returned an older version at a snapshot); the port returns the total-order result.
+
+### Open
+
+- `input_table_properties`, `ShouldMerge`, `max_successive_merges`, the subcompaction / file I/O listener callbacks and the
+  custom filter reader under the built-in name: **implemented in audit #11**. No native EventListener differential beyond
+  flush / compaction / subcompaction (the C API exposes no other callbacks).
+- The output of a failed background compaction may stay on disk until the next open (not live; unconfirmed).
+
+### Verified
+
+- Prefix extractors: built-ins line by line with `util/slice.cc`; a custom variable-length extractor with out-of-domain
+  and empty keys against native through memtable prefix bloom, SST and partitioned filters, optimize_filters_for_hits,
+  prefix_same_as_start, auto_prefix_mode, total-order seeks, snapshots, range deletions, cross-engine reopen; an extractor
+  changed between opens and through SetOptions (filters of other extractors skipped, reads correct).
+- Comparators against native (separator shortening with 256-byte blocks, range tombstones, compaction, cross-engine
+  reopen, recorded name); filter policies recorded by name, a changed policy read without its filter.
+- Merge operators against native: partial-merge groupings in flush and compaction, failing merges (reads Corruption,
+  flush / compaction unrecoverable, WAL replay Corruption), a missing or renamed operator on reopen. Compaction filters
+  and factories against native (Remove, ChangeValue, empty value, snapshots, merges, range tombstones, factory context);
+  kPurge, kRemoveAndSkipUntil, operand removal, one filter per subcompaction.
+- Table properties collectors end to end (contexts for flush / compaction / SstFileWriter, entry types, user properties
+  across reopen, NeedCompact marking); file checksum functions changing between opens; a throwing WAL filter fails the
+  open without changing the DB; throwing listeners are contained.
+
+## Audit #11: unported features, row cache with ShouldMerge, GetUpdatesSince, readahead (2026-11-17)
+
+Features ported (each against the cited C++, with native differentials where the C API reaches):
+
+- `MergeOperator.ShouldMerge` (merge_operator.h; called from `HandleTypeMerge` in the memtable and `GetContext::SaveValue`
+  only): point lookups (Get, MultiGet, GetEntity, KeyMayExist, row-cache replay, the DB part of transaction and WBWI
+  reads) stop and merge without a base once it returns true; operands newest first; iterators, flush, compaction and
+  GetMergeOperands ignore it. Default costs nothing (override detected once). Port of `LimitMergeOperands`. No C API hook.
+- `max_successive_merges` / `strict_max_successive_merges` (were accepted and ignored): `MemTableInserter::MergeCF` folds
+  a key's operands into a Put at the write's sequence once the memtable holds the limit (block-cache-only read unless
+  strict; not during WAL replay or concurrent inserts). Native differential (400-step seeded workloads, limits 1-3,
+  strict on/off, directories swapped at reopen): equal reads and equal merge-operator call counts after every step.
+- `CompactionFilterContext.InputTableProperties` (compaction_filter.h; `Compaction::GetInputTableProperties`): from the
+  compaction's already-open table readers, once per compaction; empty for flushes and on error.
+- A custom filter policy under the built-in compatibility name now gets its own reader (`parsed_full_filter_block.cc`
+  calls `GetFilterBitsReader`); built-in policies return the same reader as before. No combination is rejected:
+  delegating wrappers (upstream's `LevelAndStyleCustomFilterPolicy`) work both ways with native-written filters.
+- Listener callbacks: `OnSubcompactionBegin/Completed` (`SubcompactionJobInfo`, input-side stats as native),
+  `OnCompactionPreCommit`, `OnTableFileCreationStarted`, `OnManualFlushScheduled`, blob file creation / deletion,
+  the deprecated `OnErrorRecoveryCompleted`, and file I/O (`ShouldBeNotifiedOnFileIO`, `OnFile*Finish`, `OnIOError`) on
+  upstream's sites (table, blob, WAL, MANIFEST). Zero cost without a file-I/O listener (Put / Get within noise, no
+  allocation); with one, Put about 18% and Get about 8% slower. Native (C API listener): identical flush / compaction /
+  subcompaction sequences, reasons, ids and per-subcompaction input counts. Not ported: `OnBackgroundJobPressureChanged`
+  (experimental), blob direct-write creation events, SstFileWriter / SstFileReader file I/O (no listener list).
+
+Fixed:
+
+- Row cache + ShouldMerge returned wrong data (also upstream, reproduced on native 11.12; draft 16): a lookup that
+  ShouldMerge ended inside a file cached that file's entries so far as the whole entry; a later snapshot read replayed
+  the truncated entry and merged an older, overwritten value ("old,b" instead of "base,a,b"; also MultiGet, GetEntity,
+  GetMergeOperands). Such a lookup is no longer row-cached. Randomized row-cache-on vs off comparison (25 x 400 steps).
+- GetUpdatesSince ends with TryAgain ("Create a new iterator to fetch the new tail.") when its WALs end below
+  LastSequence, after following a rotation once, as native; caught-up ends with OK. **Deviation**: `Next()` after
+  TryAgain retries (native's iterator is spent), because reopening rescans the WAL from its start; a new iterator works
+  too. New `SkippedCorruptBytes` / `SkippedCorruptionReason` report what the reader dropped. `WalTailer` escalates to
+  NotFound (the hosts resync) when the DB is ahead, the iterator cannot advance and data was dropped (once more after a
+  reopen); unlogged writes (DisableWal, ingestion, manual_wal_flush) never trigger it. Native comparison of every run
+  end; the replica resyncs past a damaged primary WAL record.
+- Compaction input readahead and the implicit auto-readahead fallback use one synchronous buffer when the file system
+  has no `Prefetch` (block_prefetcher.cc: `num_buffers = is_async_io_prefetch ? 2 : 1`), so compaction, output
+  verification and sync scans never wait for a thread-pool read continuation. Same bytes and read counts; throughput
+  neutral. Remaining opt-in wait, as upstream: a sync iterator with `ReadaheadSize > 0` and `AsyncIo`.
+
+Open:
+
+- WAL tailer edge cases (fixed 2026-11-17): a fresh tailer whose start is still in the manual_wal_flush buffer of an
+  empty current WAL waits instead of a false NotFound (`RocksDatabase.CurrentWalBaseSequence`; native's listing also
+  skips empty WALs, wal_manager.cc, and its GetUpdatesSince returns an OK, not-valid iterator); damage inside a recycled
+  WAL (log_reader.cc ends a recycled log at a bad checksum with no report) and a record length past the written end
+  (the tailing reader waits for more data) are detected by comparing where the reader stopped with the writer's flushed
+  record end (`LogWriter.FlushedRecordEnd`, kept for alive WALs of this DB instance) and reported through
+  `SkippedCorruptBytes`, so the tailer escalates to a resync. Native ends these runs with TryAgain (compared); the
+  detection exists only in the port. Limits: WALs written by an earlier instance, or no longer alive, have no mark
+  (only bytes the reader dropped count; the gap check catches the rest on the next logged write).
+- Row cache: with `ShouldMerge` and a row cache, lookups that ShouldMerge ends inside a file read the table every time.

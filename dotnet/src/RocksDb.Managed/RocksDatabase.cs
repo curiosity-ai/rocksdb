@@ -17,6 +17,13 @@ namespace RocksDb.Managed;
 /// breaks namespace-qualified references (<c>RocksDb.Managed.X</c>) inside the <c>RocksDb.Managed.*</c> namespaces.
 /// </para>
 /// Thread-safe. Dispose (preferably <see cref="DisposeAsync"/>) to close it and release the LOCK file.
+/// <para>
+/// Use either the synchronous or the asynchronous API on one database, not both. Writes are group-committed: a sync
+/// writer blocks its thread until the group's leader finishes; when that leader is an async writer whose I/O or stall
+/// wait completes asynchronously, the leader continues on the .NET thread pool, so sync writers that occupy pool threads
+/// can starve it (stalls until the pool injects threads, deadlock under a capped pool). The sync write methods may be
+/// deprecated in a future version; prefer the async API.
+/// </para>
 /// </summary>
 public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
 {
@@ -36,6 +43,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     private readonly ColumnFamily _default;
     private readonly Dictionary<uint, ColumnFamily> _handles = new();
     private readonly Lock _handlesLock = new();
+    private int _handlesReleased;
 
     private RocksDatabase(DbImpl db)
     {
@@ -75,7 +83,11 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken = default) =>
         OpenAsync(path, options, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, defaultColumnFamilyOptions)], cancellationToken);
 
-    /// <summary>Async <see cref="Open(string, DbOptions, IReadOnlyList{ColumnFamilyDescriptor})"/>: recovery reads and writes asynchronously.</summary>
+    /// <summary>
+    /// Async <see cref="Open(string, DbOptions, IReadOnlyList{ColumnFamilyDescriptor})"/>: the files the open writes (recovery
+    /// flushes, MANIFEST, OPTIONS) are written asynchronously; the MANIFEST and the WALs are read with blocking reads on the
+    /// calling thread. Cancellation is not observed while the new MANIFEST is written.
+    /// </summary>
     public static async ValueTask<RocksDatabase> OpenAsync(string path, DbOptions options, IReadOnlyList<ColumnFamilyDescriptor> columnFamilies,
         CancellationToken cancellationToken = default)
     {
@@ -172,6 +184,9 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public void DropColumnFamily(ColumnFamily columnFamily)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        // A handle of another DB would be dropped through this DB's MANIFEST and write thread (upstream: undefined
+        // behaviour, the handle is static_cast to ColumnFamilyHandleImpl).
+        CheckOwnColumnFamily(columnFamily);
         SyncValueTask.GetResult(_db.DropColumnFamilyAsync(columnFamily.Data, synchronous: true, CancellationToken.None));
         ReleaseHandle(columnFamily);
     }
@@ -190,7 +205,8 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// <summary>Close: every remaining handle is released (OnColumnFamilyHandleDeletionStarted).</summary>
     private void ReleaseAllHandles()
     {
-        if (!_db.HasListeners || _db.IsDisposed) return;
+        // Once, even with concurrent closes (each handle is deleted once upstream).
+        if (!_db.HasListeners || _db.IsDisposed || Interlocked.Exchange(ref _handlesReleased, 1) != 0) return;
         List<ColumnFamily> handles;
         lock (_handlesLock) handles = new List<ColumnFamily>(_handles.Values);
         foreach (ColumnFamily h in handles) _db.NotifyOnColumnFamilyHandleDeletionStarted(h);
@@ -200,6 +216,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public async ValueTask DropColumnFamilyAsync(ColumnFamily columnFamily, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         await _db.DropColumnFamilyAsync(columnFamily.Data, synchronous: false, cancellationToken).ConfigureAwait(false);
         ReleaseHandle(columnFamily);
     }
@@ -208,12 +225,16 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     // Batches, snapshots, flush, properties
     // =====================================================================================================
 
-    /// <summary>A pooled, empty write batch; disposing it returns it to the pool.</summary>
+    /// <summary>
+    /// An empty write batch whose buffer comes from a pool (<see cref="WriteBatch.Rent"/>); disposing it returns the buffer.
+    /// After Dispose the batch throws <see cref="ObjectDisposedException"/>; a second Dispose does nothing.
+    /// </summary>
     public WriteBatch CreateWriteBatch() => WriteBatch.Rent();
 
     /// <summary>
-    /// A pooled, empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> (<see cref="WriteBatchWithIndex.Rent()"/>);
-    /// disposing it returns it to the pool.
+    /// An empty, bytewise-ordered <see cref="WriteBatchWithIndex"/> whose index state and buffer come from pools
+    /// (<see cref="WriteBatchWithIndex.Rent()"/>); disposing it returns them, and the batch throws
+    /// <see cref="ObjectDisposedException"/> afterwards.
     /// </summary>
     public WriteBatchWithIndex CreateWriteBatchWithIndex() => WriteBatchWithIndex.Rent();
 
@@ -247,6 +268,11 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     /// order concurrent writers. Port of DB::WriteWithCallback(options, updates, user_write_cb). Not supported
     /// (NotSupported) on WritePrepared / WriteUnprepared transaction DBs.
     /// </summary>
+    /// <remarks>
+    /// When a method of <paramref name="callback"/> throws, this call rethrows that exception once the write group is
+    /// done, the outcome of the write is indeterminate (it may have been committed), and writes fail with a hard
+    /// <see cref="BackgroundError"/> until <see cref="Resume"/> (see <see cref="UserWriteCallback"/>).
+    /// </remarks>
     public void WriteWithCallback(WriteOptions? options, WriteBatch batch, UserWriteCallback callback) =>
         SyncValueTask.GetResult(_db.WriteWithCallbackAsync(options, batch, callback, synchronous: true, CancellationToken.None));
 
@@ -375,6 +401,7 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     public Iterator NewIterator(ColumnFamily columnFamily, ReadOptions? options)
     {
         ArgumentNullException.ThrowIfNull(columnFamily);
+        CheckOwnColumnFamily(columnFamily);
         return columnFamily.NewIterator(options);
     }
     /// <summary>Creates an iterator over the default column family; table files are opened asynchronously.</summary>
@@ -522,7 +549,13 @@ public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
     // Close
     // =====================================================================================================
 
-    /// <summary>Closes the DB (DB::Close): waits for writes and background flushes, closes the WAL/MANIFEST, releases LOCK.</summary>
+    /// <summary>
+    /// Closes the DB (DB::Close): waits for writes and background flushes, closes the WAL/MANIFEST, releases LOCK.
+    /// Every later call throws <see cref="ObjectDisposedException"/> (closing again does nothing); calls racing the close
+    /// (queued or stalled writes, Flush, CompactRange) fail with <see cref="ObjectDisposedException"/> or ShutdownInProgress.
+    /// An error writing out the WAL's buffer or verifying the MANIFEST is thrown once the close has finished: the DB is
+    /// closed either way.
+    /// </summary>
     public void Dispose()
     {
         ReleaseAllHandles();

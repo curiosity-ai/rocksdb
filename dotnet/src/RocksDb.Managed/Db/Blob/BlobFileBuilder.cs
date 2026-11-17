@@ -5,14 +5,6 @@ using RocksDb.Managed.Util;
 
 namespace RocksDb.Managed.Db.Blob;
 
-/// <summary>BlobFileCreationReason (include/rocksdb/listener.h).</summary>
-internal enum BlobFileCreationReason : byte
-{
-    Flush = 0,
-    Compaction = 1,
-    Recovery = 2,
-}
-
 /// <summary>
 /// Writes values of at least <c>min_blob_size</c> bytes to blob files and returns blob indexes for them. Port of
 /// rocksdb::BlobFileBuilder (db/blob/blob_file_builder.cc) and BlobLogWriter (db/blob/blob_log_writer.cc).
@@ -40,8 +32,10 @@ internal sealed class BlobFileBuilder : IDisposable
     private readonly byte[] _header = new byte[Math.Max(BlobLogFormat.HeaderSize, BlobLogFormat.FooterSize)];
     private readonly byte[] _recordHeader = new byte[BlobLogFormat.RecordHeaderSize];
 
+    private readonly BlobFileCreationReason _reason;
     private IWritableFile? _file;
     private ulong _fileNumber;
+    private Exception? _failure; // the last failure of a write to the open file (the status Abandon reports)
     private ulong _blobCount;
     private ulong _blobBytes;
 
@@ -69,10 +63,23 @@ internal sealed class BlobFileBuilder : IDisposable
         }
         _warmCache = options.PrepopulateBlobCache == PrepopulateBlobCache.FlushOnly && reason == BlobFileCreationReason.Flush;
         _cacheTarget = blobSource;
+        _reason = reason;
         _columnFamilyId = columnFamilyId;
         _stats = stats;
         _fileOptions = fileOptions;
     }
+
+    /// <summary>
+    /// The DB whose listeners are told about the blob files (BlobFileCompletionCallback: OnBlobFileCreationStarted /
+    /// OnBlobFileCompleted -> OnBlobFileCreated), or null.
+    /// </summary>
+    internal DbImpl? Events { get; init; }
+
+    /// <summary>The column family's name (column_family_name_), for the listener events.</summary>
+    internal string ColumnFamilyName { get; init; } = "";
+
+    /// <summary>The flush or compaction job id (job_id_), for the listener events.</summary>
+    internal int JobId { get; init; }
 
     /// <summary>Blob files written successfully (finished), in creation order.</summary>
     public List<BlobFileAddition> Additions { get; } = new();
@@ -98,6 +105,19 @@ internal sealed class BlobFileBuilder : IDisposable
     public bool Add(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value, IBufferWriter<byte> blobIndex)
     {
         if (value.IsEmpty || (ulong)value.Length < _minBlobSize) return false;
+        try
+        {
+            return AddCore(userKey, value, blobIndex);
+        }
+        catch (Exception e)
+        {
+            _failure = e;
+            throw;
+        }
+    }
+
+    private bool AddCore(ReadOnlySpan<byte> userKey, ReadOnlySpan<byte> value, IBufferWriter<byte> blobIndex)
+    {
         OpenBlobFileIfNeeded();
         ReadOnlySpan<byte> blob = value;
         if (_compression != CompressionType.None)
@@ -120,7 +140,16 @@ internal sealed class BlobFileBuilder : IDisposable
     /// <summary>BlobFileBuilder::Finish: closes the open blob file, if any.</summary>
     public void Finish()
     {
-        if (_file is not null) CloseBlobFile();
+        if (_file is null) return;
+        try
+        {
+            CloseBlobFile();
+        }
+        catch (Exception e)
+        {
+            _failure = e;
+            throw;
+        }
     }
 
     /// <summary>BlobFileBuilder::Abandon: drops the open blob file without a footer (the caller deletes the files).</summary>
@@ -130,6 +159,10 @@ internal sealed class BlobFileBuilder : IDisposable
         try { _file.Dispose(); }
         catch (Exception e) when (e is IOException or RocksDbException) { }
         _file = null;
+        // BlobFileBuilder::Abandon(s): OnBlobFileCompleted with the failure (upstream: the status the job failed with;
+        // here the failure of this builder's own write, else Aborted).
+        Events?.NotifyOnBlobFileCreated(ColumnFamilyName, JobId, BlobFilePath(_fileNumber), _reason, _blobCount, _blobBytes,
+            _failure ?? new RocksDbException(StatusCode.Aborted, "Operation aborted: Blob file abandoned"), [], "");
         _blobCount = 0;
         _blobBytes = 0;
     }
@@ -150,6 +183,8 @@ internal sealed class BlobFileBuilder : IDisposable
         if (_file is not null) return;
         ulong number = _newFileNumber();
         string path = BlobFilePath(number);
+        // OpenBlobFileIfNeeded: blob_callback_->OnBlobFileCreationStarted before the file is created.
+        Events?.NotifyOnBlobFileCreationStarted(ColumnFamilyName, JobId, path, _reason);
         // Recorded right after the open so a failed job can clean it up (output_file_paths_).
         CreatedFileNumbers.Add(number);
         _file = FileChecksumHelper.CreateWritable(_fs, path, _fileOptions);
@@ -210,6 +245,8 @@ internal sealed class BlobFileBuilder : IDisposable
         _stats?.RecordTick(Ticker.BlobDbBlobFileBytesWritten, BlobLogFormat.FooterSize);
         _stats?.RecordTick(Ticker.BlobDbBlobFileSynced);
         Additions.Add(new BlobFileAddition(_fileNumber, _blobCount, _blobBytes, method, checksum));
+        // CloseBlobFile: blob_callback_->OnBlobFileCompleted(..., s, checksum_value, checksum_method, blob_count_, blob_bytes_).
+        Events?.NotifyOnBlobFileCreated(ColumnFamilyName, JobId, BlobFilePath(_fileNumber), _reason, _blobCount, _blobBytes, null, checksum, method);
         _blobCount = 0;
         _blobBytes = 0;
     }

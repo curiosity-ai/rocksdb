@@ -39,6 +39,12 @@ internal enum FaultOps
     Rename = 8,
     SyncDirectory = 16,
     All = Create | Append | Sync | Rename | SyncDirectory,
+    /// <summary>Closing a writable file: the handle is released, then the error is reported (a failed close(2)). Not in <see cref="All"/>.</summary>
+    Close = 32,
+    /// <summary>Writing out a writable file's buffer (Flush). Not in <see cref="All"/>.</summary>
+    Flush = 64,
+    /// <summary>File deletions (not part of <see cref="All"/>).</summary>
+    Delete = 128,
 }
 
 /// <summary>
@@ -289,6 +295,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
     public void DeleteFile(string path)
     {
+        CheckTargeted(path, FaultOps.Delete);
         Mutate("delete", path);
         Inner.DeleteFile(path);
     }
@@ -391,6 +398,7 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
 
         public void Flush()
         {
+            fs.CheckTargeted(path, FaultOps.Flush);
             if (fs.Tick("flush", path)) throw fs.InjectedError();
             inner.Flush();
         }
@@ -435,12 +443,20 @@ internal sealed class FaultInjectionFileSystem : IFileSystem
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             Interlocked.Decrement(ref fs._openFiles);
             inner.Dispose();
+            fs.CheckTargeted(path, FaultOps.Close);
         }
 
         public ValueTask DisposeAsync()
         {
             if (Volatile.Read(ref _disposed) == 0) fs.OnAsyncWrite?.Invoke("DisposeAsync", path);
-            Dispose();
+            try
+            {
+                Dispose();
+            }
+            catch (Exception e)
+            {
+                return ValueTask.FromException(e);
+            }
             return ValueTask.CompletedTask;
         }
     }

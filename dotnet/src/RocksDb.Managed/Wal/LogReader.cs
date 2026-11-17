@@ -494,8 +494,14 @@ public sealed class LogReader : IDisposable
                 headerSize = LogFormat.RecyclableHeaderSize;
                 if (_firstRecordRead && !_recycled)
                 {
-                    // A recycled log should have started with a recycled record
-                    return BadRecord;
+                    // A recycled log should have started with a recycled record. Deliberate deviation: upstream returns
+                    // kBadRecord here without consuming anything, so ReadRecord parses the same header again forever (a
+                    // single bit flip of a kFullType byte to kRecyclableFullType hangs native DB::Open). The record cannot
+                    // be valid (its CRC covers the type byte), so it is handled like a checksum mismatch: the rest of the
+                    // buffer is dropped and reported.
+                    dropSize = _bufLen;
+                    ClearBuffer();
+                    return BadRecordChecksum;
                 }
                 _recycled = true;
                 // We need enough for the larger header

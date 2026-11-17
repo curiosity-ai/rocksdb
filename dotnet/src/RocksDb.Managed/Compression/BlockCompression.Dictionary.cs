@@ -118,8 +118,7 @@ public static unsafe partial class BlockCompression
         if (formatVersion < 2) ThrowHelper.NotSupported("compression format 1 (format_version < 2)");
         int n = Coding.DecodeVarint64(compressed, out ulong size64);
         if (n == 0) ThrowHelper.Corruption("Unable to extract uncompressed size");
-        if (size64 > int.MaxValue) ThrowHelper.Corruption("Uncompressed size too large");
-        int size = (int)size64;
+        int size = CheckedUncompressedSize(type, size64, compressed.Length - n);
         ReadOnlySpan<byte> payload = compressed[n..];
         Span<byte> dst = output.GetSpan(size)[..size];
         switch (type)

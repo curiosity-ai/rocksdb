@@ -63,10 +63,13 @@ internal sealed class PlainTableIndex
     /// <summary>GetSubIndexBasePtrAndUpperBound: the record count of a sub index entry and its offset array.</summary>
     public ReadOnlySpan<byte> GetSubIndex(uint offset, out uint upperBound)
     {
+        // Upstream reads the sub index unchecked (undefined behavior on a damaged index); here an offset outside the sub
+        // index, or an empty entry (the builder writes sub index entries only for buckets of 2+ records, and
+        // PlainTableReader::GetOffset reads base_ptr[low] even when upper_bound is 0), is Corruption.
+        if (offset >= SubIndexSize) ThrowHelper.Corruption("plain table sub index offset out of range");
         int p = _subIndexOffset + (int)offset;
-        if (p >= _end) ThrowHelper.Corruption("plain table sub index offset out of range");
         int n = Coding.DecodeVarint32(_data.AsSpan(p, Math.Min(4, _end - p)), out upperBound);
-        if (n == 0 || (ulong)(p + n) + (ulong)upperBound * OffsetLen > (ulong)_end) ThrowHelper.Corruption("bad plain table sub index");
+        if (n == 0 || upperBound == 0 || (ulong)(p + n) + (ulong)upperBound * OffsetLen > (ulong)_end) ThrowHelper.Corruption("bad plain table sub index");
         return _data.AsSpan(p + n, (int)upperBound * OffsetLen);
     }
 }

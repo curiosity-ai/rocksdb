@@ -91,7 +91,7 @@ public sealed partial class RocksDatabase
     public void PutAttributeGroups(WriteOptions? options, ReadOnlySpan<byte> key, ReadOnlySpan<AttributeGroup> attributeGroups)
     {
         ValidateAttributeGroups(attributeGroups);
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             b.PutAttributeGroups(key, attributeGroups);
@@ -99,7 +99,7 @@ public sealed partial class RocksDatabase
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 
@@ -109,7 +109,7 @@ public sealed partial class RocksDatabase
         CancellationToken cancellationToken = default)
     {
         ValidateAttributeGroups(attributeGroups.Span);
-        WriteBatch b = WriteBatch.Rent();
+        WriteBatch b = WriteBatch.RentInternal();
         try
         {
             b.PutAttributeGroups(key.Span, attributeGroups.Span);
@@ -117,7 +117,7 @@ public sealed partial class RocksDatabase
         }
         finally
         {
-            b.Dispose();
+            WriteBatch.ReturnInternal(b);
         }
     }
 

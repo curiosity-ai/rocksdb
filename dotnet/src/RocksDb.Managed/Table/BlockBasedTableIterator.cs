@@ -889,8 +889,10 @@ public sealed class BlockBasedTableIterator : IDisposable, Env.IReadaheadSizeCal
             _readaheadSize = Math.Min((ulong)max, _readaheadSize * 2);
             return null;
         }
-        // Prefetch not supported: fall back to the internal prefetch buffer.
-        if (_prefetch is null) _prefetch = new Env.AsyncPrefetchBuffer((int)initial, (int)max);
+        // Prefetch not supported: fall back to the internal prefetch buffer, one synchronous buffer (num_buffers =
+        // async_io ? 2 : 1; only the sync positioning paths read through it, and a sync read must not wait for a
+        // ReadAsync continuation on the .NET thread pool: paranoid output verification runs on a compaction thread).
+        if (_prefetch is null) _prefetch = Env.AsyncPrefetchBuffer.CreateSingleBuffer((int)initial, (int)max);
         else _prefetch.ResetReadahead();
         _prefetch.Reset(_reader.File);
         _autoPrefetching = true;
@@ -1162,11 +1164,16 @@ public sealed class BlockBasedTableIterator : IDisposable, Env.IReadaheadSizeCal
     /// BlockPrefetcher::PrefetchIfNeeded for compaction (is_for_compaction): when the block is past the prefetched range
     /// (readahead_limit_), an OS prefetch of the block plus compaction_readahead_size bytes; blocks are then read one by
     /// one from the page cache. No buffer and no copy, like upstream with fs_prefetch_support. Only a file that does not
-    /// support Prefetch (direct I/O, other platforms, in-memory files) is read through the readahead buffer.
+    /// support Prefetch (direct I/O, other platforms, in-memory files) is read through the readahead buffer: one
+    /// synchronous buffer of compaction_readahead_size (num_buffers = async_io ? 2 : 1, and compaction reads without
+    /// async_io), read on the compaction's own thread. A two-buffer prefetch would block that thread (a dedicated
+    /// compaction thread, or a sync CompactRange caller) on a ReadAsync whose continuation needs a .NET thread-pool
+    /// thread, which hangs the compaction while the pool is saturated.
     /// </summary>
     private Env.AsyncPrefetchBuffer? PrefetchForCompaction(BlockHandle h)
     {
-        if (_prefetch is not null) return _prefetch;
+        // FilePrefetchBuffer::TryReadFromCache: a block before the buffered range is read from the file directly.
+        if (_prefetch is not null) return _prefetch.IsBeforeBuffer((long)h.Offset) ? null : _prefetch;
         ulong offset = h.Offset;
         ulong len = h.Size + BlockBasedTableConstants.BlockTrailerSize;
         if (offset + len <= _readaheadLimit) return null;
@@ -1176,8 +1183,8 @@ public sealed class BlockBasedTableIterator : IDisposable, Env.IReadaheadSizeCal
             _readaheadLimit = offset + len + size;
             return null;
         }
-        // Prefetch not supported: fall back to the internal prefetch buffer.
-        _prefetch = new Env.AsyncPrefetchBuffer(_compactionReadahead);
+        // Prefetch not supported: fall back to the internal prefetch buffer (initial = max = compaction_readahead_size).
+        _prefetch = Env.AsyncPrefetchBuffer.CreateSingleBuffer(_compactionReadahead);
         _prefetch.Reset(_reader.File);
         return _prefetch;
     }
@@ -1518,8 +1525,8 @@ public sealed class BlockBasedTableIterator : IDisposable, Env.IReadaheadSizeCal
     /// <summary>
     /// Compaction input readahead (BlockPrefetcher with compaction_readahead_size, is_for_compaction): data blocks that
     /// are not cached are preceded by an OS prefetch of the next <paramref name="readaheadSize"/> bytes
-    /// (<see cref="Env.IRandomAccessFile.Prefetch"/>), or, where the file does not support it, read through a readahead
-    /// buffer that prefetches the following chunk asynchronously. For sequential scans of whole files (compaction inputs,
+    /// (<see cref="Env.IRandomAccessFile.Prefetch"/>), or, where the file does not support it, read through a synchronous
+    /// readahead buffer (block + readahead per miss). For sequential scans of whole files (compaction inputs,
     /// which never use auto readahead: 0 disables readahead); the sync positioning paths use it, the async ones read
     /// blocks directly. Idempotent.
     /// </summary>

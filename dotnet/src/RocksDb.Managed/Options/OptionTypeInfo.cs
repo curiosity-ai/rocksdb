@@ -154,6 +154,17 @@ internal sealed class OptionTable<TOwner>
     public OptionTable<TOwner> UInt32(string name, Func<TOwner, uint> get, Action<TOwner, uint> set) =>
         Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, OptionStrings.ParseUInt32(name, v)));
 
+    /// <summary>OptionType::kUInt8T (ParseUint8): a value above 255 is InvalidArgument. Stored in a uint property.</summary>
+    public OptionTable<TOwner> UInt8(string name, Func<TOwner, uint> get, Action<TOwner, uint> set) =>
+        Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, OptionStrings.ParseUInt8(name, v)));
+
+    /// <summary>
+    /// A uint32 option parsed with ParseUint64 and truncated to 32 bits (read_amp_bytes_per_bit's custom parse function in
+    /// block_based_table_factory.cc, kept upstream for OPTIONS files of 6.10 - 6.14 that wrote it as 8 bytes).
+    /// </summary>
+    public OptionTable<TOwner> UInt32Truncated(string name, Func<TOwner, uint> get, Action<TOwner, uint> set) =>
+        Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, unchecked((uint)OptionStrings.ParseUInt64(name, v))));
+
     public OptionTable<TOwner> Int64(string name, Func<TOwner, long> get, Action<TOwner, long> set) =>
         Add(name, o => get(o).ToString(CultureInfo.InvariantCulture), (o, v) => set(o, OptionStrings.ParseInt64(name, v)));
 
@@ -175,10 +186,16 @@ internal sealed class OptionTable<TOwner>
 
     /// <summary>
     /// A Customizable factory option selected by id (memtable_factory, table_factory, flush_block_policy_factory):
-    /// written as the bare class name; the struct form "{id=Name;...}" is accepted and only its id kept.
+    /// written as the bare class name; the struct form "{id=Name;...}" is accepted and only its id kept. An id this
+    /// port does not know leaves the option unchanged, like native: creating an unregistered Customizable is NotSupported,
+    /// which ConfigOptions::ignore_unsupported_options (default true; used by the OPTIONS file parser, SetOptions and
+    /// the Get*OptionsFromString helpers) ignores (options/options_helper.cc, OptionTypeInfo::Parse).
     /// </summary>
     public OptionTable<TOwner> EnumId<TEnum>(string name, EnumMap<TEnum> map, Func<TOwner, TEnum> get, Action<TOwner, TEnum> set) where TEnum : struct, System.Enum =>
-        Add(name, o => map.ToName(get(o)), (o, v) => set(o, map.Parse(name, OptionStrings.UnwrapId(v))));
+        Add(name, o => map.ToName(get(o)), (o, v) =>
+        {
+            if (OptionStrings.TryUnwrapId(v, out string id) && map.TryParse(id, out TEnum parsed)) set(o, parsed);
+        });
 }
 
 /// <summary>Bidirectional enum &lt;-&gt; RocksDB-name map (OptionsHelper::*_string_map).</summary>
@@ -435,6 +452,26 @@ internal static class OptionStrings
 {
     public static string FormatBool(bool v) => v ? "true" : "false";
 
+    /// <summary>
+    /// <see cref="UnwrapId"/> that returns false instead of throwing for a malformed "{..." value. Native cannot create
+    /// a Customizable from such a value either: Customizable creation fails with NotSupported, which
+    /// ConfigOptions::ignore_unsupported_options (default true) turns into OK with the option unchanged
+    /// (options/configurable.cc ConfigureOptions), so callers leave the option as it is.
+    /// </summary>
+    public static bool TryUnwrapId(string v, out string id)
+    {
+        try
+        {
+            id = UnwrapId(v);
+            return true;
+        }
+        catch (RocksDbException)
+        {
+            id = v;
+            return false;
+        }
+    }
+
     /// <summary>Customizable ids may be written as "{id=Name;...}"; returns the id only (or the value unchanged).</summary>
     public static string UnwrapId(string v)
     {
@@ -573,6 +610,14 @@ internal static class OptionStrings
         long n = ParseInt64(name, v);
         if (n is < int.MinValue or > int.MaxValue) throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
         return (int)n;
+    }
+
+    /// <summary>ParseUint8 (util/string_util.cc): ParseUint64, std::out_of_range when the value needs more than 8 bits.</summary>
+    public static uint ParseUInt8(string name, string v)
+    {
+        ulong n = ParseUInt64(name, v);
+        if (n >> 8 != 0) throw RocksDbException.InvalidArgument("Error parsing " + name + ": out of range '" + v + "'");
+        return (uint)n;
     }
 
     /// <summary>ParseUint32 (util/string_util.cc): ParseUint64, std::out_of_range when the value needs more than 32 bits.</summary>

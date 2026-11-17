@@ -198,14 +198,25 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public bool MemtableWholeKeyFiltering { get; set; }
     public ulong MemtableHugePageSize { get; set; }
     public uint BloomLocality { get; set; }
+    /// <summary>
+    /// max_successive_merges: the maximum number of successive merge operands of a key in the memtable. When a merge is
+    /// written and the key already has this many merge operands at its head in the memtable, the write reads the key's
+    /// current value (at the write's sequence number, so earlier merges of the same batch count), applies the merge and
+    /// stores the result as a value instead of the operand; reads then stop at that value. The read only uses the
+    /// memtables and the block cache unless <see cref="StrictMaxSuccessiveMerges"/> is set, so the limit can be exceeded
+    /// when the value would need a table file read; if the read or the merge fails the operand is stored as usual. Not
+    /// applied while the WAL is replayed at open. 0 (default) disables it. Mutable (SetOptions): a memtable keeps the value
+    /// it was created with, so a change applies from the next memtable. Incompatible with
+    /// <see cref="DbOptions.UnorderedWrite"/>. Port of MemTableInserter::MergeCF (db/write_batch.cc).
+    /// </summary>
     public ulong MaxSuccessiveMerges { get; set; }
     public uint MemtableProtectionBytesPerKey { get; set; }
     public double ExperimentalMempurgeThreshold { get; set; }
 
     /// <summary>
-    /// strict_max_successive_merges: with <see cref="MaxSuccessiveMerges"/>, merge even when the base value must be read
-    /// from SST files. Typed and persisted only: the managed port does not implement max_successive_merges (both are
-    /// listed under "Not ported yet"). Default false. Mutable.
+    /// strict_max_successive_merges: with <see cref="MaxSuccessiveMerges"/>, merge at write time even when the base value
+    /// must be read from table files (this can block the write path on file reads); otherwise only memtables and the block
+    /// cache are read. Default false. Mutable (applies from the next memtable).
     /// </summary>
     public bool StrictMaxSuccessiveMerges { get; set; }
 
@@ -457,7 +468,14 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
 
     private static readonly OptionTable<ColumnFamilyOptions> s_table = new OptionTable<ColumnFamilyOptions>()
         .Add("comparator", static o => o._comparator.Serialize(ComparatorId) ?? BytewiseComparator.ClassName,
-            static (o, v) => o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId))
+            static (o, v) =>
+            {
+                // AsCustomRawPtr<const Comparator> without kAllowNull (options/cf_options.cc): an empty value leaves no
+                // comparator, and OptionTypeInfo::Prepare / Validate (options/options_helper.cc) then fail with "Missing
+                // configurable object: comparator" (InvalidArgument from the OPTIONS loader).
+                if (v.Length == 0) ThrowHelper.InvalidArgument("Missing configurable object: comparator");
+                o._comparator.Parse(v, static n => Managed.Comparator.TryGetBuiltin(n, out Comparator? c) ? c : null, ComparatorId);
+            })
         .Add("merge_operator", static o => o._mergeOperator.Serialize(MergeOperatorOptionsId) ?? "nullptr",
             static (o, v) => o._mergeOperator.Parse(v, Managed.MergeOperator.CreateBuiltin, MergeOperatorOptionsId))
         .Add("compaction_filter", static o => o._compactionFilter.Serialize(CompactionFilterId) ?? "nullptr",
@@ -492,8 +510,10 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
             static (c, v) => CompressionOptions.ParseLegacy(c, v, "compression_opts"))
         .Struct("bottommost_compression_opts", static o => o.BottommostCompressionOpts, static (o, v) => o.BottommostCompressionOpts = v,
             static (c, v) => CompressionOptions.ParseLegacy(c, v, "bottommost_compression_opts"))
-        // blob_compression_opts has no legacy ':' form upstream (plain OptionTypeInfo::Struct).
-        .Struct("blob_compression_opts", static o => o.BlobCompressionOpts, static (o, v) => o.BlobCompressionOpts = v, null)
+        // blob_compression_opts: OptionTypeInfo::Struct with a parse function that takes the legacy ':' form when the value
+        // has no '=' (options/cf_options.cc), so an empty value is "unable to parse the specified CF option".
+        .Struct("blob_compression_opts", static o => o.BlobCompressionOpts, static (o, v) => o.BlobCompressionOpts = v,
+            static (c, v) => CompressionOptions.ParseLegacy(c, v, "blob_compression_opts"))
         .Add("compression_manager", static o => o.CompressionManagerName ?? "nullptr",
             static (o, v) => { string id = OptionStrings.UnwrapId(v); o.CompressionManagerName = id.Length == 0 || id == "nullptr" ? null : id; })
         .Add("compression_per_level", static o => FormatCompressionList(o.CompressionPerLevel),
@@ -535,7 +555,7 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
         .Enum("last_level_temperature", OptionEnumMaps.Temperature, static o => o.LastLevelTemperature, static (o, v) => o.LastLevelTemperature = v)
         .Enum("default_temperature", OptionEnumMaps.Temperature, static o => o.DefaultTemperature, static (o, v) => o.DefaultTemperature = v)
         .Enum("default_write_temperature", OptionEnumMaps.Temperature, static o => o.DefaultWriteTemperature, static (o, v) => o.DefaultWriteTemperature = v)
-        .UInt32("block_protection_bytes_per_key", static o => o.BlockProtectionBytesPerKey, static (o, v) => o.BlockProtectionBytesPerKey = v)
+        .UInt8("block_protection_bytes_per_key", static o => o.BlockProtectionBytesPerKey, static (o, v) => o.BlockProtectionBytesPerKey = v)
         .Bool("persist_user_defined_timestamps", static o => o.PersistUserDefinedTimestamps, static (o, v) => o.PersistUserDefinedTimestamps = v)
         .Bool("cf_allow_ingest_behind", static o => o.CfAllowIngestBehind, static (o, v) => o.CfAllowIngestBehind = v)
         .Bool("disallow_memtable_writes", static o => o.DisallowMemtableWrites, static (o, v) => o.DisallowMemtableWrites = v)

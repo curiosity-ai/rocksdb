@@ -170,12 +170,26 @@ internal static class BlockFetcher
         return ProcessSerialized(buf, footer, handle, verifyChecksums, dictionary, BlockBufferSource.BlockBufferPool);
     }
 
-    private static int CheckedLength(BlockHandle handle)
+    /// <summary>
+    /// The serialized length (payload + trailer) of the block at <paramref name="handle"/>, for a handle decoded from
+    /// a possibly damaged file, so the read fails with a status and never with an exception from the file layer:
+    /// a block larger than an array is Corruption (upstream allocates the size and aborts with bad_alloc, or wraps
+    /// size + kBlockTrailerSize around); an offset of 2^63 or more is the IOError pread reports for it (EINVAL,
+    /// PosixRandomAccessFile::Read: "While pread offset ... len ..."); an offset that ends past long.MaxValue can only
+    /// be past the end of the file, which upstream reports as "truncated block read" Corruption.
+    /// </summary>
+    internal static int CheckedLength(BlockHandle handle)
     {
         ulong n = handle.Size + BlockBasedTableConstants.BlockTrailerSize;
-        if (n > int.MaxValue) ThrowHelper.Corruption("block too large: " + handle);
+        if (handle.Size > int.MaxValue || n > int.MaxValue) ThrowHelper.Corruption("block too large: " + handle);
+        if (handle.Offset > long.MaxValue) ThrowBadOffset(handle, n);
+        if (handle.Offset > (ulong)(long.MaxValue - (long)n)) ThrowTruncated(handle, 0);
         return (int)n;
     }
+
+    [DoesNotReturn]
+    private static void ThrowBadOffset(BlockHandle handle, ulong n) =>
+        throw RocksDbException.IOError("While pread offset " + handle.Offset + " len " + n + ": Invalid argument");
 
     internal static int ReadFully(IRandomAccessFile file, long offset, Span<byte> dst)
     {
@@ -368,6 +382,28 @@ internal static class BlockFetcher
         {
             w.Dispose();
             t_decompressWriter = w;
+        }
+    }
+
+    /// <summary>
+    /// Reads the serialized block at <paramref name="handle"/> and verifies its checksum without decompressing it
+    /// (BlockFetcher with decompress = false and maybe_compressed = false, as BlockBasedTable::VerifyChecksumInBlocks /
+    /// VerifyChecksumInMetaBlocks use it). Corruption on a short read or a mismatch.
+    /// </summary>
+    public static void ReadAndVerifyChecksumOnly(IRandomAccessFile file, in Footer footer, BlockHandle handle)
+    {
+        int n = CheckedLength(handle);
+        byte[] buf = RocksArrayPool<byte>.Shared.Rent(n);
+        try
+        {
+            int read = ReadFully(file, (long)handle.Offset, buf.AsSpan(0, n));
+            if (read != n) ThrowTruncated(handle, read);
+            if (!BlockChecksum.Verify(footer.ChecksumType, footer.BaseContextChecksum, buf.AsSpan(0, n), handle.Offset))
+                ThrowHelper.Corruption("block checksum mismatch at offset " + handle.Offset + " size " + handle.Size);
+        }
+        finally
+        {
+            RocksArrayPool<byte>.Shared.Return(buf);
         }
     }
 

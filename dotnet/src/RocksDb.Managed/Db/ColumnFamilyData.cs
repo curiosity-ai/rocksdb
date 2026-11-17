@@ -154,6 +154,7 @@ internal sealed class ColumnFamilyData
             db.Options.MaxOpenFiles)
         {
             BlobFileReadHistogram = Stats.BlobFileReadHist,
+            FileIo = db.FileIo,
         };
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
@@ -168,6 +169,7 @@ internal sealed class ColumnFamilyData
                 BlobFileSize = options.BlobFileSize,
                 FileOptions = db.BlobFileWriteOptions(options),
                 BlobFileReadHistogram = Stats.BlobFileReadHist,
+                FileIo = db.FileIo,
             };
             BlobSource.DirectWrite = BlobDirectWrite;
         }
@@ -309,6 +311,7 @@ internal sealed class ColumnFamilyData
             RowCache = db.Options.RowCache,
             LevelStats = new InternalStats(numLevels),
             NumLevels = numLevels,
+            FileIo = db.FileIo,
         };
 
     internal static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)
@@ -363,6 +366,16 @@ internal sealed class ColumnFamilyData
     /// <summary>WALs with numbers below this have been flushed for this CF (ColumnFamilyData::GetLogNumber).</summary>
     public ulong LogNumber { get; set; }
     public bool Dropped { get; set; }
+    /// <summary>
+    /// Set when the database releases the column family's super version at close (or after a failed open): no super
+    /// version can be referenced any more, so readers that raced with the close fail instead of waiting for one.
+    /// </summary>
+    internal bool Closed
+    {
+        get => Volatile.Read(ref _closed);
+        set => Volatile.Write(ref _closed, value);
+    }
+    private bool _closed;
     /// <summary>
     /// Non-atomic flush jobs scheduled or running on this column family. Like upstream, several flushes of one column
     /// family may run at once, each on memtables the others did not pick; their results are committed in memtable order

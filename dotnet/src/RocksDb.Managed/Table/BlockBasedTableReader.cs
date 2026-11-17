@@ -943,11 +943,15 @@ public sealed partial class BlockBasedTableReader : TableReader
         return udi.NewIterator(null) ?? throw RocksDbException.Corruption("Could not create UDI iterator");
     }
 
-    // Any built-in policy reads any built-in filter format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader).
+    /// <summary>
+    /// The reader of a filter block: the configured policy's own reader, like ParsedFullFilterBlock
+    /// (table/block_based/parsed_full_filter_block.cc: <c>filter_policy-&gt;GetFilterBitsReader(block_contents_.data)</c>).
+    /// Built-in policies return the built-in reader for any built-in format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader,
+    /// <see cref="BloomLikeFilterPolicy.CreateReader"/> is sealed); a custom policy that reuses the built-in compatibility
+    /// name gets its own reader, as upstream (a wrapper that delegates to a built-in policy reads built-in filters).
+    /// </summary>
     internal static IFilterBitsReader CreateFilterReader(FilterPolicy policy, byte[] buffer, int length) =>
-        policy.CompatibilityName == BloomLikeFilterPolicy.BuiltinFilterMetadataName
-            ? BuiltinFilterBitsReader.Create(buffer.AsMemory(0, length))
-            : policy.CreateReader(buffer.AsMemory(0, length));
+        policy.CreateReader(buffer.AsMemory(0, length));
 
     private static CachePriority MetaPriority(TableReaderOptions options) =>
         options.CacheIndexAndFilterBlocksWithHighPriority ? CachePriority.High : CachePriority.Low;
@@ -1013,14 +1017,16 @@ public sealed partial class BlockBasedTableReader : TableReader
             }
             // WART (upstream): the index block checksum is skipped when it was checked on open.
             if (kv.Key == BlockBasedTableConstants.IndexBlockName && _options.VerifyChecksums) continue;
-            RocksArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, kv.Value, verifyChecksums: true, out _));
+            BlockFetcher.ReadAndVerifyChecksumOnly(_file, _footer, kv.Value);
         }
         IndexCursor idx = IndexCursor.Rent(this, TableReadFlags.DontFillCache);
         try
         {
             for (idx.SeekToFirst(); idx.Valid; idx.Next())
             {
-                RocksArrayPool<byte>.Shared.Return(BlockFetcher.ReadRawPayload(_file, _footer, idx.Handle, verifyChecksums: true, out _));
+                // Raw contents only: the blocks are not decompressed (decompress = false upstream; decompressing here
+                // without the table's dictionary failed on valid dictionary-compressed tables).
+                BlockFetcher.ReadAndVerifyChecksumOnly(_file, _footer, idx.Handle);
             }
         }
         finally
@@ -2519,9 +2525,12 @@ public sealed partial class BlockBasedTableReader : TableReader
         {
             // The tail start isn't known before the properties are read; like upstream's default tail prefetch,
             // read the last 512 KiB (at least through the metaindex). Reads outside fall back to the inner file.
-            long start = Math.Max(0, fileSize - (512 << 10));
-            if (footer.IndexHandle.Size > 0) start = Math.Min(start, (long)footer.IndexHandle.Offset);
-            start = Math.Min(start, (long)footer.MetaindexHandle.Offset);
+            // Handles come from an unverified footer: compared as unsigned, so one past the end of the file (or past
+            // long.MaxValue) never moves the start (the block read itself then reports the corruption).
+            ulong startU = (ulong)Math.Max(0, fileSize - (512 << 10));
+            if (footer.IndexHandle.Size > 0) startU = Math.Min(startU, footer.IndexHandle.Offset);
+            startU = Math.Min(startU, footer.MetaindexHandle.Offset);
+            long start = (long)startU;
             long len = fileSize - start;
             if (len <= 0 || len > 64L << 20) return;
             byte[] buf = RocksArrayPool<byte>.Shared.Rent((int)len);

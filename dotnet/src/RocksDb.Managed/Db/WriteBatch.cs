@@ -32,12 +32,28 @@ public sealed partial class WriteBatch : IDisposable
     /// <summary>WriteBatchInternal::kHeader: 8-byte sequence number followed by a 4-byte count.</summary>
     public const int HeaderSize = 12;
 
-    private PooledBufferWriter _rep;
+    // The rep buffer; null once the batch was disposed (every later use throws ObjectDisposedException). A batch from
+    // Rent() holds a pooled rep: Dispose takes it out exactly once and returns it to the rep pool, so a reference kept
+    // after Dispose can never reach the rep of a later renter (the WriteBatch object itself is never pooled).
+    private PooledBufferWriter? _repField;
     private ContentFlags _contentFlags;
     private SavePoint[]? _savePoints;
     private int _savePointCount;
     private readonly int _maxBytes;
-    private bool _pooled;
+    // The rep came from s_repPool (Rent): Dispose returns it there instead of releasing its buffer.
+    private bool _repPooled;
+
+    /// <summary>The rep; throws <see cref="ObjectDisposedException"/> after <see cref="Dispose"/>.</summary>
+    private PooledBufferWriter Rep
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            PooledBufferWriter? r = _repField;
+            if (r is null) ThrowDisposed();
+            return r;
+        }
+    }
 
     [Flags]
     private enum ContentFlags : uint
@@ -75,93 +91,157 @@ public sealed partial class WriteBatch : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(reservedBytes);
         ArgumentOutOfRangeException.ThrowIfNegative(maxBytes);
         _maxBytes = maxBytes;
-        _rep = new PooledBufferWriter(Math.Max(reservedBytes, HeaderSize));
-        _rep.GetSpan(HeaderSize)[..HeaderSize].Clear();
-        _rep.Advance(HeaderSize);
+        _repField = NewEmptyRep(Math.Max(reservedBytes, HeaderSize));
     }
 
     /// <summary>Creates a batch from an existing rep (e.g. a WAL record). The bytes are copied.</summary>
     public WriteBatch(ReadOnlySpan<byte> rep)
     {
-        _rep = new PooledBufferWriter(Math.Max(rep.Length, HeaderSize));
+        _repField = new PooledBufferWriter(Math.Max(rep.Length, HeaderSize));
         SetContents(rep);
     }
 
-    // ---- Pooling ----------------------------------------------------------------------------------------------
+    /// <summary>A batch over <paramref name="rep"/> (which holds just a cleared header), rented from the rep pool.</summary>
+    private WriteBatch(PooledBufferWriter rep, bool repPooled)
+    {
+        _repField = rep;
+        _repPooled = repPooled;
+    }
 
-    private static readonly WriteBatch?[] s_pool = new WriteBatch?[Math.Min(64, Environment.ProcessorCount * 4)];
+    private static PooledBufferWriter NewEmptyRep(int capacity)
+    {
+        var rep = new PooledBufferWriter(capacity);
+        rep.GetSpan(HeaderSize)[..HeaderSize].Clear();
+        rep.Advance(HeaderSize);
+        return rep;
+    }
+
+    // ---- Pooling ----------------------------------------------------------------------------------------------
+    //
+    // Two pools. Rent() hands out a new WriteBatch over a pooled rep buffer (s_repPool): the object the caller holds is
+    // never reused, so a stale reference (a second Dispose, a Put after Dispose) throws ObjectDisposedException instead
+    // of touching the batch of whoever rents next. RentInternal() pools whole batches (s_internalPool) for the engine's
+    // own single-operation writes (Put, Delete, Merge, ...), which never hand the object out: those stay allocation-free.
+
+    private static readonly PooledBufferWriter?[] s_repPool = new PooledBufferWriter?[Math.Min(64, Environment.ProcessorCount * 4)];
+    private static readonly WriteBatch?[] s_internalPool = new WriteBatch?[Math.Min(64, Environment.ProcessorCount * 4)];
     private const int MaxPooledCapacity = 1 << 20;
 
     /// <summary>
-    /// Gets an empty batch from a process-wide pool (or a new one). <see cref="Dispose"/> returns it to the pool, so the
-    /// batch must not be used after disposal.
+    /// Gets an empty batch whose rep buffer comes from a process-wide pool (the <see cref="WriteBatch"/> object itself is
+    /// new). <see cref="Dispose"/> returns the buffer to the pool exactly once: afterwards every use of this object throws
+    /// <see cref="ObjectDisposedException"/> and further Dispose calls do nothing, so a reference kept after Dispose never
+    /// affects other batches. Allocates only the small batch object in steady state.
     /// </summary>
     public static WriteBatch Rent()
     {
-        WriteBatch?[] pool = s_pool;
+        PooledBufferWriter?[] pool = s_repPool;
         for (int i = 0; i < pool.Length; i++)
         {
-            WriteBatch? b = pool[i];
-            if (b is not null && Interlocked.CompareExchange(ref pool[i], null, b) == b)
-            {
-                b._pooled = true;
-                return b;
-            }
+            PooledBufferWriter? r = pool[i];
+            if (r is not null && Interlocked.CompareExchange(ref pool[i], null, r) == r) return new WriteBatch(r, repPooled: true);
         }
-        return new WriteBatch { _pooled = true };
+        return new WriteBatch(NewEmptyRep(HeaderSize), repPooled: true);
     }
 
     /// <summary>
-    /// Releases the batch. A batch obtained from <see cref="Rent"/> is cleared and returned to the pool; otherwise
-    /// its buffer is returned to the array pool. The batch must not be used afterwards.
+    /// Releases the batch: a rep from <see cref="Rent"/> is cleared and returned to the pool, otherwise its buffer is
+    /// returned to the array pool. Idempotent and thread-safe (the rep is taken out exactly once); every other member
+    /// throws <see cref="ObjectDisposedException"/> afterwards.
     /// </summary>
     public void Dispose()
     {
-        if (_pooled && _rep.Capacity <= MaxPooledCapacity && _maxBytes == 0)
+        PooledBufferWriter? rep = Interlocked.Exchange(ref _repField, null);
+        if (rep is null) return;
+        if (_repPooled && _maxBytes == 0 && rep.Capacity <= MaxPooledCapacity)
         {
-            _pooled = false;
-            Clear();
-            DropProtection(); // a rented batch starts unprotected
-            WriteBatch?[] pool = s_pool;
+            rep.Clear();
+            rep.GetSpan(HeaderSize)[..HeaderSize].Clear();
+            rep.Advance(HeaderSize);
+            PooledBufferWriter?[] pool = s_repPool;
             for (int i = 0; i < pool.Length; i++)
             {
-                if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], this, null) is null) return;
+                if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], rep, null) is null) return;
             }
         }
-        _pooled = false;
-        _rep.Dispose();
+        rep.Dispose();
     }
+
+    /// <summary>
+    /// An empty batch for an operation of the engine that never hands it out (single-key writes): a whole pooled batch,
+    /// no allocation in steady state. Return it with <see cref="ReturnInternal"/> (not <see cref="Dispose"/>).
+    /// </summary>
+    internal static WriteBatch RentInternal()
+    {
+        WriteBatch?[] pool = s_internalPool;
+        for (int i = 0; i < pool.Length; i++)
+        {
+            WriteBatch? b = pool[i];
+            if (b is not null && Interlocked.CompareExchange(ref pool[i], null, b) == b) return b;
+        }
+        return new WriteBatch();
+    }
+
+    /// <summary>Clears a batch of <see cref="RentInternal"/> and pools it (or releases it when it grew large).</summary>
+    internal static void ReturnInternal(WriteBatch b)
+    {
+        PooledBufferWriter? rep = b._repField;
+        if (rep is null) return;
+        if (rep.Capacity <= MaxPooledCapacity && b._maxBytes == 0)
+        {
+            b.Clear();
+            b.DropProtection(); // the next user starts unprotected
+            b.TrackTimestampSize = false;
+            WriteBatch?[] pool = s_internalPool;
+            for (int i = 0; i < pool.Length; i++)
+            {
+                if (pool[i] is null && Interlocked.CompareExchange(ref pool[i], b, null) is null) return;
+            }
+        }
+        b.Dispose();
+    }
+
+    /// <summary>Throws <see cref="ObjectDisposedException"/> once the batch was disposed.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void ThrowIfDisposed()
+    {
+        if (_repField is null) ThrowDisposed();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(WriteBatch));
 
     // ---- Accessors --------------------------------------------------------------------------------------------
 
     /// <summary>Capacity of the rep buffer.</summary>
-    internal int Capacity => _rep.Capacity;
+    internal int Capacity => Rep.Capacity;
 
     /// <summary>The rep: header followed by records. Valid until the batch is modified.</summary>
-    public ReadOnlySpan<byte> Data => _rep.WrittenSpan;
+    public ReadOnlySpan<byte> Data => Rep.WrittenSpan;
     /// <summary>The rep as memory (for async I/O). Valid until the batch is modified.</summary>
-    public ReadOnlyMemory<byte> DataMemory => _rep.WrittenMemory;
+    public ReadOnlyMemory<byte> DataMemory => Rep.WrittenMemory;
     /// <summary>Size of the rep in bytes (<c>GetDataSize</c>).</summary>
-    public int DataSize => _rep.WrittenCount;
+    public int DataSize => Rep.WrittenCount;
     /// <summary>Maximum rep size (0 = unlimited).</summary>
     public int MaxBytes => _maxBytes;
 
     /// <summary>Number of key-value operations in the batch (<c>WriteBatchInternal::Count</c>).</summary>
-    public int Count => (int)Coding.DecodeFixed32(_rep.WrittenSpan[8..]);
+    public int Count => (int)Coding.DecodeFixed32(Rep.WrittenSpan[8..]);
 
     /// <summary>The sequence number of the first operation (<c>WriteBatchInternal::Sequence/SetSequence</c>).</summary>
     public ulong Sequence
     {
-        get => Coding.DecodeFixed64(_rep.WrittenSpan);
-        set => Coding.EncodeFixed64(_rep.WrittenSpanMutable, value);
+        get => Coding.DecodeFixed64(Rep.WrittenSpan);
+        set => Coding.EncodeFixed64(Rep.WrittenSpanMutable, value);
     }
 
-    internal void SetCount(uint n) => Coding.EncodeFixed32(_rep.WrittenSpanMutable[8..], n);
+    internal void SetCount(uint n) => Coding.EncodeFixed32(Rep.WrittenSpanMutable[8..], n);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void IncrementCount()
     {
-        Span<byte> c = _rep.WrittenSpanMutable.Slice(8, 4);
+        Span<byte> c = Rep.WrittenSpanMutable.Slice(8, 4);
         Coding.EncodeFixed32(c, Coding.DecodeFixed32(c) + 1);
     }
 
@@ -197,7 +277,7 @@ public sealed partial class WriteBatch : IDisposable
         ContentFlags rv = ContentFlags.None;
         try
         {
-            var reader = new WriteBatchReader(_rep.WrittenSpan[HeaderSize..], wholeBatch: false, count: 0);
+            var reader = new WriteBatchReader(Rep.WrittenSpan[HeaderSize..], wholeBatch: false, count: 0);
             while (reader.TryReadNext(out WriteBatchEntry e))
             {
                 rv |= e.Type switch
@@ -231,9 +311,9 @@ public sealed partial class WriteBatch : IDisposable
     /// <summary>Removes all records and save points (keeps the buffer). Port of <c>WriteBatch::Clear</c>.</summary>
     public void Clear()
     {
-        _rep.Clear();
-        _rep.GetSpan(HeaderSize)[..HeaderSize].Clear();
-        _rep.Advance(HeaderSize);
+        Rep.Clear();
+        Rep.GetSpan(HeaderSize)[..HeaderSize].Clear();
+        Rep.Advance(HeaderSize);
         _contentFlags = ContentFlags.None;
         _savePointCount = 0;
         _walTermPoint = default;
@@ -254,7 +334,7 @@ public sealed partial class WriteBatch : IDisposable
     /// before they are flushed. Has no effect when the write disables the WAL. Calling it again moves the point;
     /// <see cref="Clear"/> removes it.
     /// </summary>
-    public void MarkWalTerminationPoint() => _walTermPoint = new SavePoint(_rep.WrittenCount, (uint)Count, _contentFlags);
+    public void MarkWalTerminationPoint() => _walTermPoint = new SavePoint(Rep.WrittenCount, (uint)Count, _contentFlags);
 
     /// <summary>True if <see cref="MarkWalTerminationPoint"/> was called since the last <see cref="Clear"/>.</summary>
     public bool HasWalTerminationPoint => _walTermPoint.Size != 0;
@@ -303,8 +383,8 @@ public sealed partial class WriteBatch : IDisposable
     public void SetContents(ReadOnlySpan<byte> rep)
     {
         if (rep.Length < HeaderSize) ThrowHelper.InvalidArgument("WriteBatch rep is smaller than the header");
-        _rep.Clear();
-        _rep.Write(rep);
+        Rep.Clear();
+        Rep.Write(rep);
         _contentFlags = ContentFlags.Deferred;
         _savePointCount = 0;
         DropProtection(); // the new records carry no protection info (upstream asserts prot_info_ == nullptr)
@@ -506,7 +586,7 @@ public sealed partial class WriteBatch : IDisposable
     public void UpdateTimestamps(ReadOnlySpan<byte> timestamp, Func<uint, int> timestampSizeOf)
     {
         ArgumentNullException.ThrowIfNull(timestampSizeOf);
-        Span<byte> rep = _rep.WrittenSpanMutable;
+        Span<byte> rep = Rep.WrittenSpanMutable;
         ref byte origin = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(rep);
         var reader = new WriteBatchReader(rep);
         int protIdx = 0;
@@ -626,8 +706,9 @@ public sealed partial class WriteBatch : IDisposable
     /// </summary>
     public WriteBatch PutLogData(ReadOnlySpan<byte> blob)
     {
+        ThrowIfDisposed();
         SaveState(out SavePoint save);
-        Span<byte> dst = _rep.GetSpan(1 + Coding.MaxVarint32Length + blob.Length);
+        Span<byte> dst = Rep.GetSpan(1 + Coding.MaxVarint32Length + blob.Length);
         dst[0] = (byte)EntryType.LogData;
         int p = 1 + Coding.EncodeVarint32(dst[1..], (uint)blob.Length);
         blob.CopyTo(dst[p..]);
@@ -638,7 +719,7 @@ public sealed partial class WriteBatch : IDisposable
     // ---- Transaction markers (WriteBatchInternal) -----------------------------------------------------------
 
     /// <summary>WriteBatchInternal::InsertNoop.</summary>
-    internal void InsertNoop() => _rep.WriteByte((byte)EntryType.Noop);
+    internal void InsertNoop() => Rep.WriteByte((byte)EntryType.Noop);
 
     /// <summary>WriteBatchInternal::GetBeginPrepareType.</summary>
     internal static EntryType GetBeginPrepareType(bool writeAfterCommit, bool unpreparedBatch) =>
@@ -648,15 +729,15 @@ public sealed partial class WriteBatch : IDisposable
     /// <summary>WriteBatchInternal::InsertBeginPrepare.</summary>
     internal void InsertBeginPrepare(bool writeAfterCommit, bool unpreparedBatch)
     {
-        _rep.WriteByte((byte)GetBeginPrepareType(writeAfterCommit, unpreparedBatch));
+        Rep.WriteByte((byte)GetBeginPrepareType(writeAfterCommit, unpreparedBatch));
         _contentFlags |= ContentFlags.HasBeginPrepare;
     }
 
     /// <summary>WriteBatchInternal::InsertEndPrepare.</summary>
     internal void InsertEndPrepare(ReadOnlySpan<byte> xid)
     {
-        _rep.WriteByte((byte)EntryType.EndPrepareXID);
-        Coding.PutLengthPrefixedSlice(_rep, xid);
+        Rep.WriteByte((byte)EntryType.EndPrepareXID);
+        Coding.PutLengthPrefixedSlice(Rep, xid);
         _contentFlags |= ContentFlags.HasEndPrepare;
     }
 
@@ -667,12 +748,12 @@ public sealed partial class WriteBatch : IDisposable
     internal void MarkEndPrepare(ReadOnlySpan<byte> xid, bool writeAfterCommit, bool unpreparedBatch)
     {
         // a manually constructed batch can only contain one prepare section
-        if (_rep.WrittenCount <= HeaderSize || _rep.WrittenSpan[HeaderSize] != (byte)EntryType.Noop)
+        if (Rep.WrittenCount <= HeaderSize || Rep.WrittenSpan[HeaderSize] != (byte)EntryType.Noop)
             ThrowHelper.InvalidArgument("MarkEndPrepare requires a batch that starts with a Noop");
         // all savepoints up to this point are cleared
         _savePointCount = 0;
         // rewrite noop as begin marker
-        _rep.WrittenSpanMutable[HeaderSize] = (byte)GetBeginPrepareType(writeAfterCommit, unpreparedBatch);
+        Rep.WrittenSpanMutable[HeaderSize] = (byte)GetBeginPrepareType(writeAfterCommit, unpreparedBatch);
         _contentFlags |= ContentFlags.HasBeginPrepare;
         if (unpreparedBatch) _contentFlags |= ContentFlags.HasBeginUnprepare;
         InsertEndPrepare(xid);
@@ -681,8 +762,8 @@ public sealed partial class WriteBatch : IDisposable
     /// <summary>WriteBatchInternal::MarkCommit.</summary>
     internal void MarkCommit(ReadOnlySpan<byte> xid)
     {
-        _rep.WriteByte((byte)EntryType.CommitXID);
-        Coding.PutLengthPrefixedSlice(_rep, xid);
+        Rep.WriteByte((byte)EntryType.CommitXID);
+        Coding.PutLengthPrefixedSlice(Rep, xid);
         _contentFlags |= ContentFlags.HasCommit;
     }
 
@@ -690,17 +771,17 @@ public sealed partial class WriteBatch : IDisposable
     internal void MarkCommitWithTimestamp(ReadOnlySpan<byte> xid, ReadOnlySpan<byte> commitTimestamp)
     {
         if (commitTimestamp.IsEmpty) ThrowHelper.InvalidArgument("commit timestamp must not be empty");
-        _rep.WriteByte((byte)EntryType.CommitXIDAndTimestamp);
-        Coding.PutLengthPrefixedSlice(_rep, commitTimestamp);
-        Coding.PutLengthPrefixedSlice(_rep, xid);
+        Rep.WriteByte((byte)EntryType.CommitXIDAndTimestamp);
+        Coding.PutLengthPrefixedSlice(Rep, commitTimestamp);
+        Coding.PutLengthPrefixedSlice(Rep, xid);
         _contentFlags |= ContentFlags.HasCommit;
     }
 
     /// <summary>WriteBatchInternal::MarkRollback.</summary>
     internal void MarkRollback(ReadOnlySpan<byte> xid)
     {
-        _rep.WriteByte((byte)EntryType.RollbackXID);
-        Coding.PutLengthPrefixedSlice(_rep, xid);
+        Rep.WriteByte((byte)EntryType.RollbackXID);
+        Coding.PutLengthPrefixedSlice(Rep, xid);
         _contentFlags |= ContentFlags.HasRollback;
     }
 
@@ -728,13 +809,13 @@ public sealed partial class WriteBatch : IDisposable
         }
         else
         {
-            srcLen = src._rep.WrittenCount - HeaderSize;
+            srcLen = src.Rep.WrittenCount - HeaderSize;
             srcCount = (uint)src.Count;
             srcFlags = src._contentFlags;
         }
         dst.SetCount((uint)dst.Count + srcCount);
         if ((dst._protInfo ?? src._protInfo) is not null) dst.AppendProtection(src, (int)srcCount);
-        dst._rep.Write(src._rep.WrittenSpan.Slice(HeaderSize, srcLen));
+        dst.Rep.Write(src.Rep.WrittenSpan.Slice(HeaderSize, srcLen));
         dst._contentFlags |= srcFlags;
     }
 
@@ -744,7 +825,7 @@ public sealed partial class WriteBatch : IDisposable
     /// </summary>
     internal void SetContentsWalOnly(WriteBatch src)
     {
-        SetContents(src._rep.WrittenSpan[..HeaderSize]);
+        SetContents(src.Rep.WrittenSpan[..HeaderSize]);
         SetCount(0);
         _contentFlags = ContentFlags.None;
         Append(this, src, walOnly: true);
@@ -758,7 +839,7 @@ public sealed partial class WriteBatch : IDisposable
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void SaveState(out SavePoint save) =>
-        save = _maxBytes == 0 ? default : new SavePoint(_rep.WrittenCount, (uint)Count, _contentFlags);
+        save = _maxBytes == 0 ? default : new SavePoint(Rep.WrittenCount, (uint)Count, _contentFlags);
 
     /// <summary>
     /// Reserves room for a record of the given payload sizes and writes the tag (+ CF id). Returns the span to write
@@ -767,11 +848,12 @@ public sealed partial class WriteBatch : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private Span<byte> BeginRecord(EntryType defaultCfTag, EntryType cfTag, uint columnFamilyId, int keyLength, long valueLength, out int p)
     {
+        ThrowIfDisposed();
         // RocksDatabase.MaxKeyLength / MaxValueLength (a deviation from upstream's uint32 limits): checked before
         // anything is written, so the batch and the database are unchanged by a rejected record.
         if ((uint)keyLength > RocksDatabase.MaxKeyLength || (ulong)valueLength > RocksDatabase.MaxValueLength) ThrowTooLarge(keyLength, valueLength);
         long max = 1 + Coding.MaxVarint32Length + (2L * Coding.MaxVarint32Length) + keyLength + valueLength;
-        Span<byte> dst = _rep.GetSpan((int)max);
+        Span<byte> dst = Rep.GetSpan((int)max);
         if (columnFamilyId == 0)
         {
             dst[0] = (byte)defaultCfTag;
@@ -812,18 +894,18 @@ public sealed partial class WriteBatch : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void CommitRecord(int length, ContentFlags flag, bool counted, in SavePoint save)
     {
-        _rep.Advance(length);
+        Rep.Advance(length);
         if (counted) IncrementCount();
         _contentFlags |= flag;
         // LocalSavePoint::commit
-        if (_maxBytes != 0 && _rep.WrittenCount > _maxBytes) RollbackAndThrowMemoryLimit(save);
-        if (counted && _protInfo is not null) ProtectRecord(_rep.WrittenCount - length);
+        if (_maxBytes != 0 && Rep.WrittenCount > _maxBytes) RollbackAndThrowMemoryLimit(save);
+        if (counted && _protInfo is not null) ProtectRecord(Rep.WrittenCount - length);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void RollbackAndThrowMemoryLimit(in SavePoint save)
     {
-        _rep.Truncate(save.Size);
+        Rep.Truncate(save.Size);
         SetCount(save.Count);
         _contentFlags = save.Flags;
         throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Memory limit reached: Write batch is too big",
@@ -844,7 +926,7 @@ public sealed partial class WriteBatch : IDisposable
         _savePoints ??= new SavePoint[4];
         if (_savePointCount == _savePoints.Length) Array.Resize(ref _savePoints, _savePoints.Length * 2);
         // Record length and count of current batch of writes.
-        _savePoints[_savePointCount++] = new SavePoint(_rep.WrittenCount, (uint)Count, _contentFlags);
+        _savePoints[_savePointCount++] = new SavePoint(Rep.WrittenCount, (uint)Count, _contentFlags);
     }
 
     /// <summary>
@@ -856,13 +938,13 @@ public sealed partial class WriteBatch : IDisposable
         if (_savePointCount == 0) return false;
         // Pop the most recent savepoint off the stack
         SavePoint sp = _savePoints![--_savePointCount];
-        if (sp.Size == _rep.WrittenCount)
+        if (sp.Size == Rep.WrittenCount)
         {
             // No changes to rollback
         }
         else
         {
-            _rep.Truncate(sp.Size);
+            Rep.Truncate(sp.Size);
             SetCount(sp.Count);
             _contentFlags = sp.Flags;
             TruncateProtection(sp.Count);
@@ -881,11 +963,11 @@ public sealed partial class WriteBatch : IDisposable
     // ---- Iteration --------------------------------------------------------------------------------------------
 
     /// <summary>Returns an allocation-free reader over the records (usable with <c>foreach</c>).</summary>
-    public WriteBatchReader GetEnumerator() => new(_rep.WrittenSpan);
+    public WriteBatchReader GetEnumerator() => new(Rep.WrittenSpan);
 
     /// <summary>Invokes <paramref name="handler"/> for every record. Port of <c>WriteBatch::Iterate</c>.</summary>
     public void Iterate<THandler>(ref THandler handler) where THandler : IWriteBatchHandler =>
-        Iterate(_rep.WrittenSpan, ref handler);
+        Iterate(Rep.WrittenSpan, ref handler);
 
     /// <summary>
     /// Invokes <paramref name="handler"/> for every record of <paramref name="rep"/> and validates the record count.
@@ -978,10 +1060,10 @@ public sealed partial class WriteBatch : IDisposable
     /// <summary>Iterates a sub-range [<paramref name="begin"/>, <paramref name="end"/>) of the rep without count validation.</summary>
     internal void Iterate<THandler>(int begin, int end, ref THandler handler) where THandler : IWriteBatchHandler
     {
-        int size = _rep.WrittenCount;
+        int size = Rep.WrittenCount;
         if (begin > size || end > size || end < begin) ThrowHelper.Corruption("Invalid start/end bounds for Iterate");
         bool wholeBatch = begin == HeaderSize && end == size;
-        IterateRecords(_rep.WrittenSpan[begin..end], wholeBatch, (uint)Count, ref handler);
+        IterateRecords(Rep.WrittenSpan[begin..end], wholeBatch, (uint)Count, ref handler);
     }
 
     private static void IterateRecords<THandler>(ReadOnlySpan<byte> input, bool wholeBatch, uint count, ref THandler handler)

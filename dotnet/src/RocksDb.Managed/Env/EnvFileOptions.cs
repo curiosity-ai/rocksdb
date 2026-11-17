@@ -134,6 +134,35 @@ public sealed class WritableFileOptions
         copy._truncateToSizeOnClose = true;
         return copy;
     }
+
+    /// <summary>
+    /// The DB's file I/O listeners (WritableFileWriter::listeners_): <see cref="LocalWritableFile"/> reports each physical
+    /// write (OnFileWriteFinish, OnIOError) and range sync (OnFileRangeSyncFinish) to it, and the truncation of a direct
+    /// I/O file on close (OnFileTruncateFinish). Null (the default) when no listener wants file I/O notifications. Set by
+    /// the DB only for the files upstream reports on, which it also wraps in a <see cref="Db.NotifyingWritableFile"/>.
+    /// </summary>
+    internal Db.FileIoNotifier? FileIoNotifier
+    {
+        get => _fileIoNotifier;
+        init => _fileIoNotifier = value;
+    }
+
+    private Db.FileIoNotifier? _fileIoNotifier;
+
+    /// <summary>
+    /// Whether the range syncs of <see cref="BytesPerSync"/> are reported to <see cref="FileIoNotifier"/> (true, the
+    /// default; false for a writeback the DB adds where upstream's writer does none).
+    /// </summary>
+    internal bool ReportRangeSyncs { get; init; } = true;
+
+    /// <summary>A copy of these options with <see cref="FileIoNotifier"/> set to <paramref name="notifier"/> (these options when it is already).</summary>
+    internal WritableFileOptions WithFileIoNotifier(Db.FileIoNotifier? notifier)
+    {
+        if (ReferenceEquals(FileIoNotifier, notifier)) return this;
+        var copy = (WritableFileOptions)MemberwiseClone();
+        copy._fileIoNotifier = notifier;
+        return copy;
+    }
 }
 
 /// <summary>Options for random-access readers (RandomAccessFileReader / PosixRandomAccessFile).</summary>

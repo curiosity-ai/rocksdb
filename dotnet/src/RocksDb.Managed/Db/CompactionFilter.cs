@@ -144,8 +144,48 @@ public abstract class CompactionFilter
     internal const string IgnoreSnapshotsFalseMessage = "CompactionFilter::IgnoreSnapshots() = false is not supported anymore.";
 }
 
-/// <summary>Port of CompactionFilter::Context: information about the compaction a filter is created for.</summary>
-public readonly record struct CompactionFilterContext(bool IsFullCompaction, bool IsManualCompaction, uint ColumnFamilyId, bool IsFlush);
+/// <summary>
+/// Port of CompactionFilter::Context: information about the table file creation (compaction, flush or WAL recovery
+/// flush) a filter is created for.
+/// </summary>
+/// <param name="IsFullCompaction">The compaction includes all table files (always false for flushes).</param>
+/// <param name="IsManualCompaction">The compaction was requested by the client (always false for flushes).</param>
+/// <param name="ColumnFamilyId">The column family that will contain the created table file.</param>
+/// <param name="IsFlush">The file is written by a flush (<see cref="Reason"/> is Flush or Recovery).</param>
+public readonly record struct CompactionFilterContext(bool IsFullCompaction, bool IsManualCompaction, uint ColumnFamilyId, bool IsFlush)
+{
+    /// <summary>Context::kUnknownStartLevel.</summary>
+    public const int UnknownStartLevel = -1;
+
+    /// <summary>Context::reason: why this table file is being created (Compaction, Flush or Recovery).</summary>
+    public TableFileCreationReason Reason { get; init; } = IsFlush ? TableFileCreationReason.Flush : TableFileCreationReason.Compaction;
+
+    /// <summary>
+    /// Context::input_start_level: the lowest level among the input files of the compaction, or
+    /// <see cref="UnknownStartLevel"/> for flushes.
+    /// </summary>
+    public int InputStartLevel { get; init; } = UnknownStartLevel;
+
+    private readonly IReadOnlyDictionary<string, Table.TableProperties>? _inputTableProperties;
+
+    /// <summary>
+    /// Context::input_table_properties: the table properties of every input file of the compaction, keyed by the file's
+    /// path (as <see cref="ColumnFamily.GetPropertiesOfAllTables"/> keys them), including the user properties written by
+    /// table properties collectors. Empty for flushes (no input files), and empty when the properties of an input file
+    /// could not be loaded (upstream logs the error and creates the filter anyway; the compaction itself then fails when
+    /// it reads that file).
+    /// <para>
+    /// Filled from the table readers the compaction opens for its inputs: no extra file read when the readers are
+    /// already open (table cache); otherwise the readers are opened a little earlier than the compaction would open them.
+    /// Only computed when a factory creates the filter. Read-only; shared by the filters of all subcompactions.
+    /// </para>
+    /// </summary>
+    public IReadOnlyDictionary<string, Table.TableProperties> InputTableProperties
+    {
+        get => _inputTableProperties ?? System.Collections.ObjectModel.ReadOnlyDictionary<string, Table.TableProperties>.Empty;
+        init => _inputTableProperties = value;
+    }
+}
 
 /// <summary>Port of rocksdb::CompactionFilterFactory: creates one (possibly stateful) filter per compaction.</summary>
 public abstract class CompactionFilterFactory
@@ -153,11 +193,24 @@ public abstract class CompactionFilterFactory
     /// <summary>Name persisted in the OPTIONS file (<c>compaction_filter_factory</c>).</summary>
     public abstract string Name { get; }
 
-    /// <summary>Creates the filter for one compaction (or flush, if <see cref="ShouldFilterTableFileCreation"/>), or null for none.</summary>
+    /// <summary>Creates the filter for one compaction (or flush, if <see cref="ShouldFilterTableFileCreation(TableFileCreationReason)"/>), or null for none.</summary>
     public abstract CompactionFilter? CreateCompactionFilter(in CompactionFilterContext context);
 
-    /// <summary>Port of ShouldFilterTableFileCreation: by default only compactions (not flushes) are filtered.</summary>
+    /// <summary>
+    /// Simplified form of <see cref="ShouldFilterTableFileCreation(TableFileCreationReason)"/>: <paramref name="isFlush"/>
+    /// is true for flushes and WAL recovery flushes. By default only compactions (not flushes) are filtered.
+    /// </summary>
     public virtual bool ShouldFilterTableFileCreation(bool isFlush) => !isFlush;
+
+    /// <summary>
+    /// Port of ShouldFilterTableFileCreation(TableFileCreationReason): whether table files created for
+    /// <paramref name="reason"/> (Compaction, Flush, or Recovery for the flushes of a WAL replay at open) go through a
+    /// filter from <see cref="CreateCompactionFilter"/>. The default asks
+    /// <see cref="ShouldFilterTableFileCreation(bool)"/> (Flush and Recovery are flushes), so by default, like upstream,
+    /// only compactions are filtered. Override this overload to tell flushes from recovery flushes.
+    /// </summary>
+    public virtual bool ShouldFilterTableFileCreation(TableFileCreationReason reason) =>
+        ShouldFilterTableFileCreation(isFlush: reason != TableFileCreationReason.Compaction);
 }
 
 /// <summary>

@@ -203,7 +203,7 @@ internal sealed partial class DbImpl
         }
         catch (RocksDbException e) when (e.SubCode == StatusSubCode.PathNotFound && !Options.CreateIfMissing)
         {
-            throw RocksDbException.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
+            throw RocksDbException.InvalidArgument(FileNames.CurrentFilePath(DbName) + ": does not exist (create_if_missing is false)");
         }
 
         InitInfoLog();
@@ -211,7 +211,7 @@ internal sealed partial class DbImpl
         bool exists = Options.BestEffortsRecovery ? HasNonEmptyManifest() : FileSystem.FileExists(FileNames.CurrentFilePath(DbName));
         if (!exists)
         {
-            if (!Options.CreateIfMissing) ThrowHelper.InvalidArgument(DbName + ": does not exist (create_if_missing is false)");
+            if (!Options.CreateIfMissing) ThrowHelper.InvalidArgument(FileNames.CurrentFilePath(DbName) + ": does not exist (create_if_missing is false)");
             await NewDbAsync(descriptors[DefaultColumnFamilyName], synchronous, ct).ConfigureAwait(false);
         }
         else if (Options.ErrorIfExists)
@@ -234,7 +234,7 @@ internal sealed partial class DbImpl
             bool hasMissingFiles;
             try
             {
-                state = ManifestReader.TryRecoverPointInTime(FileSystem, DbName, _comparatorResolver, pointInTimeVerifier, out manifestNumber,
+                state = ManifestReader.TryRecoverPointInTime(ManifestFileSystem, DbName, _comparatorResolver, pointInTimeVerifier, out manifestNumber,
                     out hasMissingFiles);
             }
             finally
@@ -245,7 +245,7 @@ internal sealed partial class DbImpl
         }
         else
         {
-            state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
+            state = ManifestReader.RecoverFromDirectory(ManifestFileSystem, DbName, _comparatorResolver, out manifestNumber);
         }
         Versions.RecoverFrom(state, manifestNumber);
         MarkExistingFileNumbersUsed();
@@ -266,11 +266,10 @@ internal sealed partial class DbImpl
         if (missing.Count > 0 && !Options.CreateMissingColumnFamilies) ThrowHelper.InvalidArgument("Column family not found: " + missing[0]);
 
         // ---- DB identity (DBImpl::SetupDBId) ----
-        string? dbId = state.DbId;
-        if (dbId is null && FileSystem.FileExists(FileNames.IdentityFileName(DbName))) dbId = FileNames.ReadIdentityFile(FileSystem, DbName);
-        dbId ??= FileNames.GenerateUniqueId();
-        if (Options.WriteIdentityFile && !FileSystem.FileExists(FileNames.IdentityFileName(DbName)))
+        string? dbId = SetupDbIdFromIdentityFile(state.DbId, out bool identityFileOk);
+        if (!identityFileOk && Options.WriteIdentityFile)
         {
+            // "Persist it to IDENTITY file if allowed": a missing, empty or mismatching IDENTITY is rewritten.
             await FileNames.SetIdentityFileAsync(FileSystem, DbName, dbId, synchronous, ct).ConfigureAwait(false);
         }
         Versions.DbId = dbId;
@@ -375,6 +374,7 @@ internal sealed partial class DbImpl
             // get recycled otherwise (min_wal_number_to_recycle_).
             _minWalNumberToRecycle = newLogNumber;
             _logNumber = newLogNumber;
+            _currentWalBaseSequence = Versions.LastSequence;
             _walTrackingStart = newLogNumber;
             _aliveWals.Add(newLogNumber);
         }
@@ -446,6 +446,32 @@ internal sealed partial class DbImpl
         StartStatsPersist();
         EnableBackgroundCompactions();
         RegisterRecordSeqnoTimeWorker();
+    }
+
+    /// <summary>
+    /// The IDENTITY part of DBImpl::SetupDBId (db/db_impl/db_impl_files.cc): the DB id is the MANIFEST's
+    /// (<paramref name="manifestDbId"/>), else a non-empty IDENTITY file's, else a newly generated one.
+    /// <paramref name="identityFileOk"/> is false when IDENTITY is "missing or no good" (absent, empty, or not matching
+    /// the MANIFEST), i.e. when a writable open rewrites it. Opening a new DB reads back the id NewDB wrote.
+    /// </summary>
+    private string SetupDbIdFromIdentityFile(string? manifestDbId, out bool identityFileOk)
+    {
+        identityFileOk = false;
+        if (FileSystem.FileExists(FileNames.IdentityFileName(DbName)))
+        {
+            string inFile = FileNames.ReadIdentityFile(FileSystem, DbName);
+            if (inFile.Length > 0)
+            {
+                // Loaded from file and wasn't already known from manifest, or matches the manifest.
+                if (string.IsNullOrEmpty(manifestDbId) || manifestDbId == inFile)
+                {
+                    identityFileOk = true;
+                    return inFile;
+                }
+            }
+        }
+        // Otherwise IDENTITY file is missing or no good. Generate new id if needed.
+        return string.IsNullOrEmpty(manifestDbId) ? FileNames.GenerateUniqueId() : manifestDbId;
     }
 
     /// <summary>
@@ -724,7 +750,7 @@ internal sealed partial class DbImpl
         string manifest = FileNames.DescriptorFileName(DbName, manifestNumber);
         try
         {
-            using (ManifestLogWriter log = ManifestLogWriter.Create(FileSystem, manifest))
+            using (ManifestLogWriter log = ManifestLogWriter.Create(ManifestFileSystem, manifest))
             {
                 var writer = new ManifestWriter(log);
                 await writer.AddEditAsync(edit, 0, sync: true, synchronous, ct).ConfigureAwait(false);
@@ -1279,12 +1305,14 @@ internal sealed partial class DbImpl
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         // WriteLevel0TableForRecovery writes blob files too (BlobFileCreationReason::kRecovery). The blob files stay
         // registered as pending outputs, like the table file, until the recovery edits are installed.
-        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Recovery);
+        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, BlobFileCreationReason.Recovery, 0);
         FileMetaData? meta;
         try
         {
             SeqnoToTimeMapping? seqnoToTime;
             lock (_mutex) seqnoToTime = CopySeqnoToTimeMapping(cfd);
+            // WriteLevel0TableForRecovery -> BuildTable: NotifyTableFileCreationStarted (kRecovery).
+            NotifyOnTableFileCreationStarted(cfd, 0, path, TableFileCreationReason.Recovery);
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [],
                     CurrentSnapshotChecker, blobBuilder, null, seqnoToTime, null /* BuildTable(version = nullptr) */, null,
                     new FlushJobContext(TableFileCreationReason.Recovery, DbFormat.MaxSequenceNumber, Options.EnforceSingleDelContracts), synchronous, ct)

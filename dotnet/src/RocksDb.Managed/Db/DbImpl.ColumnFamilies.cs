@@ -67,7 +67,8 @@ internal sealed partial class DbImpl
         {
             ExitUnbatched(w, synchronous);
         }
-        if (writeOptionsFile) await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
+        // The column family is committed: a cancellation now would report a creation that happened as not done.
+        if (writeOptionsFile) await WriteOptionsFileAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
         return cfd;
     }
 
@@ -108,7 +109,8 @@ internal sealed partial class DbImpl
         PurgeObsoleteFiles();
         RegisterRecordSeqnoTimeWorker();
         RescheduleCompactionTrigger();
-        await WriteOptionsFileAsync(synchronous, ct).ConfigureAwait(false);
+        // The drop is committed: not cancellable any more (a cancellation would report it as not done).
+        await WriteOptionsFileAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>

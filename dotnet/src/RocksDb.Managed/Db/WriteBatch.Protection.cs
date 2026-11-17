@@ -50,7 +50,7 @@ public sealed partial class WriteBatch
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void ProtectRecord(int recordStart)
     {
-        ReadOnlySpan<byte> record = _rep.WrittenSpan[recordStart..];
+        ReadOnlySpan<byte> record = Rep.WrittenSpan[recordStart..];
         var reader = new WriteBatchReader(record, wholeBatch: false, count: 0);
         if (!reader.TryReadNext(out WriteBatchEntry e)) return;
         AddProtection(Compute(e));
@@ -91,7 +91,7 @@ public sealed partial class WriteBatch
         _protectionBytesPerKey = 8;
         _protInfo = new ulong[Math.Max(8, Count)];
         _protCount = 0;
-        foreach (WriteBatchEntry e in new WriteBatchReader(_rep.WrittenSpan))
+        foreach (WriteBatchEntry e in new WriteBatchReader(Rep.WrittenSpan))
         {
             if (e.IsCounted) AddProtection(Compute(e));
         }
@@ -106,7 +106,7 @@ public sealed partial class WriteBatch
     {
         if (_protInfo is null) return;
         ReadOnlySpan<ulong> prot = ProtectionInfo;
-        var reader = new WriteBatchReader(_rep.WrittenSpan[HeaderSize..], wholeBatch: false, count: 0);
+        var reader = new WriteBatchReader(Rep.WrittenSpan[HeaderSize..], wholeBatch: false, count: 0);
         int idx = 0;
         while (idx < prot.Length && reader.TryReadNext(out WriteBatchEntry e))
         {

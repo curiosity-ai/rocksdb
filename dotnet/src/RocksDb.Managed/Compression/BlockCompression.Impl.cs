@@ -307,7 +307,7 @@ public static partial class BlockCompression
                     return false;
                 }
                 int n = Coding.DecodeVarint64(compressed, out ulong size);
-                if (n == 0 || size > int.MaxValue)
+                if (n == 0 || size > (ulong)Array.MaxLength)
                 {
                     return false;
                 }
@@ -346,11 +346,7 @@ public static partial class BlockCompression
         {
             ThrowHelper.Corruption("Unable to extract uncompressed size");
         }
-        if (size64 > int.MaxValue)
-        {
-            ThrowHelper.Corruption("Uncompressed size too large");
-        }
-        int size = (int)size64;
+        int size = CheckedUncompressedSize(type, size64, compressed.Length - n);
         ReadOnlySpan<byte> payload = compressed[n..];
         Span<byte> dst = output.GetSpan(size)[..size];
         switch (type)
@@ -387,18 +383,47 @@ public static partial class BlockCompression
             _ => "Unknown compression type",
         });
 
+    /// <summary>
+    /// The largest output <paramref name="payloadLength"/> bytes of a valid stream can decode to: snappy 64 bytes per
+    /// 3-byte copy, LZ4 255 bytes per match-length byte, deflate 258 bytes per 2 bits, zstd one 128 KiB block per
+    /// 4-byte RLE block.
+    /// </summary>
+    private static ulong MaxExpansion(CompressionType type, int payloadLength) => type switch
+    {
+        CompressionType.Snappy => 22UL * (ulong)payloadLength,
+        CompressionType.LZ4 or CompressionType.LZ4HC => 256UL * (ulong)payloadLength + 64,
+        CompressionType.Zlib => 1040UL * (ulong)payloadLength + 4096,
+        _ => 32768UL * (ulong)payloadLength + (128 << 10),
+    };
+
+    /// <summary>
+    /// The uncompressed size a block's header claims, as an array length. Upstream (Decompressor::ExtractUncompressedSize,
+    /// util/compression.cc) allocates whatever the header says and the decompressor then fails, so a corrupt size ends
+    /// in Corruption; here a size no array can hold (more than <see cref="Array.MaxLength"/>), or more than the payload
+    /// could expand to, is reported as that same Corruption up front instead of an OutOfMemoryException or a
+    /// multi-gigabyte allocation (no valid stream is rejected).
+    /// </summary>
+    internal static int CheckedUncompressedSize(CompressionType type, ulong size, int payloadLength)
+    {
+        if (size > (ulong)Array.MaxLength) ThrowHelper.Corruption("Uncompressed size too large");
+        if (size > MaxExpansion(type, payloadLength)) ThrowHelper.Corruption("Uncompressed size " + size + " impossible for a " + payloadLength + " byte " + type + " payload");
+        return (int)size;
+    }
+
     private static void DecompressSnappy(ReadOnlySpan<byte> compressed, IBufferWriter<byte> output)
     {
         int len;
         try
         {
+            // snappy::GetUncompressedLength accepts any varint32; Snappier returns it as a (possibly negative) int.
             len = Snappier.Snappy.GetUncompressedLength(compressed);
         }
         catch (InvalidDataException)
         {
-            ThrowHelper.Corruption("Error decompressing snappy data");
+            ThrowHelper.Corruption("Error reading snappy compressed length");
             return;
         }
+        len = CheckedUncompressedSize(CompressionType.Snappy, len < 0 ? ulong.MaxValue : (ulong)len, compressed.Length);
         Span<byte> dst = output.GetSpan(len)[..len];
         bool ok;
         int written;

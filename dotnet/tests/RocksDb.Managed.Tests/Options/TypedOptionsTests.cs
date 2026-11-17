@@ -169,10 +169,12 @@ public sealed class TypedOptionsTests
         o.TableOptions.SetOption("flush_block_policy_factory", "FlushBlockEveryKeyPolicyFactory", preserveUnknown: false);
         Assert.AreEqual(FlushBlockPolicyType.EveryKey, o.TableOptions.FlushBlockPolicy);
 
-        var ex = Assert.ThrowsExactly<RocksDbException>(() => o.SetOption("memtable_factory", "NoSuchFactory", preserveUnknown: true));
-        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
-        ex = Assert.ThrowsExactly<RocksDbException>(() => o.SetOption("table_factory", "NoSuchTable", preserveUnknown: true));
-        Assert.AreEqual(StatusCode.InvalidArgument, ex.Code);
+        // An unregistered factory id is NotSupported upstream, which ConfigOptions::ignore_unsupported_options (default
+        // true) ignores: the option keeps its value (audit #7, checked against native).
+        o.SetOption("memtable_factory", "NoSuchFactory", preserveUnknown: true);
+        Assert.AreEqual(MemTableFactoryType.SkipList, o.MemtableFactory);
+        o.SetOption("table_factory", "NoSuchTable", preserveUnknown: true);
+        Assert.AreEqual(TableFactoryType.BlockBasedTable, o.TableFactory);
     }
 
     [TestMethod]

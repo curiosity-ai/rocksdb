@@ -424,7 +424,10 @@ public sealed class SstFileManager : IDisposable
         private readonly Queue<(string TrashPath, string Dir, ulong Size)> _queue = new();
         private readonly SemaphoreSlim _signal = new(0);
         private readonly CancellationTokenSource _close = new();
-        private readonly Task _worker;
+        // Set while the worker is not deleting a file: Dispose waits only for a deletion in progress (which runs on a
+        // thread already), not for the worker task, whose continuations need a .NET thread-pool thread.
+        private readonly ManualResetEventSlim _notDeleting = new(true);
+        private bool _disposed; // guarded by _lock
         private long _rateBytesPerSecond;
         private double _maxTrashDbRatio;
         private long _totalTrashSize;
@@ -438,7 +441,7 @@ public sealed class SstFileManager : IDisposable
             _rateBytesPerSecond = rateBytesPerSecond;
             _maxTrashDbRatio = maxTrashDbRatio;
             _empty.TrySetResult();
-            _worker = Task.Run(BackgroundEmptyTrashAsync);
+            _ = Task.Run(BackgroundEmptyTrashAsync);
         }
 
         public long RateBytesPerSecond
@@ -527,7 +530,10 @@ public sealed class SstFileManager : IDisposable
                     (string TrashPath, string Dir, ulong Size) item;
                     lock (_lock)
                     {
+                        // Nothing is deleted once Dispose began (it waits only for a deletion already in progress).
+                        if (_disposed) return;
                         if (!_queue.TryDequeue(out item)) break;
+                        _notDeleting.Reset();
                     }
                     if (rate != RateBytesPerSecond)
                     {
@@ -537,14 +543,21 @@ public sealed class SstFileManager : IDisposable
                     }
                     try
                     {
-                        _fs.DeleteFile(item.TrashPath);
-                        if (item.Dir.Length != 0) _fs.SyncDirectory(item.Dir);
+                        try
+                        {
+                            _fs.DeleteFile(item.TrashPath);
+                            if (item.Dir.Length != 0) _fs.SyncDirectory(item.Dir);
+                        }
+                        catch (Exception e) when (e is IOException or RocksDbException)
+                        {
+                        }
+                        _sfm.OnDeleteFile(item.TrashPath);
+                        Interlocked.Add(ref _totalTrashSize, -(long)item.Size);
                     }
-                    catch (Exception e) when (e is IOException or RocksDbException)
+                    finally
                     {
+                        _notDeleting.Set();
                     }
-                    _sfm.OnDeleteFile(item.TrashPath);
-                    Interlocked.Add(ref _totalTrashSize, -(long)item.Size);
                     totalDeleted += item.Size;
                     if (rate > 0)
                     {
@@ -574,9 +587,12 @@ public sealed class SstFileManager : IDisposable
 
         public void Dispose()
         {
+            lock (_lock) _disposed = true;
             _close.Cancel();
-            try { _worker.Wait(TimeSpan.FromSeconds(30)); }
-            catch (AggregateException) { }
+            // ~DeleteScheduler joins its thread; here only a deletion in progress is waited for. The worker task itself
+            // ends whenever the thread pool runs its cancelled wait: waiting for it made every close of a DB (each owns
+            // an SstFileManager by default) depend on a free .NET thread-pool thread, up to 30 s under starvation.
+            _notDeleting.Wait();
             lock (_lock) _empty.TrySetResult();
         }
     }

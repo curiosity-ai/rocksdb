@@ -372,6 +372,35 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>
+    /// The last sequence number when the current WAL became the one written to: every write logged to it has a larger
+    /// sequence number. 0 when no WAL is written. Managed (WAL tailing: a sequence above it can still appear in the
+    /// current WAL even while that WAL holds no record on disk yet, e.g. with manual_wal_flush).
+    /// </summary>
+    public ulong CurrentWalBaseSequence
+    {
+        get
+        {
+            lock (_mutex) return _logNumber == 0 ? 0 : _currentWalBaseSequence;
+        }
+    }
+
+    /// <summary>
+    /// Managed (WAL tailing): the file offset up to which WAL <paramref name="walNumber"/> holds complete records this
+    /// instance's writer pushed to the file - <see cref="Wal.LogWriter.FlushedRecordEnd"/> of the current WAL, or of an
+    /// alive WAL at the switch that closed it. A reader that cannot get that far is stopped by data it cannot read
+    /// (damage; upstream's log readers take a recycled log's bad record, or a record length past the end of the data,
+    /// for the end of the log). -1 when unknown: a WAL of an earlier instance, or one no longer alive.
+    /// </summary>
+    internal long WalWrittenEnd(ulong walNumber)
+    {
+        lock (_mutex)
+        {
+            if (walNumber == _logNumber && _log is { } log) return log.FlushedRecordEnd;
+            return _closedWalWrittenEnds.TryGetValue(walNumber, out long end) ? end : -1;
+        }
+    }
+
     /// <summary>Port of DBImpl::GetCurrentWalFile (WalManager::GetLiveWalFile): the WAL currently written to.</summary>
     public WalFileInfo GetCurrentWalFile()
     {
@@ -424,19 +453,32 @@ internal sealed partial class DbImpl
         allLogs.RemoveRange(0, startIndex);
     }
 
-    /// <summary>Opens a WAL for sequential reading; alive WALs fall back to the archive (TransactionLogIteratorImpl::OpenLogFile).</summary>
+    /// <summary>
+    /// Opens a WAL for sequential reading; alive WALs fall back to the archive (TransactionLogIteratorImpl::OpenLogFile,
+    /// whose SequentialFileReader gets the listeners: the reads are reported to the file I/O listeners).
+    /// </summary>
     internal Env.ISequentialFile OpenWalForRead(WalFileInfo file)
     {
-        if (file.Type == WalFileType.ArchivedLogFile) return FileSystem.OpenSequential(FileNames.ArchivedLogFileName(WalDir, file.LogNumber));
-        try
+        string path = file.Type == WalFileType.ArchivedLogFile ? FileNames.ArchivedLogFileName(WalDir, file.LogNumber) : FileNames.LogFileName(WalDir, file.LogNumber);
+        Env.ISequentialFile f;
+        if (file.Type == WalFileType.ArchivedLogFile)
         {
-            return FileSystem.OpenSequential(FileNames.LogFileName(WalDir, file.LogNumber));
+            f = FileSystem.OpenSequential(path);
         }
-        catch (RocksDbException)
+        else
         {
-            // If cannot open file in DB directory, try the archive dir, as it could have moved in the meanwhile.
-            return FileSystem.OpenSequential(FileNames.ArchivedLogFileName(WalDir, file.LogNumber));
+            try
+            {
+                f = FileSystem.OpenSequential(path);
+            }
+            catch (RocksDbException)
+            {
+                // If cannot open file in DB directory, try the archive dir, as it could have moved in the meanwhile.
+                path = FileNames.ArchivedLogFileName(WalDir, file.LogNumber);
+                f = FileSystem.OpenSequential(path);
+            }
         }
+        return FileIoNotifier.Wrap(FileIo, f, path);
     }
 
     // ---- write-path signal ---------------------------------------------------------------------------------

@@ -327,6 +327,31 @@ internal sealed class ErrorHandler
         }
     }
 
+    /// <summary>
+    /// Managed addition (no upstream counterpart): sets <paramref name="err"/> as a hard background error with
+    /// <paramref name="reason"/>, without the severity maps and without automatic recovery: writes stop until
+    /// <see cref="RocksDatabase.Resume"/>. Used for a UserWriteCallback that threw (DbImpl.OnUserWriteCallbackFailed),
+    /// which upstream treats as undefined behaviour and whose status the maps would classify as fatal. Listeners are
+    /// told (OnBackgroundError may suppress or replace the error, as in HandleKnownErrors). Called without the mutex.
+    /// </summary>
+    internal RocksDbException? SetHardBgError(RocksDbException err, BackgroundErrorReason reason)
+    {
+        Interlocked.Increment(ref _errorCount);
+        _db.Stats?.RecordTick(Ticker.ErrorHandlerBgErrorCount);
+        _db.LogWarn("Background error " + err.Message + ", reason " + (int)reason);
+        RocksDbException classified = err.WithSeverity(ErrorSeverity.HardError);
+        lock (_db.Mutex)
+        {
+            if (_recoveryInProgress && _recoveryError is null) _recoveryError = classified;
+        }
+        RocksDbException? s = NotifyOnBackgroundError(reason, classified, autoRecovery: false, out _);
+        lock (_db.Mutex)
+        {
+            if (s is not null) CheckAndSetRecoveryAndBgError(s, walRelated: false, FlushReason.ErrorRecovery);
+            return _bgError;
+        }
+    }
+
     private static ErrorSeverity Severity(RocksDbException? e) => e?.Severity ?? ErrorSeverity.NoError;
 
     /// <summary>
@@ -459,7 +484,9 @@ internal sealed class ErrorHandler
     {
         DbOptions o = _db.Options;
         int resumeCount = o.MaxBgErrorResumeCount;
-        TimeSpan interval = TimeSpan.FromMicroseconds(o.BgErrorResumeRetryInterval);
+        // bgerror_resume_retry_interval is any uint64 of microseconds; Task.Delay takes at most uint.MaxValue - 1 ms
+        // (~49.7 days), longer waits are indistinguishable (close cancels the wait).
+        TimeSpan interval = TimeSpan.FromMicroseconds((long)Math.Min(o.BgErrorResumeRetryInterval, (uint.MaxValue - 1UL) * 1000));
         ulong retryCount = 0;
         RocksDbException? oldError;
         while (resumeCount > 0)
@@ -595,8 +622,12 @@ internal sealed class ErrorHandler
             if (synchronous) t.GetAwaiter().GetResult();
             else await t.ConfigureAwait(false);
         }
-        catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException)
+        catch (Exception e) when (e is not OutOfMemoryException)
         {
+            // CloseHelper joins the recovery thread and goes on whatever happened there: an unexpected failure of the
+            // recovery task must not stop the close half way (LOCK and files left open).
+            if (e is not (RocksDbException or IOException or ObjectDisposedException or OperationCanceledException))
+                _db.LogWarn("ErrorHandler: the recovery task failed: " + e);
         }
     }
 
@@ -669,6 +700,18 @@ internal sealed class ErrorHandler
         {
             foreach (EventListener l in listeners)
             {
+                // EventHelpers::NotifyOnErrorRecoveryEnd: "listener->OnErrorRecoveryCompleted(old_bg_error_cp);
+                // listener->OnErrorRecoveryEnd(info);" for every listener, whatever the outcome.
+                try
+                {
+#pragma warning disable CS0618 // the deprecated callback is still raised, as upstream
+                    l.OnErrorRecoveryCompleted(oldError);
+#pragma warning restore CS0618
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    _db.LogWarn("EventListener.OnErrorRecoveryCompleted threw: " + e.Message);
+                }
                 try
                 {
                     l.OnErrorRecoveryEnd(info);
