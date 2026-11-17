@@ -18,8 +18,10 @@ internal interface IReadaheadSizeCallback
 /// <summary>
 /// Sequential readahead with the next chunk read asynchronously while the current one is consumed: a port of the
 /// async_io mode of FilePrefetchBuffer (file/file_prefetch_buffer.{h,cc}: two buffers, PrefetchAsync of the second
-/// while the first serves reads, PollIfNeeded / swap on a miss), as BlockPrefetcher uses it for compaction inputs with
-/// compaction_readahead_size (table/block_based/block_prefetcher.cc).
+/// while the first serves reads, PollIfNeeded / swap on a miss), as BlockPrefetcher uses it with ReadOptions::async_io
+/// (table/block_based/block_prefetcher.cc: num_buffers = is_async_io_prefetch ? 2 : 1), and the synchronous one-buffer
+/// mode (<see cref="CreateSingleBuffer(int)"/>) that BlockPrefetcher uses otherwise: compaction inputs with
+/// compaction_readahead_size, the implicit auto readahead and an explicit ReadOptions::readahead_size.
 /// </summary>
 /// <remarks>
 /// <para>A miss outside the buffered range reads one readahead chunk synchronously from the requested offset and
@@ -123,6 +125,14 @@ public sealed class AsyncPrefetchBuffer : IDisposable
     /// <paramref name="readaheadSize"/> (ReadAheadSizeTuning), at most up to the end of the file.
     /// </summary>
     public static AsyncPrefetchBuffer CreateSingleBuffer(int readaheadSize) => new(readaheadSize, readaheadSize, singleBuffer: true);
+
+    /// <summary>
+    /// A synchronous buffer whose readahead starts at <paramref name="initialReadaheadSize"/> and doubles with every read
+    /// up to <paramref name="maxReadaheadSize"/> (FilePrefetchBuffer with num_buffers = 1 and implicit auto readahead,
+    /// as BlockPrefetcher creates it without ReadOptions::async_io). Every read happens on the caller's thread.
+    /// </summary>
+    public static AsyncPrefetchBuffer CreateSingleBuffer(int initialReadaheadSize, int maxReadaheadSize) =>
+        new(initialReadaheadSize, maxReadaheadSize, singleBuffer: true);
 
     /// <summary>
     /// A one-buffer prefetch buffer does not serve a read before its buffered range: TryReadFromCache returns false for

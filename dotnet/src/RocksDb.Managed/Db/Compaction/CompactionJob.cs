@@ -300,10 +300,11 @@ internal sealed class CompactionJob
     /// fill_cache = false, like CompactionJob's ReadOptions): avoids polluting the cache and lets the iterator reuse
     /// its block buffers.
     /// <para>
-    /// Input files are read sequentially through an <see cref="Env.AsyncPrefetchBuffer"/> of
-    /// <see cref="DbOptions.CompactionReadaheadSize"/> bytes (upstream: compaction_readahead_size, with the next chunk
-    /// prefetched asynchronously like FilePrefetchBuffer's async_io), so the input I/O overlaps the merge / output
-    /// work and is done in large reads instead of one pread per block. 0 disables readahead.
+    /// Input files are read sequentially with <see cref="DbOptions.CompactionReadaheadSize"/> bytes of readahead
+    /// (upstream: compaction_readahead_size, BlockPrefetcher): an OS prefetch (readahead(2)) where the file supports
+    /// it, else a synchronous one-buffer <see cref="Env.AsyncPrefetchBuffer"/> read on the compaction's own thread
+    /// (FilePrefetchBuffer without async_io), so the input is read in large reads instead of one pread per block.
+    /// 0 disables readahead.
     /// </para>
     /// </summary>
     private sealed class NoFillTableCache(TableCache inner, int readaheadSize, TableReadFlags flags) : ITableCache
