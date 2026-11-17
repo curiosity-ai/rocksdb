@@ -140,8 +140,16 @@ await db.CompactRangeAsync();                               // full manual compa
 ```
 
 Async calls complete synchronously when nothing has to wait (memtable and block-cache hits, page-cache hits through
-`preadv2(RWF_NOWAIT)` on Linux), so they cost about as much as the sync calls. The sync API never blocks on thread-pool
-work: a synchronous writer that becomes the write-group leader does the WAL I/O on its own thread.
+`preadv2(RWF_NOWAIT)` on Linux), so they cost about as much as the sync calls. A synchronous writer that becomes the
+write-group leader does the WAL I/O on its own thread.
+
+> **Use either the sync or the async API on a database, not both.** Writes are group-committed: one writer (the leader)
+> writes the WAL and memtable for every writer queued behind it. A sync writer (`Put`, `Write`, ...) waits for its
+> leader by blocking its thread. If that leader is an async writer (`PutAsync`, `WriteAsync`, ...) whose WAL write or
+> write-stall wait does not complete inline, the rest of the leader's work runs on the .NET thread pool, so blocked sync
+> writers that occupy pool threads (e.g. sync `Put` calls from ASP.NET request handlers) can starve it: the writes stall
+> until the pool injects threads, or deadlock under a capped pool. All-sync and all-async use are not affected. The sync
+> write methods may be deprecated and removed in a future version; new code should use the async API.
 
 ## API tour
 

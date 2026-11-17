@@ -2327,7 +2327,9 @@ complete asynchronously (and out of order), under a deliberately exhausted threa
 
 - A sync writer queued behind an async write leader waits for the leader's thread-pool continuation (async WAL I/O,
   stall waits); with the pool full of sync writers a capped pool deadlocks and the default pool stalls until it injects
-  threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`.
+  threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`. **Decision (2026-11-17): not fixed;
+  documented as a usage rule** (README, architecture.md, `RocksDatabase` remarks: do not mix the sync and async API on
+  one database). The sync write methods are expected to be deprecated and removed.
 - `AsyncPrefetchBuffer.TakePending` blocks a compaction thread (or a sync CompactRange) on a read continuation that needs
   a pool thread when the file system has no `Prefetch` (macOS LocalFileSystem, in-memory and custom file systems; not
   Linux LocalFileSystem). Ignored repro `CompactionPrefetchProgressesWithThreadPoolExhausted`.

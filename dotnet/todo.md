@@ -451,7 +451,7 @@ Still open from this round:
 - [x] Transactions: range lock granted during cancellation released; lock timeouts beyond 24.8 days
 - [x] Sync/async parity differential tests for writes, reads, iterators, transactions, backup, control APIs; public async surface inventory test
 - [x] A throwing `UserWriteCallback` (OnWriteEnqueued / OnWalWriteFinish) fails safely: hard background error, caller gets the exception, Resume() recovers (deliberate deviation; upstream: undefined behaviour)
-- [ ] Sync writers behind an async leader depend on a thread-pool continuation (write-thread design; repro ignored)
+- [x] Sync writers behind an async leader depend on a thread-pool continuation: documented as a usage rule (never mix sync and async on one DB; sync write methods to be deprecated), repro stays ignored
 - [ ] `AsyncPrefetchBuffer.TakePending` blocks on a pool continuation without `Prefetch` support (macOS / custom file systems; repro ignored)
 
 ## Audit #9 (2026-11-16; docs/validation.md "Audit #9: opening and closing the DB")
@@ -470,3 +470,5 @@ Still open from this round:
 - [ ] `CompactionFilter::Context::input_table_properties`; `MergeOperator::ShouldMerge`; `max_successive_merges`; `OnSubcompaction*` / `OnFile*Finish` listeners
 - [ ] Custom filter policy reusing the built-in compatibility name gets the built-in reader
 - [ ] Failed background compaction output possibly kept until the next open (unconfirmed)
+
+- [ ] Deprecate, then remove, the synchronous write methods (follows from the sync/async mixing rule, audit #8)

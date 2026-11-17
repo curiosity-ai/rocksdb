@@ -17,6 +17,13 @@ namespace RocksDb.Managed;
 /// breaks namespace-qualified references (<c>RocksDb.Managed.X</c>) inside the <c>RocksDb.Managed.*</c> namespaces.
 /// </para>
 /// Thread-safe. Dispose (preferably <see cref="DisposeAsync"/>) to close it and release the LOCK file.
+/// <para>
+/// Use either the synchronous or the asynchronous API on one database, not both. Writes are group-committed: a sync
+/// writer blocks its thread until the group's leader finishes; when that leader is an async writer whose I/O or stall
+/// wait completes asynchronously, the leader continues on the .NET thread pool, so sync writers that occupy pool threads
+/// can starve it (stalls until the pool injects threads, deadlock under a capped pool). The sync write methods may be
+/// deprecated in a future version; prefer the async API.
+/// </para>
 /// </summary>
 public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
 {

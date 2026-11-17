@@ -187,8 +187,16 @@ Followers wait in one of two ways:
 - **sync writers** (`Put`, `Write`) wait like upstream's `AwaitState`: a short busy spin, then (with
   `enable_write_thread_adaptive_yield`) `Thread.Yield` for up to `write_thread_max_yield_usec` while the yield credit
   says yielding pays off, then a blocking wait on a monitor that the waker only touches if the waiter registered as
-  blocked (`STATE_LOCKED_WAITING`). A sync writer that becomes leader does the group's I/O on its own thread, so the
-  sync API never waits on thread-pool work.
+  blocked (`STATE_LOCKED_WAITING`). A sync writer that becomes leader does the group's I/O on its own thread.
+
+**Do not mix sync and async writers on one database.** A sync follower blocks its thread until its leader completes the
+group. When the leader is an async writer whose WAL write (a truly asynchronous file system, `OffloadAsyncSync` with
+synced writes, very large batches) or stall wait (write controller, `WriteBufferManager`) does not complete inline, the
+leader's remaining work (memtable insert, waking the followers) is a thread-pool continuation. Sync followers that are
+themselves pool threads can then exhaust the pool: the group waits for the pool's thread injection, or deadlocks with a
+capped pool (`SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`, ignored repro in `Audit8AsyncBackgroundIoTests`).
+Upstream has no such case: no async writers, no shared pool. Decision (2026-11-17): documented as a usage rule rather
+than fixed; the sync write methods are expected to be deprecated and removed, so new code should be async-only.
 
 "Unbatched" writers (memtable switches and other exclusive operations) form a group of their own. Write stalls and
 delayed writes (`Db/Compaction/WriteController.cs`) delay the leader with a token bucket, as upstream does.
