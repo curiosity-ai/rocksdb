@@ -741,7 +741,6 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
             (string ns, string nk) = NativeOpenAndRead(n1, mode);
             (string ms, string mk, string mmsg) = ManagedOpenAndRead(m1, mode);
             nk = nk.Replace(NativeTryAgain, "TryAgain", StringComparison.Ordinal);
-            if (nk.EndsWith(",TryAgain", StringComparison.Ordinal) && mk == nk[..^"TryAgain".Length] + "OK") mk = nk; // see GetUpdatesSinceStoppedBelowLastSequenceIsTryAgainLikeNative
             compared++;
             if (ns != ms || nk != mk)
             {
@@ -927,7 +926,7 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     [DataRow("manifest-missing", false)]
     [DataRow("identity-garbage", false)]
     [DataRow("identity-missing", false)]
-    public void DamageScenarioRecoversLikeNative(string scenario, bool recycle) => CompareScenario(scenario, recycle, strictIteratorEnd: false);
+    public void DamageScenarioRecoversLikeNative(string scenario, bool recycle) => CompareScenario(scenario, recycle);
 
     /// <summary>
     /// WAL compression (kSetCompressionType record, ZSTDStreamingUncompress, log::Reader::ReadPhysicalRecord's
@@ -938,23 +937,22 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
     [DataRow("wal-zstd-truncated-frame")]
     [DataRow("wal-torn-tail")]
     [DataRow("wal-middle-crc")]
-    public void DamagedCompressedWalRecoversLikeNative(string scenario) => CompareScenario(scenario, recycle: false, strictIteratorEnd: false, walZstd: true);
+    public void DamagedCompressedWalRecoversLikeNative(string scenario) => CompareScenario(scenario, recycle: false, walZstd: true);
 
     /// <summary>
-    /// Audit #7 open: GetUpdatesSince over a recycled WAL that holds a record of its previous use (another log number)
-    /// before the end of the recovered data. WalIteratorImpl::NextImpl (db/wal_iterator_impl.cc) ends with
+    /// GetUpdatesSince over a recycled WAL that holds a record of its previous use (another log number) before the end
+    /// of the recovered data. WalIteratorImpl::NextImpl (db/wal_iterator_impl.cc) ends with
     /// TryAgain("Create a new iterator to fetch the new tail.") because the iterator stopped below
-    /// VersionSet::LastSequence; the managed iterator (deliberately, for tailing: it re-lists the WAL files instead of
-    /// returning TryAgain) ends with an OK status, which reads as "caught up" although later batches exist.
+    /// VersionSet::LastSequence. The managed iterator ended with OK (audit #7 open); since the audit #11 follow-up it
+    /// re-lists the WAL files once and then ends with TryAgain like native.
     /// </summary>
     [TestMethod]
-    [Ignore("audit #7 open: managed TransactionLogIterator ends with OK where native returns TryAgain (tailing design decision)")]
     public void GetUpdatesSinceStoppedBelowLastSequenceIsTryAgainLikeNative() =>
-        CompareScenario("wal-recycled-wrong-lognumber", recycle: true, strictIteratorEnd: true);
+        CompareScenario("wal-recycled-wrong-lognumber", recycle: true);
 
     private const string NativeTryAgain = "Operation failed. Try again.: Create a new iterator to fetch the new tail.";
 
-    private static void CompareScenario(string scenario, bool recycle, bool strictIteratorEnd, bool walZstd = false)
+    private static void CompareScenario(string scenario, bool recycle, bool walZstd = false)
     {
         using var dir = new TempDir("a7scen");
         string src = recycle ? NativeRecycledDb(dir) : NativeDbWithTwoWals(dir, walZstd);
@@ -972,11 +970,6 @@ public sealed unsafe class Audit7MetadataCorruptionCompatTests
             (string ns, string nk) = NativeOpenAndRead(n1, mode);
             (string ms, string mk, string mmsg) = ManagedOpenAndRead(m1, mode);
             nk = nk.Replace(NativeTryAgain, "TryAgain", StringComparison.Ordinal);
-            if (!strictIteratorEnd && nk.EndsWith(",TryAgain", StringComparison.Ordinal) && mk == nk[..^"TryAgain".Length] + "OK")
-            {
-                // Known deviation, see GetUpdatesSinceStoppedBelowLastSequenceIsTryAgainLikeNative.
-                mk = nk;
-            }
             lines.Add(mode + ": native=" + ns + " " + nk + " | managed=" + ms + " " + mk + " " + mmsg);
             same &= ns == ms && nk == mk;
             // DB::OpenForReadOnly replays the WALs too (DBImplReadOnly, nothing written).

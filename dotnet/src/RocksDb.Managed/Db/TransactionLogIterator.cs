@@ -64,15 +64,30 @@ public readonly struct WalBatch
 
 /// <summary>
 /// Iterates the write batches of the WAL from a starting sequence number, in sequence order. Port of
-/// TransactionLogIteratorImpl (db/transaction_log_impl.cc) over <see cref="FragmentBufferedLogReader"/>, so it can
-/// tail the WAL that is still being written: when <see cref="Valid"/> turns false at the end of the available data,
-/// calling <see cref="Next"/> (or <see cref="NextAsync"/>) later picks up batches appended since.
+/// WalIteratorImpl (db/wal_iterator_impl.cc, formerly TransactionLogIteratorImpl) over
+/// <see cref="FragmentBufferedLogReader"/>, so it can tail the WAL that is still being written: when <see cref="Valid"/>
+/// turns false at the end of the available data, calling <see cref="Next"/> (or <see cref="NextAsync"/>) later picks
+/// up batches appended since.
+/// <para>
+/// How a run ends (include/rocksdb/wal_iterator.h, "STATES"): <see cref="Valid"/> false with <see cref="Error"/> null
+/// means caught up with the DB (every published sequence number was read). <see cref="StatusCode.TryAgain"/>
+/// ("Create a new iterator to fetch the new tail.", like upstream) means the iterator read everything it can see while
+/// the DB has published newer sequence numbers: writes that bypass the WAL (<see cref="WriteOptions.DisableWal"/>,
+/// ingested files) at the end of the log, data a manual WAL flush has not written yet, or a damaged record (see
+/// <see cref="SkippedCorruptBytes"/>). NotFound (a gap in the sequence numbers), Corruption and I/O errors end the run
+/// for good: <see cref="Next"/> does nothing any more and the caller opens a new iterator.
+/// </para>
 /// <para>
 /// Managed differences from upstream (better tailing ergonomics):
 /// <list type="bullet">
 /// <item>When the iterator reaches the end of the newest WAL it knew about while the DB has published newer
-/// sequence numbers, it re-lists the WAL files and continues into WALs created after it was opened (upstream
-/// returns TryAgain and the caller must open a new iterator).</item>
+/// sequence numbers, it re-lists the WAL files once and continues into WALs created after it was opened (upstream
+/// returns TryAgain and the caller must open a new iterator). Only if that finds nothing either does it end with
+/// TryAgain.</item>
+/// <item>TryAgain does not spend the iterator: a later <see cref="Next"/> retries from where it stopped (reading
+/// records that became readable since, following WAL rotations), which is what opening a new iterator at
+/// <see cref="NextSequence"/> does upstream, without reading the WAL again from its start. Opening a new iterator
+/// works too.</item>
 /// <item><see cref="WaitForUpdatesAsync"/> awaits the next write (signalled by the write path after the WAL append
 /// and memtable insert are published) instead of polling.</item>
 /// <item>Batches are exposed as <see cref="WalBatch"/> views over the reader's pooled buffers (no allocation per
@@ -101,14 +116,30 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
     // recovery_sequence_generation_: the fenced ranges known when the iterator was created.
     private readonly ulong _recoverySequenceGeneration;
 
+    // WalIteratorImpl::NextImpl: Status::TryAgain("Create a new iterator to fetch the new tail."). Never thrown itself
+    // (ThrowIfError wraps it), so one instance serves every iterator and a tailer that keeps retrying does not allocate.
+    private static readonly RocksDbException s_tryAgain =
+        new(StatusCode.TryAgain, "Operation failed. Try again.: Create a new iterator to fetch the new tail.");
+
     private sealed class Reporter : LogReporter
     {
         public string? Info;
+        // Dropped since the last record the iterator read (reset by ResetSkipped).
+        public long SkippedBytes;
+        public string? SkippedReason;
 
         public override void Corruption(long bytes, StatusCode code, string reason, ulong logNumber)
         {
-            // LogReporter in transaction_log_impl.h only logs ("dropping N bytes; reason").
+            // LogReporter in wal_iterator_impl.h only logs ("dropping N bytes; reason").
             Info = "dropping " + bytes + " bytes; " + reason;
+            SkippedBytes += Math.Max(bytes, 1);
+            SkippedReason = Info;
+        }
+
+        public void ResetSkipped()
+        {
+            SkippedBytes = 0;
+            SkippedReason = null;
         }
     }
 
@@ -152,14 +183,45 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
     /// <summary>The WAL files the iterator reads (grows when it follows WAL rotations).</summary>
     public IReadOnlyList<WalFileInfo> Files => _files;
 
+    /// <summary>
+    /// The number of the WAL the iterator reads now (the one its last batch came from, or where it stopped), 0 before
+    /// it opened one.
+    /// </summary>
+    public ulong CurrentWalNumber => _reader?.LogNumber ?? 0;
+
+    /// <summary>
+    /// Bytes of damaged WAL data (bad checksum, malformed or too small record) the log reader dropped after the last
+    /// record the iterator read; 0 if none. Upstream's reporter only logs these. Non-zero while the iterator ends with
+    /// <see cref="StatusCode.TryAgain"/> (or has not found its start sequence) although the DB is ahead means the batches
+    /// it misses are damaged, not merely unlogged (<see cref="WriteOptions.DisableWal"/>, ingestion) or not written
+    /// yet (manual WAL flush), which never drop data. A recycled WAL ends at a damaged record instead (the bytes after
+    /// the live end are the file's previous use), so damage there is not counted.
+    /// </summary>
+    public long SkippedCorruptBytes => _reporter.SkippedBytes;
+
+    /// <summary>What the log reader reported for the last damaged data counted by <see cref="SkippedCorruptBytes"/>
+    /// ("dropping N bytes; reason"), or null.</summary>
+    public string? SkippedCorruptionReason => _reporter.SkippedReason;
+
     // ---- iteration --------------------------------------------------------------------------------------
 
-    /// <summary>Moves to the next batch (TransactionLogIteratorImpl::Next). No-op after an error.</summary>
+    /// <summary>
+    /// Moves to the next batch (WalIteratorImpl::Next). No-op after an error that ended the run (NotFound,
+    /// Corruption, I/O errors); after <see cref="StatusCode.TryAgain"/> it retries from where the iterator stopped
+    /// (managed: upstream's iterator is spent then, see the class remarks).
+    /// </summary>
     public void Next()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_status is null) NextImpl(internalCall: false);
+        if (_status is null || ReferenceEquals(_status, s_tryAgain))
+        {
+            _status = null;
+            NextImpl(internalCall: false);
+        }
     }
+
+    /// <summary>True if <see cref="Error"/> is the TryAgain that only says "stopped below the DB's last sequence".</summary>
+    private bool StoppedBelowLastSequence => ReferenceEquals(_status, s_tryAgain);
 
     /// <summary>
     /// Asynchronous <see cref="Next"/>: the WAL reads are done synchronously from the OS cache, so this completes
@@ -181,20 +243,37 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
 
     /// <summary>
     /// Advances to the next batch, waiting for new writes when the WAL is exhausted. Returns false when the DB is
-    /// closed or the iterator hit an error (see <see cref="Error"/>). Allocation-free in steady state (pooled state
-    /// machine and wait).
+    /// closed or the iterator hit an error that ends the run (see <see cref="Error"/>). <see cref="StatusCode.TryAgain"/>
+    /// does not end it: published sequence numbers that are not readable from the WAL (writes with
+    /// <see cref="WriteOptions.DisableWal"/>, ingestion, manual WAL flush data still buffered) are waited out with a short
+    /// back-off. A damaged WAL record that keeps the iterator below the DB's last sequence (see
+    /// <see cref="SkippedCorruptBytes"/>) ends it with NotFound once a second read finds the same damage at the same
+    /// position. Allocation-free in steady state (pooled state machine and wait).
     /// </summary>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> MoveNextTailingAsync(CancellationToken cancellationToken)
     {
         if (_started && _isValid) Next();
+        ulong damagedAt = ulong.MaxValue;
         while (!Valid)
         {
-            if (_status is not null) return false;
+            if (_status is not null && !StoppedBelowLastSequence) return false;
             if (!await WaitForUpdatesAsync(cancellationToken).ConfigureAwait(false)) return false;
             Next();
-            if (!Valid && _status is null && _db.Versions.LastSequence >= NextSequence)
+            if (!Valid && (_status is null || StoppedBelowLastSequence) && _db.Versions.LastSequence >= NextSequence)
             {
+                if (_reporter.SkippedBytes > 0)
+                {
+                    // The reader dropped damaged data after the last record and nothing readable follows. Seen twice at
+                    // the same position (the second time after the back-off below), it is not a record being written.
+                    if (damagedAt == NextSequence)
+                    {
+                        _isValid = false;
+                        _status = DamagedTail(NextSequence);
+                        return false;
+                    }
+                    damagedAt = NextSequence;
+                }
                 // Published but not readable from the WAL (disableWAL writes, or manual_wal_flush data still
                 // buffered): wait a little instead of spinning.
                 await Task.Delay(1, cancellationToken).ConfigureAwait(false);
@@ -203,9 +282,16 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
         return true;
     }
 
+    /// <summary>NotFound for a tail that cannot get past damaged WAL data at <paramref name="sequence"/>.</summary>
+    private RocksDbException DamagedTail(ulong sequence) =>
+        new(StatusCode.NotFound, "NotFound: WAL data for sequence " + sequence + " is damaged in WAL #" + CurrentWalNumber +
+            " (" + _reporter.SkippedReason + "); the batches up to the DB's last sequence cannot be read");
+
     /// <summary>
     /// Enumerates the batches available now (starting with the current one), without waiting for new writes. Each
-    /// <see cref="WalBatch"/> is valid until the enumeration moves on.
+    /// <see cref="WalBatch"/> is valid until the enumeration moves on. Throws the error that ended the run; an end with
+    /// <see cref="StatusCode.TryAgain"/> (nothing more readable now although the DB is ahead) ends the enumeration
+    /// without throwing and stays visible in <see cref="Error"/>.
     /// </summary>
     public async IAsyncEnumerator<WalBatch> GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
@@ -216,7 +302,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
             yield return Current;
             Next();
         }
-        ThrowIfError();
+        if (!StoppedBelowLastSequence) ThrowIfError();
     }
 
     // ---- port of TransactionLogIteratorImpl ---------------------------------------------------------------
@@ -252,6 +338,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
     {
         _started = false;
         _isValid = false;
+        _reporter.ResetSkipped(); // the WAL is read again from its start
         if (_files.Count <= startFileIndex)
         {
             StopBeforeRecoveryGap(0, ulong.MaxValue); // WalIteratorImpl::SeekToStartSequence: files_->size() <= start_file_index
@@ -311,6 +398,9 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
             if (_files.Count == 0) RefreshFileList();
             SeekToStartSequence(0, strict: false);
             if (!_started && _status is null && RefreshFileList()) SeekToStartSequence(0, strict: false);
+            // Upstream goes on into the read loop, which ends with TryAgain: the start sequence was published (or
+            // GetUpdatesSince would have failed) but is not readable.
+            if (!_started && _status is null && _currentLastSeq < _db.Versions.LastSequence) _status = s_tryAgain;
             return;
         }
         bool refreshed = false;
@@ -342,11 +432,27 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
             }
             _isValid = false;
             if (StopBeforeRecoveryGap(_files[^1].LogNumber, ulong.MaxValue)) return;
-            if (_currentLastSeq == _db.Versions.LastSequence || refreshed) return;
-            // Managed extension: follow WAL rotation. Any WAL created after the current one implies the current one is
-            // complete (the writer flushed every record before switching), so drain it once more, then continue.
-            refreshed = true;
-            if (!RefreshFileList()) return;
+            if (_currentLastSeq >= _db.Versions.LastSequence)
+            {
+                // Caught up. Not an error: the caller may call Next() again later to pick up writes that have not
+                // happened yet (WalIteratorImpl::NextImpl sets OK, also after "Start sequence was not found").
+                _status = null;
+                return;
+            }
+            if (!refreshed)
+            {
+                // Managed extension: follow WAL rotation. Any WAL created after the current one implies the current one
+                // is complete (the writer flushed every record before switching), so drain it once more, then continue.
+                // Also drains the current WAL once more when nothing new is listed, for a write published between the
+                // read and the check above.
+                refreshed = true;
+                RefreshFileList();
+                continue;
+            }
+            // WalIteratorImpl::NextImpl: the DB has moved on but this iterator cannot read further (the end of the log
+            // is unlogged writes, a manual WAL flush has not written them yet, or the record is damaged).
+            _status = s_tryAgain;
+            return;
         }
     }
 
@@ -398,6 +504,7 @@ public sealed class TransactionLogIterator : IDisposable, IAsyncEnumerable<WalBa
         }
         ulong batchLastSeq = batchSeq + count - 1;
         if (StopBeforeRecoveryGap(_files[_currentFileIndex].LogNumber, batchLastSeq)) return;
+        _reporter.ResetSkipped();
         _currentBatchSeq = batchSeq;
         _currentLastSeq = batchLastSeq;
         _currentBatch = _reader!.Record;

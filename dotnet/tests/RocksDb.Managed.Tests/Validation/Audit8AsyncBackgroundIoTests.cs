@@ -412,11 +412,12 @@ public sealed class Audit8AsyncBackgroundIoTests
     /// AsyncPrefetchBuffer, which blocks (ManualResetEventSlim) until IRandomAccessFile.ReadAsync of the next chunk
     /// completes. When that completion runs on the .NET thread pool (here a file system whose ReadAsync yields; on macOS
     /// LocalFileSystem's RandomAccess.ReadAsync runs the pread on a pool thread) and every pool worker is blocked, the sync
-    /// CompactRange never finishes. Native's FilePrefetchBuffer async_io polls io_uring from the reading thread.
+    /// CompactRange never finished. Fixed (audit #11 follow-up) as upstream: compaction reads without async_io, so its
+    /// readahead buffer has one buffer read synchronously on the compaction's thread (BlockPrefetcher: num_buffers =
+    /// is_async_io_prefetch ? 2 : 1).
     /// </summary>
     [TestMethod]
     [DoNotParallelize]
-    [Ignore("audit #8 open: compaction input prefetch (AsyncPrefetchBuffer) blocks its compaction thread on a ReadAsync continuation that needs a .NET thread-pool thread")]
     public void CompactionPrefetchProgressesWithThreadPoolExhausted()
     {
         var fs = new YieldingFileSystem(NewFs()); // no readahead(2), ReadAsync continues on the thread pool
