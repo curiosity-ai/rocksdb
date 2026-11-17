@@ -121,7 +121,7 @@ internal sealed partial class DbImpl
         }
         else
         {
-            state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
+            state = ManifestReader.RecoverFromDirectory(ManifestFileSystem, DbName, _comparatorResolver, out manifestNumber);
         }
         Versions.RecoverFrom(state, manifestNumber);
         foreach (string name in descriptors.Keys)
@@ -264,7 +264,7 @@ internal sealed partial class DbImpl
                 DisposeManifestTailer();
                 var reporter = new WalRecoveryReporter { FileName = path };
                 // log::FragmentBufferedReader(..., checksum=true, log_number=0), as in MaybeSwitchManifest.
-                var reader = new FragmentBufferedLogReader(FileSystem.OpenSequential(path), reporter, checksum: true, logNumber: 0);
+                var reader = new FragmentBufferedLogReader(ManifestFileSystem.OpenSequential(path), reporter, checksum: true, logNumber: 0);
                 tailer = new SecondaryManifestTailer(manifestNumber, reader, reporter, new ManifestReplayer(_comparatorResolver));
                 _manifestTailer = tailer;
                 Interlocked.Increment(ref _secondaryManifestOpens);

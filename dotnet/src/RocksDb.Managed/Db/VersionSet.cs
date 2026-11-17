@@ -903,6 +903,7 @@ internal sealed class VersionSet : IAsyncDisposable
         string path;
         long expected;
         string? status = null;
+        Exception? failure = null;
         await LockManifestAsync(synchronous).ConfigureAwait(false);
         try
         {
@@ -920,6 +921,7 @@ internal sealed class VersionSet : IAsyncDisposable
             catch (Exception e) when (e is IOException or RocksDbException)
             {
                 status = e.Message;
+                failure = e;
             }
         }
         finally
@@ -936,12 +938,17 @@ internal sealed class VersionSet : IAsyncDisposable
                 if (size == expected) return;
                 // "This means the size is not as expected. So we treat it as a corruption".
                 status = "Corruption: ";
+                failure = new RocksDbException(StatusCode.Corruption, status);
             }
             catch (Exception e) when (e is IOException or RocksDbException)
             {
                 status = e.Message;
+                failure = e;
             }
         }
+        // "IOErrorInfo io_error_info(io_s, FileOperationType::kVerify, manifest_file_name, /*length=*/size, /*offset=*/0);
+        // for (auto& listener : cfd->ioptions().listeners) listener->OnIOError(io_error_info);" (every listener).
+        _db.NotifyOnIOErrorToAllListeners(failure!, FileOperationType.Verify, path, (ulong)size, 0);
         _db.LogError("MANIFEST verification on Close, filename " + path + ", expected size " + expected.ToString(System.Globalization.CultureInfo.InvariantCulture)
             + " failed with status " + status + " and actual size " + size.ToString(System.Globalization.CultureInfo.InvariantCulture));
         await LogAndApplyAsync(defaultCfd, new VersionEdit(), synchronous, CancellationToken.None).ConfigureAwait(false);
@@ -984,6 +991,10 @@ internal sealed class VersionSet : IAsyncDisposable
             }
             if (!corrupt) return; // Manifest is healthy, no need to check again
             _db.Stats?.RecordTick(Ticker.ManifestValidationFailureCount);
+            // IOErrorInfo(IOStatus::Corruption("MANIFEST content validation failed"), kVerify, content_manifest_name, 0, 0)
+            // to every listener.
+            _db.NotifyOnIOErrorToAllListeners(new RocksDbException(StatusCode.Corruption, "Corruption: MANIFEST content validation failed"),
+                FileOperationType.Verify, path, 0, 0);
             if (check == 0)
             {
                 // First check failed -- rewrite and verify again.

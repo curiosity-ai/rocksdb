@@ -700,6 +700,18 @@ internal sealed class ErrorHandler
         {
             foreach (EventListener l in listeners)
             {
+                // EventHelpers::NotifyOnErrorRecoveryEnd: "listener->OnErrorRecoveryCompleted(old_bg_error_cp);
+                // listener->OnErrorRecoveryEnd(info);" for every listener, whatever the outcome.
+                try
+                {
+#pragma warning disable CS0618 // the deprecated callback is still raised, as upstream
+                    l.OnErrorRecoveryCompleted(oldError);
+#pragma warning restore CS0618
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    _db.LogWarn("EventListener.OnErrorRecoveryCompleted threw: " + e.Message);
+                }
                 try
                 {
                     l.OnErrorRecoveryEnd(info);

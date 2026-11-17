@@ -739,9 +739,36 @@ internal sealed class CompactionJob
 
     /// <summary>
     /// Runs one subcompaction (CompactionJob::ProcessKeyValueCompaction) over its key range (the whole input without
-    /// subcompactions).
+    /// subcompactions), with its listener notifications: OnSubcompactionBegin once the compaction filter is set up
+    /// (<see cref="RunSubcompactionCoreAsync"/>), OnSubcompactionCompleted when it ends, successfully or not
+    /// (ProcessLocalKeyValueCompaction: NotifyOnSubcompactionBegin / NotifyOnSubcompactionCompleted).
     /// </summary>
     private async ValueTask RunSubcompactionAsync(bool synchronous)
+    {
+        Exception? failure = null;
+        try
+        {
+            await RunSubcompactionCoreAsync(synchronous).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            failure = e;
+            throw;
+        }
+        finally
+        {
+            // SubcompactionState::notify_on_subcompaction_completion: only after OnSubcompactionBegin.
+            if (_notifyOnSubcompactionCompleted)
+            {
+                _notifyOnSubcompactionCompleted = false;
+                _db.NotifyOnSubcompactionCompleted(_cfd, _c, this, failure);
+            }
+        }
+    }
+
+    private bool _notifyOnSubcompactionCompleted;
+
+    private async ValueTask RunSubcompactionCoreAsync(bool synchronous)
     {
         // BlockCacheLookupContext{kCompaction} of the compaction input reads (scoped to this async method).
         if (_db.BlockCacheTracer.IsEnabled) Tracing.BlockCacheTracer.SetCaller(Tracing.TableReaderCaller.Compaction, 0, default, false);
@@ -753,6 +780,9 @@ internal sealed class CompactionJob
         // CompactionJob::SetupAndValidateCompactionFilter (compaction_job.cc): before any input is opened.
         CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id);
         if (filter is not null && !filter.IgnoreSnapshots) ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
+        // ProcessLocalKeyValueCompaction: NotifyOnSubcompactionBegin(sub_compact) right after the filter is validated
+        // (skipped while shutting down and for a canceled manual compaction).
+        _notifyOnSubcompactionCompleted = _db.NotifyOnSubcompactionBegin(_cfd, _c, this, _cancellation.IsCancellationRequested);
         bool isPart = _subStart is not null || _subEnd is not null;
         Stats.NumInputFiles = isPart ? 0 : _c.TotalInputFiles;
         Stats.BytesRead = isPart ? 0 : _c.TotalInputBytes;
@@ -806,7 +836,7 @@ internal sealed class CompactionJob
             _blobGarbageMeter = new Blob.BlobGarbageMeter();
             input = new Blob.BlobCountingIterator(input, _blobGarbageMeter);
         }
-        BlobBuilder = _db.CreateBlobFileBuilder(_cfd, _c.OutputLevel, Blob.BlobFileCreationReason.Compaction);
+        BlobBuilder = _db.CreateBlobFileBuilder(_cfd, _c.OutputLevel, BlobFileCreationReason.Compaction, JobId);
         bool enableGc = _c.EnableBlobGarbageCollection;
         if (BlobBuilder is not null || enableGc || _c.InputStorage.BlobFiles.Length > 0)
         {
@@ -1257,6 +1287,8 @@ internal sealed class CompactionJob
         };
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
+        // OpenCompactionOutputFile: "Fire events." NotifyTableFileCreationStarted before the file is created.
+        _db.NotifyOnTableFileCreationStarted(_cfd, JobId, _out.Path, TableFileCreationReason.Compaction);
         try
         {
             _out.File = FileChecksumHelper.CreateWritable(_db.FileSystem, _out.Path, fileOptions);
@@ -1417,6 +1449,9 @@ internal sealed class CompactionJob
         _out.OutputHashes.Add(_out.OutputHash);
         Stats.NumOutputFiles++;
         Stats.BytesWritten += meta.FileSize;
+        // FinishCompactionOutputFile: LogAndNotifyTableFileCreationFinished with the builder's table properties
+        // (outputs.UpdateTableProperties()), once the file is closed and before the subcompaction completes.
+        _db.NotifyOnTableFileCreated(_cfd, JobId, outputPath, meta.FileSize, TableFileCreationReason.Compaction, null, builder.Properties);
     }
 
     // ---------------------------------------------------------------------------------------------------------

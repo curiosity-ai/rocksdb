@@ -105,7 +105,8 @@ internal static class FileChecksumHelper
     /// </summary>
     public static IWritableFile CreateWritable(IFileSystem fs, string path, WritableFileOptions options)
     {
-        IWritableFile file = fs.CreateWritable(path, truncate: true, options);
+        // WritableFileWriter(..., listeners, ...): the file reports to the DB's file I/O listeners when they exist.
+        IWritableFile file = Db.FileIoNotifier.Wrap(options.FileIoNotifier, fs.CreateWritable(path, truncate: true, options), path);
         FileChecksumGenerator? gen;
         try
         {

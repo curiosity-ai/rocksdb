@@ -309,6 +309,12 @@ internal sealed class Compaction
     /// <summary>Compaction::ShouldNotifyOnCompactionCompleted: set once OnCompactionBegin was raised for this compaction.</summary>
     internal bool NotifyOnCompactionCompleted { get; set; }
 
+    /// <summary>
+    /// Compaction::WasNotifyOnCompactionPreCommitCalled: OnCompactionPreCommit fires at most once per compaction, although
+    /// it is raised before the MANIFEST write and again (as a safety net) before a failed compaction releases its files.
+    /// </summary>
+    internal bool PreCommitNotified { get; set; }
+
     /// <summary>CompactFiles with a compaction_job_info output: the job builds <see cref="JobInfo"/> when it finishes.</summary>
     internal bool BuildJobInfo { get; set; }
 

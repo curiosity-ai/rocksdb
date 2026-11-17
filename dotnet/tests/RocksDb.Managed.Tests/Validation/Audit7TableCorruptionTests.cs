@@ -956,7 +956,7 @@ public sealed class Audit7TableCorruptionTests
             var o = new ColumnFamilyOptions { EnableBlobFiles = true, MinBlobSize = 0, BlobCompressionType = ct };
             ulong number = 9;
             var blobs = new List<(byte[] Key, byte[] Value, ulong Offset, ulong Size, CompressionType Compression)>();
-            using (var builder = new RocksDb.Managed.Db.Blob.BlobFileBuilder(fs, "/db", () => number, o, cfId, RocksDb.Managed.Db.Blob.BlobFileCreationReason.Flush,
+            using (var builder = new RocksDb.Managed.Db.Blob.BlobFileBuilder(fs, "/db", () => number, o, cfId, RocksDb.Managed.BlobFileCreationReason.Flush,
                        null, null, RocksDb.Managed.Env.WritableFileOptions.Default))
             {
                 var w = new RocksDb.Managed.Util.PooledBufferWriter(32);

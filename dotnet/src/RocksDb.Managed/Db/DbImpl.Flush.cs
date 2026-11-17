@@ -434,7 +434,7 @@ internal sealed partial class DbImpl
         OnFlushStarted(cfd, jobId, mems, reason);
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         NotifyOnFlushBegin(cfd, jobId, fileNumber, path, mems, reason);
-        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Flush);
+        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, BlobFileCreationReason.Flush, jobId);
         try
         {
             return await BuildFlushResultAsync(cfd, picked, fileNumber, epoch, synchronous, jobId, flushStart, mems, path, blobBuilder, reason)
@@ -474,6 +474,8 @@ internal sealed partial class DbImpl
         // table file; their blobs the output does not reference (hidden versions, failed writes) are garbage.
         (List<BlobFileAddition> Additions, Blob.BlobGarbageMeter Meter)? directWrite = PrepareBlobDirectWriteFlush(cfd, picked);
         FileMetaData? meta;
+        // BuildTable: NotifyTableFileCreationStarted before the table is built.
+        NotifyOnTableFileCreationStarted(cfd, jobId, path, TableFileCreationReason.Flush);
         try
         {
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, mems, fileNumber, epoch, Identity, snapshots, CurrentSnapshotChecker, blobBuilder,
@@ -806,6 +808,21 @@ internal sealed partial class DbImpl
         {
             ExitUnbatched(w, synchronous);
         }
+        // FlushMemTable / AtomicFlushMemTables: "if (flush_reason != FlushReason::kWriteBufferManager)
+        // NotifyOnManualFlushScheduled(cfds, flush_reason)", before waiting (also when nothing was switched).
+        if (reason != FlushReason.WriteBufferManager && HasListeners)
+        {
+            if (!Options.AtomicFlush)
+            {
+                NotifyOnManualFlushScheduled([cfd], reason);
+            }
+            else
+            {
+                var cfds = new List<ColumnFamilyData>(targets.Count);
+                foreach ((ColumnFamilyData c, _) in targets) cfds.Add(c);
+                NotifyOnManualFlushScheduled(cfds, reason);
+            }
+        }
         if (!wait) return;
         // DBImpl::WaitForFlushMemTables (also entered with nothing to wait for).
         while (true)
@@ -966,14 +983,20 @@ internal sealed partial class DbImpl
     /// (enable_blob_files and output level &gt;= blob_file_starting_level), else null. Its file numbers are registered as
     /// pending outputs until <see cref="ReleaseBlobOutputs"/>.
     /// </summary>
-    internal Blob.BlobFileBuilder? CreateBlobFileBuilder(ColumnFamilyData cfd, int outputLevel, Blob.BlobFileCreationReason reason)
+    internal Blob.BlobFileBuilder? CreateBlobFileBuilder(ColumnFamilyData cfd, int outputLevel, BlobFileCreationReason reason, int jobId)
     {
         ColumnFamilyOptions o = cfd.Options;
         if (!o.EnableBlobFiles || outputLevel < o.BlobFileStartingLevel) return null;
         // Blob files of flushes are rate limited like their table files (IO_HIGH), those of compactions at IO_LOW.
-        Env.IoPriority priority = reason == Blob.BlobFileCreationReason.Compaction ? Env.IoPriority.Low : Env.IoPriority.High;
+        Env.IoPriority priority = reason == BlobFileCreationReason.Compaction ? Env.IoPriority.Low : Env.IoPriority.High;
         return new Blob.BlobFileBuilder(FileSystem, DbPaths[0], NewPendingOutputFileNumber, o, cfd.Id, reason, cfd.BlobSource, Stats,
-            BlobFileWriteOptions(o, priority));
+            BlobFileWriteOptions(o, priority))
+        {
+            // BlobFileCompletionCallback (blob_callback_) with the column family's name and the job id.
+            Events = HasListeners ? this : null,
+            ColumnFamilyName = cfd.Name,
+            JobId = jobId,
+        };
     }
 
     /// <summary>
@@ -989,6 +1012,8 @@ internal sealed partial class DbImpl
         IoPriority = priority,
         Statistics = Options.Statistics,
         FileChecksumGenFactory = Options.FileChecksumGenFactory,
+        // builder.cc / compaction_job.cc: WritableFileWriter(..., ioptions.listeners, ...).
+        FileIoNotifier = FileIo,
     };
 
     /// <summary>
@@ -1004,6 +1029,8 @@ internal sealed partial class DbImpl
         IoPriority = priority,
         Statistics = Options.Statistics,
         FileChecksumGenFactory = Options.FileChecksumGenFactory,
+        // BlobFileBuilder::OpenBlobFileIfNeeded: WritableFileWriter(..., immutable_options_->listeners, ...).
+        FileIoNotifier = FileIo,
         BytesPerSync = (long)Math.Min(Options.BytesPerSync, long.MaxValue),
         MaxBufferSize = (int)Math.Clamp(o.BlobFileWritableFileMaxBufferSize != 0 ? o.BlobFileWritableFileMaxBufferSize : Options.WritableFileMaxBufferSize,
             64 * 1024, int.MaxValue),

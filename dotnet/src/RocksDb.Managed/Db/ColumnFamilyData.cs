@@ -154,6 +154,7 @@ internal sealed class ColumnFamilyData
             db.Options.MaxOpenFiles)
         {
             BlobFileReadHistogram = Stats.BlobFileReadHist,
+            FileIo = db.FileIo,
         };
         CompactionState = new ColumnFamilyCompactionState(options, Icmp);
         // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
@@ -168,6 +169,7 @@ internal sealed class ColumnFamilyData
                 BlobFileSize = options.BlobFileSize,
                 FileOptions = db.BlobFileWriteOptions(options),
                 BlobFileReadHistogram = Stats.BlobFileReadHist,
+                FileIo = db.FileIo,
             };
             BlobSource.DirectWrite = BlobDirectWrite;
         }
@@ -309,6 +311,7 @@ internal sealed class ColumnFamilyData
             RowCache = db.Options.RowCache,
             LevelStats = new InternalStats(numLevels),
             NumLevels = numLevels,
+            FileIo = db.FileIo,
         };
 
     internal static TableReaderOptions CreateReaderOptions(ColumnFamilyOptions options, TableFormatOptions format, DbImpl db)

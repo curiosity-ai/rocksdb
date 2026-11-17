@@ -424,19 +424,32 @@ internal sealed partial class DbImpl
         allLogs.RemoveRange(0, startIndex);
     }
 
-    /// <summary>Opens a WAL for sequential reading; alive WALs fall back to the archive (TransactionLogIteratorImpl::OpenLogFile).</summary>
+    /// <summary>
+    /// Opens a WAL for sequential reading; alive WALs fall back to the archive (TransactionLogIteratorImpl::OpenLogFile,
+    /// whose SequentialFileReader gets the listeners: the reads are reported to the file I/O listeners).
+    /// </summary>
     internal Env.ISequentialFile OpenWalForRead(WalFileInfo file)
     {
-        if (file.Type == WalFileType.ArchivedLogFile) return FileSystem.OpenSequential(FileNames.ArchivedLogFileName(WalDir, file.LogNumber));
-        try
+        string path = file.Type == WalFileType.ArchivedLogFile ? FileNames.ArchivedLogFileName(WalDir, file.LogNumber) : FileNames.LogFileName(WalDir, file.LogNumber);
+        Env.ISequentialFile f;
+        if (file.Type == WalFileType.ArchivedLogFile)
         {
-            return FileSystem.OpenSequential(FileNames.LogFileName(WalDir, file.LogNumber));
+            f = FileSystem.OpenSequential(path);
         }
-        catch (RocksDbException)
+        else
         {
-            // If cannot open file in DB directory, try the archive dir, as it could have moved in the meanwhile.
-            return FileSystem.OpenSequential(FileNames.ArchivedLogFileName(WalDir, file.LogNumber));
+            try
+            {
+                f = FileSystem.OpenSequential(path);
+            }
+            catch (RocksDbException)
+            {
+                // If cannot open file in DB directory, try the archive dir, as it could have moved in the meanwhile.
+                path = FileNames.ArchivedLogFileName(WalDir, file.LogNumber);
+                f = FileSystem.OpenSequential(path);
+            }
         }
+        return FileIoNotifier.Wrap(FileIo, f, path);
     }
 
     // ---- write-path signal ---------------------------------------------------------------------------------
