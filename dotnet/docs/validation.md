@@ -2324,9 +2324,8 @@ complete asynchronously (and out of order), under a deliberately exhausted threa
 
 - A sync writer queued behind an async write leader waits for the leader's thread-pool continuation (async WAL I/O,
   stall waits); with the pool full of sync writers a capped pool deadlocks and the default pool stalls until it injects
-  threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`. **Decision (2026-11-17): not fixed;
-  documented as a usage rule** (README, architecture.md, `RocksDatabase` remarks: do not mix the sync and async API on
-  one database). The sync write methods are expected to be deprecated and removed.
+  threads. Repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`. First documented as a usage rule (do not mix
+  the sync and async API); **fixed in audit #12** (mixed sync/async writers supported, the notice removed).
 - `AsyncPrefetchBuffer.TakePending` blocked a compaction thread (or a sync CompactRange / scan) on a read continuation
   that needs a pool thread when the file system has no `Prefetch`. **Fixed in audit #11** (synchronous readahead).
 
@@ -2551,3 +2550,70 @@ Open:
   detection exists only in the port. Limits: WALs written by an earlier instance, or no longer alive, have no mark
   (only bytes the reader dropped count; the gap check catches the rest on the next logged write).
 - Row cache: with `ShouldMerge` and a row cache, lookups that ShouldMerge ends inside a file read the table every time.
+
+## Audit #12: mixed sync and async writers (2026-11-17)
+
+Problem (audit #8 open item): group commit makes a writer wait for the writers ahead of it. A sync writer blocks its
+thread, so when the work it waits for is a .NET thread-pool continuation of an async writer and every pool thread is a
+blocked sync writer, the write path stalls until the pool injects threads, or deadlocks with a capped pool. No upstream
+analogue: `WriteThread::AwaitState` waits for threads that each run their own write, there is no shared pool and no async
+writer (write_thread.cc, db_impl_write.cc). The fix keeps upstream's protocol (JoinBatchGroup, EnterAsBatchGroupLeader,
+ExitAsBatchGroupLeader, the pipelined and unordered stages, two_write_queues) and changes only which thread runs a step.
+
+Inventory of waiting points that could depend on a pool thread (each now synchronous or on a write wake-up thread once
+`WriteThread.SyncWriterJoined`):
+
+1. An async leader's WAL I/O: main queue, WAL-only queue, pipelined and unordered WAL stages (synced writes, large
+   batches, `OffloadAsyncSync`, a file system whose async I/O completes on the pool).
+2. An async leader's stall waits: DelayWrite delays and stops (also LockWAL's stop), `WriteBufferManager` stalls.
+3. Hand-off of leadership to an async writer: main queue, WAL-only queue, pipelined memtable leader.
+4. Memtable inserts by async writers: parallel inserts (default and pipelined) and unordered inserts waited for by
+   `WaitForPendingWrites`.
+5. Waits of a leader on other writers: the memtable-writer drain, `WaitForPendingWrites`, `EnterNonMemUnbatched`.
+6. Locks held across async I/O: the two-queue WAL write lock, the WAL I/O lock (FlushWAL, SyncWAL, memtable switch,
+   UnlockWAL), the MANIFEST slot of `LogAndApply` (flushes and compactions that stalled writers wait for take it).
+7. Async unbatched operations (FlushAsync, column family create/drop, ingestion, import, the WAL switch of
+   SetDBOptions, ResumeAsync and auto-recovery, LockWalAsync, FlushWalAsync, SyncWalAsync) and the WBM flush
+   coordinator (was `Task.Run`, a pool dependency for stalled sync writers even in all-sync DBs).
+8. Already independent of the pool: the low-pri rate limiter (a sync requester refills it), SplitInsert workers.
+
+Fixed:
+
+- Async leaders lead synchronously in a DB that has had a sync writer (`DbImpl.LeadsSynchronously`); async writers
+  woken to lead run on `BackgroundThreadPool.WriteWakeup` and return to the pool after releasing the leadership; groups
+  with async writers are inserted serially by the leader (unordered: the leader inserts its async followers' batches);
+  leaders likely to stall and async unbatched operations move to a wake-up thread first. The writer's wait is a
+  hand-written `IValueTaskSource` (the `ManualResetValueTaskSourceCore` protocol, but completion chooses the thread,
+  also when the waiter registers after completion). The sync DelayWrite sleep observes the cancellation token, so an
+  async writer cancelled while stalled behaves as before. Rejected designs: synchronous leading alone (hand-off still on
+  the pool); the exiting leader running the next async writer's group (no safe point inside the pipelined exit,
+  recursion on chains of hand-offs); a waiting sync writer leading for the async one (cannot join every group, changes
+  the group size cap, cancellation and statistics); blocking async writers (starves async apps); a per-DB option (a
+  usage rule again).
+- Tests (`Audit12SyncAsyncWriteTests`, 41 cases, every pool worker blocked, a file system completing async I/O on the
+  pool, per-test deadlines with write-queue dumps): every write mode (default, pipelined, unordered, two_write_queues,
+  concurrent memtable writes, SplitInsert), synced writes, large batches, memtable and WAL switches, delayed and stopped
+  writes, both WBM flush policies, manual_wal_flush with async control operations, WAL-only queue transactions, a capped
+  pool, cancellation of a stalled async leader, callers never resuming on wake-up threads. Against the pre-fix sources
+  34 of the 41 cases and the audit #8 repro hang until their deadline; the rest pin semantics.
+- Semantics: a seeded mixed program (more writers than pool threads, stalls, flushes) ends with the contents and last
+  sequence of the same program run all-sync; a sequential mixed program gives the same per-operation sequence numbers
+  and WAL records as all-sync. Native check: native has no async writers, so the comparison is with the managed all-sync
+  path, which earlier audits compared with native (group commit, sequence numbers, WAL records).
+- Performance (release, 4 alternating runs per side, ops/s): 1 sync Put 720k-810k before / 715k-813k after; 1 PutAsync
+  623k-738k / 655k-712k; 8 sync 434k-508k / 439k-474k; 8 async 545k-595k / 542k-561k (noise); 4 sync + 4 async
+  470k-543k / 460k-498k (about -5 to -8%: serial inserts and one extra hop per woken leader). Allocations 0.06-0.09 B/op
+  in every row, before and after.
+
+Residuals (documented in architecture.md, README, `RocksDatabase` remarks):
+
+- The mode is entered at the first sync writer: async I/O, stall waits or pool wake-ups started before it still finish
+  on the pool. A capped pool that fills with sync writers inside that window can deadlock (once per DB); the default
+  pool only slows down. One sync write after open avoids it (the audit #8 repro does one).
+- In mixed mode an async writer that leads a group may block its caller for the group's synchronous WAL write (fsync
+  with `Sync = true`), and async `LogAndApply` callers for the MANIFEST slot.
+- A stall that begins between the leader's "likely to stall" check and `PreprocessWrite` blocks the async caller's thread
+  for that stall.
+- Close (`DisposeAsync`) is unchanged: sync writes racing it wait for the pool, then fail with ObjectDisposed.
+- `UnlockWAL` (sync only) waits for an async FlushWAL's I/O in a DB that never had a sync writer (pre-existing, no
+  writers involved).

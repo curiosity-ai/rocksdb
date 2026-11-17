@@ -18,11 +18,11 @@ namespace RocksDb.Managed;
 /// </para>
 /// Thread-safe. Dispose (preferably <see cref="DisposeAsync"/>) to close it and release the LOCK file.
 /// <para>
-/// Use either the synchronous or the asynchronous API on one database, not both. Writes are group-committed: a sync
-/// writer blocks its thread until the group's leader finishes; when that leader is an async writer whose I/O or stall
-/// wait completes asynchronously, the leader continues on the .NET thread pool, so sync writers that occupy pool threads
-/// can starve it (stalls until the pool injects threads, deadlock under a capped pool). The sync write methods may be
-/// deprecated in a future version; prefer the async API.
+/// The synchronous and asynchronous APIs can be mixed on one database, also from .NET thread-pool threads: once a
+/// synchronous writer has used the database, asynchronous writers that lead a write group do that work (WAL I/O, stall
+/// waits) synchronously, so synchronous writers never wait for a thread-pool thread. In that mode an asynchronous write
+/// may block its caller for its group's WAL write. Asynchronous I/O already in flight when the first synchronous writer
+/// arrives still completes on the thread pool; with a capped pool, do one synchronous write after opening.
 /// </para>
 /// </summary>
 public sealed partial class RocksDatabase : IDisposable, IAsyncDisposable
