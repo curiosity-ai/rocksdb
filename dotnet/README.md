@@ -1063,6 +1063,12 @@ Set `DbOptions.WalTtlSeconds` / `WalSizeLimitMb` to archive obsolete WALs for re
 [src/RocksDb.Managed.Replication](src/RocksDb.Managed.Replication/README.md). A held iterator, `TailUpdatesAsync` and
 `WaitForSequenceAsync` allocate nothing per batch, also while they wait (see [docs/allocations.md](docs/allocations.md)).
 
+A `GetUpdatesSince` run ends like native: `Error` null when caught up, `TryAgain` when the DB is ahead of what the WAL
+can deliver (writes with `DisableWal` or ingested files at the end of the log, `ManualWalFlush` data not flushed yet,
+a damaged record - `SkippedCorruptBytes` tells that one apart), `NotFound` on a gap. Unlike native, `Next()` after
+`TryAgain` retries from where the iterator stopped; `TailUpdatesAsync` waits `TryAgain` out and ends with `NotFound`
+at a damaged record.
+
 ### Read-only and secondary instances
 
 <!-- snippet:read-only-secondary -->

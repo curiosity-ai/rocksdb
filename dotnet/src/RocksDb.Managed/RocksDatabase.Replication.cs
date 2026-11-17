@@ -99,6 +99,14 @@ public sealed partial class RocksDatabase
     /// (flushed and not archived, see <see cref="DbOptions.WalTtlSeconds"/> / <see cref="DbOptions.WalSizeLimitMb"/>)
     /// cannot be read: the iterator then starts at the oldest available batch, so callers must compare
     /// <see cref="WalBatch.Sequence"/> with what they asked for. Disable file deletions to keep WALs alive.
+    /// <para>
+    /// When the iterator runs out of readable batches while the DB has published newer sequence numbers it ends with
+    /// <see cref="StatusCode.TryAgain"/> in <see cref="TransactionLogIterator.Error"/>, like native
+    /// ("Create a new iterator to fetch the new tail."): the end of the log is writes that bypassed the WAL, data a
+    /// manual WAL flush has not written yet, or a damaged record (<see cref="TransactionLogIterator.SkippedCorruptBytes"/>).
+    /// Unlike native, calling <see cref="TransactionLogIterator.Next"/> later retries from there; opening a new iterator
+    /// at <see cref="TransactionLogIterator.NextSequence"/> works as well. Caught up is <see cref="TransactionLogIterator.Error"/> null.
+    /// </para>
     /// <code>
     /// using var it = db.GetUpdatesSince(seq);
     /// await foreach (WalBatch b in it) replica.Write(b.Span);   // batches available now
@@ -114,7 +122,9 @@ public sealed partial class RocksDatabase
     /// at least <paramref name="sequenceNumber"/>, awaiting new writes when caught up (no polling), following WAL
     /// rotations, until <paramref name="cancellationToken"/> is cancelled or the DB is closed. Each
     /// <see cref="WalBatch"/> is valid until the enumeration moves on. Throws if the WAL has a gap (e.g. the
-    /// requested WAL was already deleted) or is corrupted.
+    /// requested WAL was already deleted) or is corrupted, and NotFound when a damaged WAL record keeps it below the
+    /// DB's last sequence number (see <see cref="TransactionLogIterator.MoveNextTailingAsync"/>). Sequence numbers that
+    /// are not in the WAL at the end of the log (TryAgain) are waited out.
     /// </summary>
     public async IAsyncEnumerable<WalBatch> TailUpdatesAsync(ulong sequenceNumber, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -128,7 +138,8 @@ public sealed partial class RocksDatabase
             {
                 if (!await it.MoveNextTailingAsync(cancellationToken).ConfigureAwait(false))
                 {
-                    it.ThrowIfError();
+                    // The DB closed while the tail waited out a TryAgain: not an error of the tail.
+                    if (it.Error is { Code: not StatusCode.TryAgain }) it.ThrowIfError();
                     yield break;
                 }
             }
