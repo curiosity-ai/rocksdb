@@ -1630,6 +1630,10 @@ internal sealed partial class DbImpl
             // does not wait) so that this sync only has to wait for the last chunk instead of the whole file.
             BytesPerSync = Options.WalBytesPerSync != 0 ? (long)Math.Min(Options.WalBytesPerSync, long.MaxValue) : WalWritebackBytes,
             MaxBufferSize = (int)Math.Clamp(Options.WritableFileMaxBufferSize, 64 * 1024, int.MaxValue),
+            // CreateWAL: WritableFileWriter(..., immutable_db_options_.listeners, ...). The writeback without
+            // wal_bytes_per_sync is not a RangeSync of upstream's writer: not reported.
+            FileIoNotifier = FileIo,
+            ReportRangeSyncs = Options.WalBytesPerSync != 0,
         };
         IWritableFile file;
         if (recycleLogNumber != 0)
@@ -1644,6 +1648,7 @@ internal sealed partial class DbImpl
         {
             file = FileSystem.CreateWritable(path, truncate: true, fileOptions);
         }
+        file = FileIoNotifier.Wrap(FileIo, file, path);
         try
         {
             // Any non-zero recycle_log_file_num (after sanitization) writes the recyclable record format, also for WALs

@@ -113,6 +113,9 @@ internal sealed class BlobDirectWriteManager : IDisposable
     /// </summary>
     public HistogramImpl? BlobFileReadHistogram { get; init; }
 
+    /// <summary>The DB's file I/O listeners, given to the readers of unsealed files. Null: none.</summary>
+    internal FileIoNotifier? FileIo { get; init; }
+
     /// <summary>
     /// Write buffering of the blob files, and the DB's file checksum factory (set from the mutable options before each
     /// write).
@@ -341,7 +344,7 @@ internal sealed class BlobDirectWriteManager : IDisposable
             if (e.Reader is null)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
-                e.Reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats, BlobFileReadHistogram);
+                e.Reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats, BlobFileReadHistogram, FileIo);
                 e.Reader.ExtendVisibleSize(e.VisibleSize);
             }
             reader = e.Reader;
@@ -374,7 +377,7 @@ internal sealed class BlobDirectWriteManager : IDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (!_orphanReaders.TryGetValue(fileNumber, out reader))
             {
-                reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats, BlobFileReadHistogram);
+                reader = BlobFileReader.OpenUnsealed(_fs, FileNames.BlobFileName(_blobDir, fileNumber), ColumnFamilyId, _stats, BlobFileReadHistogram, FileIo);
                 _orphanReaders[fileNumber] = reader;
             }
         }

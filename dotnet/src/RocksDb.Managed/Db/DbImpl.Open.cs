@@ -234,7 +234,7 @@ internal sealed partial class DbImpl
             bool hasMissingFiles;
             try
             {
-                state = ManifestReader.TryRecoverPointInTime(FileSystem, DbName, _comparatorResolver, pointInTimeVerifier, out manifestNumber,
+                state = ManifestReader.TryRecoverPointInTime(ManifestFileSystem, DbName, _comparatorResolver, pointInTimeVerifier, out manifestNumber,
                     out hasMissingFiles);
             }
             finally
@@ -245,7 +245,7 @@ internal sealed partial class DbImpl
         }
         else
         {
-            state = ManifestReader.RecoverFromDirectory(FileSystem, DbName, _comparatorResolver, out manifestNumber);
+            state = ManifestReader.RecoverFromDirectory(ManifestFileSystem, DbName, _comparatorResolver, out manifestNumber);
         }
         Versions.RecoverFrom(state, manifestNumber);
         MarkExistingFileNumbersUsed();
@@ -749,7 +749,7 @@ internal sealed partial class DbImpl
         string manifest = FileNames.DescriptorFileName(DbName, manifestNumber);
         try
         {
-            using (ManifestLogWriter log = ManifestLogWriter.Create(FileSystem, manifest))
+            using (ManifestLogWriter log = ManifestLogWriter.Create(ManifestFileSystem, manifest))
             {
                 var writer = new ManifestWriter(log);
                 await writer.AddEditAsync(edit, 0, sync: true, synchronous, ct).ConfigureAwait(false);
@@ -1304,12 +1304,14 @@ internal sealed partial class DbImpl
         string path = FileNames.TableFileName(DbPaths, fileNumber, 0);
         // WriteLevel0TableForRecovery writes blob files too (BlobFileCreationReason::kRecovery). The blob files stay
         // registered as pending outputs, like the table file, until the recovery edits are installed.
-        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, Blob.BlobFileCreationReason.Recovery);
+        Blob.BlobFileBuilder? blobBuilder = CreateBlobFileBuilder(cfd, outputLevel: 0, BlobFileCreationReason.Recovery, 0);
         FileMetaData? meta;
         try
         {
             SeqnoToTimeMapping? seqnoToTime;
             lock (_mutex) seqnoToTime = CopySeqnoToTimeMapping(cfd);
+            // WriteLevel0TableForRecovery -> BuildTable: NotifyTableFileCreationStarted (kRecovery).
+            NotifyOnTableFileCreationStarted(cfd, 0, path, TableFileCreationReason.Recovery);
             meta = await FlushJob.WriteLevel0TableAsync(FileSystem, path, TableFileWriteOptions(Env.IoPriority.High), cfd, [mem], fileNumber, cfd.NewEpochNumber(), Identity, [],
                     CurrentSnapshotChecker, blobBuilder, null, seqnoToTime, null /* BuildTable(version = nullptr) */, null,
                     new FlushJobContext(TableFileCreationReason.Recovery, DbFormat.MaxSequenceNumber, Options.EnforceSingleDelContracts), synchronous, ct)

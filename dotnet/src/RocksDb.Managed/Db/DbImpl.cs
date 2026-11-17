@@ -53,6 +53,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         SharedTableCache = new TableCacheStore(options.MaxOpenFiles);
         // FileSystemTracingWrapper (DBImpl::fs_): records file operations while an IO trace runs.
         FileSystem = new Tracing.IoTracingFileSystem(options.FileSystem, IoTracer);
+        FileIo = FileIoNotifier.Create(options.Listeners, LogWarn);
+        ManifestFileSystem = FileIoNotifier.ManifestFileSystem(FileIo, FileSystem);
         WalDir = string.IsNullOrEmpty(options.WalDir) ? dbname : options.WalDir.TrimEnd('/');
         // SanitizeOptions (db_impl_open.cc): db_paths as given (path id i = db_paths[i]), or {dbname, UINT64_MAX}.
         var paths = new List<string>();
@@ -69,7 +71,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         DbPaths = paths;
         DbPathTargetSizes = targetSizes;
-        Versions = new VersionSet(this, FileSystem, dbname);
+        Versions = new VersionSet(this, ManifestFileSystem, dbname);
         ErrorHandler = new ErrorHandler(this);
         _allowConcurrentMemtableWrite = options.AllowConcurrentMemtableWrite;
         _pipelined = options.EnablePipelinedWrite;
@@ -130,6 +132,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
     public string DbName { get; }
     public DbOptions Options { get; }
     public IFileSystem FileSystem { get; }
+
+    /// <summary>
+    /// The listeners that want file I/O notifications (EventListener::ShouldBeNotifiedOnFileIO), or null when none does:
+    /// then no file is wrapped and the I/O paths are those of a DB without listeners.
+    /// </summary>
+    internal FileIoNotifier? FileIo { get; }
+
+    /// <summary><see cref="FileSystem"/> with the MANIFEST files reporting to <see cref="FileIo"/> (VersionSet, recovery).</summary>
+    internal IFileSystem ManifestFileSystem { get; }
+
     public string WalDir { get; }
     public IReadOnlyList<string> DbPaths { get; }
 
@@ -840,8 +852,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
             // The SharedBlobFileMetaData deleter: evict the reader, then delete the file (AddObsoleteBlobFile).
             b.Cfd.BlobSource.Evict(b.BlobFileNumber);
             b.Cfd.BlobDirectWrite?.Forget(b.BlobFileNumber);
-            Exception? failure = DeleteDbFile(FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber), DbPaths[0]);
+            string blobPath = FileNames.BlobFileName(DbPaths[0], b.BlobFileNumber);
+            Exception? failure = DeleteDbFile(blobPath, DbPaths[0]);
             LogFileDeletionEvent("blob_file_deletion", 0, b.BlobFileNumber, failure); // EventHelpers::LogAndNotifyBlobFileDeletion
+            NotifyOnBlobFileDeleted(blobPath, 0, failure);
         }
         if (releasedBlobs is not null)
         {
@@ -993,7 +1007,12 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (dataFiles is not null && dataFiles.TryGetValue(p, out (FileType Type, ulong Number, string Directory) f))
             {
                 if (f.Type == FileType.TableFile) DeleteObsoleteTableFile(p, f.Number);
-                else LogFileDeletionEvent("blob_file_deletion", 0, f.Number, DeleteDbFile(p, f.Directory));
+                else
+                {
+                    Exception? failure = DeleteDbFile(p, f.Directory);
+                    LogFileDeletionEvent("blob_file_deletion", 0, f.Number, failure);
+                    NotifyOnBlobFileDeleted(p, 0, failure);
+                }
             }
             else TryDeleteFile(p);
         }

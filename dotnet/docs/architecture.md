@@ -73,6 +73,7 @@ Paths on the left are relative to the repository root (C++). Paths on the right 
 | `db/db_impl/db_impl_experimental.cc`, `db/multi_scan.cc`, `db/history_trimming_iterator.h` | `Db/DbImpl.Experimental.cs`, `MultiScan.cs`, `Db/Compaction/HistoryTrimmingIterator.cs` |
 | `db_impl_readonly.cc`, `db_impl_secondary.cc`, `ReactiveVersionSet` / `ManifestTailer` (`version_set.cc`, `version_edit_handler.h`) | `Db/DbImpl.ReadOnly.cs` |
 | `db/error_handler.cc`, `db/event_helpers.cc`, `include/rocksdb/listener.h` | `Db/ErrorHandler.cs`, `Db/EventListener.cs`, `Db/EventListener.Notifications.cs` |
+| listener notifications of `file/random_access_file_reader.cc`, `file/writable_file_writer.cc`, `file/sequence_file_reader.cc` | `Db/FileIoNotifier.cs` (file wrappers, only when a listener wants file I/O), `Env/LocalFileSystem.cs` (physical writes, range syncs) |
 | `db/blob/*` | `Db/Blob/*` |
 | `db/wide/*` | `Db/Wide/*`, `ColumnFamily.Entities.cs` |
 | `DBImpl::SetOptions`, `SetDBOptions` | `Db/DbImpl.Options.cs`, `ColumnFamily.Options.cs` |
@@ -227,7 +228,8 @@ their reads carry a `ReadCallback` and their flushes / compactions a `SnapshotCh
   (`max_compaction_trigger_wakeup_seconds`: re-evaluates TTL / periodic / read-triggered compaction on idle DBs) and,
   with `preserve_internal_time_seconds` / `preclude_last_level_data_seconds`, the seqno-to-time recorder.
 - **Listener notifications** are queued and drained on the thread pool (`EventListener.Notifications.cs`), so a slow
-  listener does not hold the mutex.
+  listener does not hold the mutex. File I/O notifications (`ShouldBeNotifiedOnFileIO`) run on the thread doing the I/O;
+  without such a listener no file is wrapped.
 - **Error recovery** (`Db/ErrorHandler.cs`) runs automatic resume for retryable background errors as a task; `Resume`
   runs the same recovery on demand.
 - On close, scheduling stops, running jobs finish or are cancelled, and anyone waiting in `FlushAsync` or

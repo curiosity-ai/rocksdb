@@ -35,9 +35,14 @@ internal sealed class BlobFileReader : IDisposable
     /// files still being written): validates the header only. Readable bytes are those made visible with
     /// <see cref="ExtendVisibleSize"/> (no footer is assumed: IsValidBlobOffset with has_footer = false).
     /// </summary>
-    public static BlobFileReader OpenUnsealed(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram)
+    public static BlobFileReader OpenUnsealed(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram) =>
+        OpenUnsealed(fs, path, columnFamilyId, stats, readHistogram, null);
+
+    /// <summary><see cref="OpenUnsealed(IFileSystem, string, uint, Statistics?, HistogramImpl?)"/> reporting reads to the DB's file I/O listeners.</summary>
+    internal static BlobFileReader OpenUnsealed(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram,
+        FileIoNotifier? fileIo)
     {
-        IRandomAccessFile file = OpenFile(fs, path, stats, readHistogram);
+        IRandomAccessFile file = OpenFile(fs, path, stats, readHistogram, fileIo);
         try
         {
             if ((ulong)file.Length < BlobLogFormat.HeaderSize) ThrowHelper.Corruption("Malformed blob file");
@@ -77,9 +82,17 @@ internal sealed class BlobFileReader : IDisposable
     public ulong FileSize => _fileSize;
 
     /// <summary>BlobFileReader::Create (OpenFile + ReadHeader + ReadFooter). Throws Corruption / IOError / PathNotFound.</summary>
-    public static BlobFileReader Open(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram)
+    public static BlobFileReader Open(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram) =>
+        Open(fs, path, columnFamilyId, stats, readHistogram, null);
+
+    /// <summary>
+    /// <see cref="Open(IFileSystem, string, uint, Statistics?, HistogramImpl?)"/> reporting reads to the DB's file I/O
+    /// listeners (BlobFileReader::OpenFile: RandomAccessFileReader(..., immutable_options.listeners)).
+    /// </summary>
+    internal static BlobFileReader Open(IFileSystem fs, string path, uint columnFamilyId, Statistics? stats, HistogramImpl? readHistogram,
+        FileIoNotifier? fileIo)
     {
-        IRandomAccessFile file = OpenFile(fs, path, stats, readHistogram);
+        IRandomAccessFile file = OpenFile(fs, path, stats, readHistogram, fileIo);
         try
         {
             ulong fileSize = (ulong)file.Length;
@@ -110,9 +123,9 @@ internal sealed class BlobFileReader : IDisposable
     /// (BLOB_DB_BLOB_FILE_READ_MICROS, the activity histogram and InternalStats' blob_file_read_latency_,
     /// <paramref name="readHistogram"/>).
     /// </summary>
-    private static IRandomAccessFile OpenFile(IFileSystem fs, string path, Statistics? stats, HistogramImpl? readHistogram)
+    private static IRandomAccessFile OpenFile(IFileSystem fs, string path, Statistics? stats, HistogramImpl? readHistogram, FileIoNotifier? fileIo)
     {
-        IRandomAccessFile file = fs.OpenRandomAccess(path);
+        IRandomAccessFile file = FileIoNotifier.Wrap(fileIo, fs.OpenRandomAccess(path), path, Temperature.Unknown);
         return stats is null ? file : new Monitoring.StatisticsRandomAccessFile(file, stats, readHistogram, Histogram.BlobDbBlobFileReadMicros);
     }
 

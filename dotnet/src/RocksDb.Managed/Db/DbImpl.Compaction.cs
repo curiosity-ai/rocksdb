@@ -910,7 +910,7 @@ internal sealed partial class DbImpl
                 // BackgroundCompaction: is_trivial_copy_compaction (FIFO kChangeTemperature with
                 // allow_trivial_copy_when_change_temperature): byte copies of the inputs with the new temperature.
                 copiedFiles = new List<ulong>();
-                CopyTrivialCompactionFiles(c, edit, copiedFiles, ct);
+                CopyTrivialCompactionFiles(cfd, c, edit, copiedFiles, jobId, ct);
             }
             else if (c.IsTrivialMove())
             {
@@ -1014,8 +1014,6 @@ internal sealed partial class DbImpl
                 {
                     jobSnapshot?.Dispose();
                 }
-                // CompactionJob::FinishCompactionOutputFile: the creation event of each output, before the install.
-                NotifyOnCompactionOutputsCreated(cfd, job, jobId);
                 c.AddInputDeletions(edit);
                 foreach (FileMetaData f in job.Outputs) edit.AddFile(c.OutputLevel, f);
                 // Per-key placement: entries too new for the last level were written to the proximal level.
@@ -1043,6 +1041,9 @@ internal sealed partial class DbImpl
             }
             // The super version (and with it the write stall) is installed in the critical section that installs the
             // version (InstallSuperVersionAndScheduleWork right after LogAndApply, under the same mutex hold).
+            // BackgroundCompaction: NotifyOnCompactionPreCommit before LogAndApply / CompactionJob::Install (every path:
+            // FIFO deletion, trivial copy, trivial move, compaction job).
+            NotifyOnCompactionPreCommit(cfd, c, job, jobId, null);
             editSubmitted = true;
             SyncValueTask.GetResult(Versions.LogAndApplyAsync(cfd, edit, synchronous: true, () => InstallSuperVersion(cfd), CancellationToken.None));
             TestHooks.Invoke("DBImpl::RunCompaction:AfterLogAndApply");
@@ -1103,6 +1104,9 @@ internal sealed partial class DbImpl
                 if (c.BuildJobInfo) c.JobInfo = NewCompactionJobInfo(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
                 try
                 {
+                    // BackgroundCompaction's safety net before ReleaseCompactionFiles: OnCompactionPreCommit with the
+                    // failure when the paths above did not raise it (idempotent).
+                    if (!ok) NotifyOnCompactionPreCommit(cfd, c, job, jobId, failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
                     NotifyOnCompactionCompleted(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
                 }
                 catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)
@@ -1230,9 +1234,10 @@ internal sealed partial class DbImpl
     /// and replaces the input by the copy at the same level in <paramref name="edit"/>. The copy keeps the input's
     /// metadata (boundaries, seqnos, unique id, oldest ancestor time, ...) with a new creation time, the compaction's
     /// epoch number and its own file checksum. <paramref name="created"/> receives the new file numbers (pending
-    /// outputs).
+    /// outputs). Each copy is reported like a compaction output (NotifyTableFileCreationStarted, then
+    /// LogAndNotifyTableFileCreationFinished with the input's table properties, or with the failure).
     /// </summary>
-    private void CopyTrivialCompactionFiles(Compaction c, VersionEdit edit, List<ulong> created, CancellationToken ct)
+    private void CopyTrivialCompactionFiles(ColumnFamilyData cfd, Compaction c, VersionEdit edit, List<ulong> created, int jobId, CancellationToken ct)
     {
         int bufferSize = (int)Math.Clamp(c.Options.CompactionOptionsFifo.TrivialCopyBufferSize, 1UL, 64UL << 20);
         byte[] buffer = RocksArrayPool<byte>.Shared.Rent(bufferSize);
@@ -1248,13 +1253,23 @@ internal sealed partial class DbImpl
                 string outPath = FileNames.TableFileName(DbPaths, number, c.OutputPathId);
                 byte[] checksum;
                 string checksumFunc;
-                using (Env.ISequentialFile src = FileSystem.OpenSequential(inPath))
-                using (Env.IWritableFile dst = FileChecksumHelper.CreateWritable(FileSystem, outPath, TableFileWriteOptions(Env.IoPriority.Low)))
+                NotifyOnTableFileCreationStarted(cfd, jobId, outPath, TableFileCreationReason.Compaction);
+                try
                 {
-                    int n;
-                    while ((n = src.Read(buffer.AsSpan(0, bufferSize))) > 0) dst.Append(buffer.AsSpan(0, n));
-                    dst.Sync();
-                    (checksum, checksumFunc) = FileChecksumHelper.GetChecksum(dst);
+                    using (Env.ISequentialFile src = FileSystem.OpenSequential(inPath))
+                    using (Env.IWritableFile dst = FileChecksumHelper.CreateWritable(FileSystem, outPath, TableFileWriteOptions(Env.IoPriority.Low)))
+                    {
+                        int n;
+                        while ((n = src.Read(buffer.AsSpan(0, bufferSize))) > 0) dst.Append(buffer.AsSpan(0, n));
+                        dst.Sync();
+                        (checksum, checksumFunc) = FileChecksumHelper.GetChecksum(dst);
+                    }
+                }
+                catch (Exception e) when (e is IOException or RocksDbException)
+                {
+                    // unfinished_out_fname: the creation event of the copy that failed, with an empty FileDescriptor.
+                    NotifyOnTableFileNotKept(cfd, jobId, outPath, 0, TableFileCreationReason.Compaction, e);
+                    throw;
                 }
                 FileMetaData copy = input.Clone();
                 copy.FileNumber = number;
@@ -1267,6 +1282,10 @@ internal sealed partial class DbImpl
                 copy.FileChecksumFuncName = checksumFunc;
                 edit.DeleteFile(c.StartLevel, input.FileNumber);
                 edit.AddFile(c.StartLevel, copy);
+                if (HasListeners)
+                {
+                    NotifyOnTableFileCreated(cfd, jobId, outPath, copy.FileSize, TableFileCreationReason.Compaction, null, TryGetTableProperties(cfd, input));
+                }
             }
             FileSystem.SyncDirectory(DbPaths[(int)Math.Min(c.OutputPathId, (uint)(DbPaths.Count - 1))]);
         }
