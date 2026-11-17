@@ -2210,11 +2210,8 @@ Replication layer (reference: rocksdb-sharp):
 
 ### Open
 
-- `GetUpdatesSince` stopped on a damaged recycled record below LastSequence ends with OK; native returns TryAgain "Create
-  a new iterator to fetch the new tail." (`wal_iterator_impl.cc` NextImpl). The managed iterator re-lists WALs by design
-  instead of TryAgain; in this case OK reads as "caught up". Ignored compat test
-  `GetUpdatesSinceStoppedBelowLastSequenceIsTryAgainLikeNative`.
-### OPTIONS strictness (follow-up)
+- `GetUpdatesSince` stopped below LastSequence ended with OK where native returns TryAgain. **Fixed in audit #11**
+  (see there).
 
 The port may be stricter than native when reading OPTIONS files, never less strict (project rule). Fixed to that rule:
 an empty `comparator=` is InvalidArgument "Missing configurable object" (`OptionTypeInfo::Prepare` / `Validate`, no
@@ -2330,9 +2327,8 @@ complete asynchronously (and out of order), under a deliberately exhausted threa
   threads. Ignored repro `SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`. **Decision (2026-11-17): not fixed;
   documented as a usage rule** (README, architecture.md, `RocksDatabase` remarks: do not mix the sync and async API on
   one database). The sync write methods are expected to be deprecated and removed.
-- `AsyncPrefetchBuffer.TakePending` blocks a compaction thread (or a sync CompactRange) on a read continuation that needs
-  a pool thread when the file system has no `Prefetch` (macOS LocalFileSystem, in-memory and custom file systems; not
-  Linux LocalFileSystem). Ignored repro `CompactionPrefetchProgressesWithThreadPoolExhausted`.
+- `AsyncPrefetchBuffer.TakePending` blocked a compaction thread (or a sync CompactRange / scan) on a read continuation
+  that needs a pool thread when the file system has no `Prefetch`. **Fixed in audit #11** (synchronous readahead).
 
 ### Known deviations recorded by this audit
 
@@ -2479,12 +2475,10 @@ now say so.
 
 ### Open
 
-- `CompactionFilter::Context::input_table_properties` is not offered (needs the input files' properties per compaction).
-- Not ported, unchanged: `MergeOperator::ShouldMerge`, `max_successive_merges` (accepted, ignored), listener callbacks
-  `OnSubcompaction*` and `OnFile*Finish`. No native EventListener differential.
-- A custom filter policy that reuses the built-in compatibility name gets the built-in reader (upstream calls the
-  policy's own reader). The output of a failed background compaction may stay on disk until the next open (not live;
-  upstream likely deletes it at once; unconfirmed).
+- `input_table_properties`, `ShouldMerge`, `max_successive_merges`, the subcompaction / file I/O listener callbacks and the
+  custom filter reader under the built-in name: **implemented in audit #11**. No native EventListener differential beyond
+  flush / compaction / subcompaction (the C API exposes no other callbacks).
+- The output of a failed background compaction may stay on disk until the next open (not live; unconfirmed).
 
 ### Verified
 
@@ -2501,3 +2495,53 @@ now say so.
 - Table properties collectors end to end (contexts for flush / compaction / SstFileWriter, entry types, user properties
   across reopen, NeedCompact marking); file checksum functions changing between opens; a throwing WAL filter fails the
   open without changing the DB; throwing listeners are contained.
+
+## Audit #11: unported features, row cache with ShouldMerge, GetUpdatesSince, readahead (2026-11-17)
+
+Features ported (each against the cited C++, with native differentials where the C API reaches):
+
+- `MergeOperator.ShouldMerge` (merge_operator.h; called from `HandleTypeMerge` in the memtable and `GetContext::SaveValue`
+  only): point lookups (Get, MultiGet, GetEntity, KeyMayExist, row-cache replay, the DB part of transaction and WBWI
+  reads) stop and merge without a base once it returns true; operands newest first; iterators, flush, compaction and
+  GetMergeOperands ignore it. Default costs nothing (override detected once). Port of `LimitMergeOperands`. No C API hook.
+- `max_successive_merges` / `strict_max_successive_merges` (were accepted and ignored): `MemTableInserter::MergeCF` folds
+  a key's operands into a Put at the write's sequence once the memtable holds the limit (block-cache-only read unless
+  strict; not during WAL replay or concurrent inserts). Native differential (400-step seeded workloads, limits 1-3,
+  strict on/off, directories swapped at reopen): equal reads and equal merge-operator call counts after every step.
+- `CompactionFilterContext.InputTableProperties` (compaction_filter.h; `Compaction::GetInputTableProperties`): from the
+  compaction's already-open table readers, once per compaction; empty for flushes and on error.
+- A custom filter policy under the built-in compatibility name now gets its own reader (`parsed_full_filter_block.cc`
+  calls `GetFilterBitsReader`); built-in policies return the same reader as before. No combination is rejected:
+  delegating wrappers (upstream's `LevelAndStyleCustomFilterPolicy`) work both ways with native-written filters.
+- Listener callbacks: `OnSubcompactionBegin/Completed` (`SubcompactionJobInfo`, input-side stats as native),
+  `OnCompactionPreCommit`, `OnTableFileCreationStarted`, `OnManualFlushScheduled`, blob file creation / deletion,
+  the deprecated `OnErrorRecoveryCompleted`, and file I/O (`ShouldBeNotifiedOnFileIO`, `OnFile*Finish`, `OnIOError`) on
+  upstream's sites (table, blob, WAL, MANIFEST). Zero cost without a file-I/O listener (Put / Get within noise, no
+  allocation); with one, Put about 18% and Get about 8% slower. Native (C API listener): identical flush / compaction /
+  subcompaction sequences, reasons, ids and per-subcompaction input counts. Not ported: `OnBackgroundJobPressureChanged`
+  (experimental), blob direct-write creation events, SstFileWriter / SstFileReader file I/O (no listener list).
+
+Fixed:
+
+- Row cache + ShouldMerge returned wrong data (also upstream, reproduced on native 11.12; draft 16): a lookup that
+  ShouldMerge ended inside a file cached that file's entries so far as the whole entry; a later snapshot read replayed
+  the truncated entry and merged an older, overwritten value ("old,b" instead of "base,a,b"; also MultiGet, GetEntity,
+  GetMergeOperands). Such a lookup is no longer row-cached. Randomized row-cache-on vs off comparison (25 x 400 steps).
+- GetUpdatesSince ends with TryAgain ("Create a new iterator to fetch the new tail.") when its WALs end below
+  LastSequence, after following a rotation once, as native; caught-up ends with OK. **Deviation**: `Next()` after
+  TryAgain retries (native's iterator is spent), because reopening rescans the WAL from its start; a new iterator works
+  too. New `SkippedCorruptBytes` / `SkippedCorruptionReason` report what the reader dropped. `WalTailer` escalates to
+  NotFound (the hosts resync) when the DB is ahead, the iterator cannot advance and data was dropped (once more after a
+  reopen); unlogged writes (DisableWal, ingestion, manual_wal_flush) never trigger it. Native comparison of every run
+  end; the replica resyncs past a damaged primary WAL record.
+- Compaction input readahead and the implicit auto-readahead fallback use one synchronous buffer when the file system
+  has no `Prefetch` (block_prefetcher.cc: `num_buffers = is_async_io_prefetch ? 2 : 1`), so compaction, output
+  verification and sync scans never wait for a thread-pool read continuation. Same bytes and read counts; throughput
+  neutral. Remaining opt-in wait, as upstream: a sync iterator with `ReadaheadSize > 0` and `AsyncIo`.
+
+Open:
+
+- A fresh WAL tailer starting at a record still in the manual_wal_flush buffer of an empty current WAL gets NotFound
+  (its start looks purged); damage in a recycled WAL reads as the end of the log and is not escalated; a damaged record
+  length past EOF reads as an incomplete record until the next write.
+- Row cache: with `ShouldMerge` and a row cache, lookups that ShouldMerge ends inside a file read the table every time.

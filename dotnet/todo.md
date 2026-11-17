@@ -452,7 +452,7 @@ Still open from this round:
 - [x] Sync/async parity differential tests for writes, reads, iterators, transactions, backup, control APIs; public async surface inventory test
 - [x] A throwing `UserWriteCallback` (OnWriteEnqueued / OnWalWriteFinish) fails safely: hard background error, caller gets the exception, Resume() recovers (deliberate deviation; upstream: undefined behaviour)
 - [x] Sync writers behind an async leader depend on a thread-pool continuation: documented as a usage rule (never mix sync and async on one DB; sync write methods to be deprecated), repro stays ignored
-- [ ] `AsyncPrefetchBuffer.TakePending` blocks on a pool continuation without `Prefetch` support (macOS / custom file systems; repro ignored)
+- [x] `AsyncPrefetchBuffer.TakePending` blocked on a pool continuation without `Prefetch` support: synchronous readahead (audit #11)
 
 ## Audit #9 (2026-11-16; docs/validation.md "Audit #9: opening and closing the DB")
 
@@ -467,8 +467,17 @@ Still open from this round:
 - [x] Do-nothing FindShortestSeparator / FindShortSuccessor overrides keep the key; inconsistent comparator -> Corruption at flush; ReadOptions.TableFilter ported
 - [x] Throwing user code fails safely everywhere (partitioner, checksum factory, compaction service, merge operator, filters, collectors, listeners, comparators, extractors)
 - [x] Compaction filter factories see the table file creation reason
-- [ ] `CompactionFilter::Context::input_table_properties`; `MergeOperator::ShouldMerge`; `max_successive_merges`; `OnSubcompaction*` / `OnFile*Finish` listeners
-- [ ] Custom filter policy reusing the built-in compatibility name gets the built-in reader
+- [x] `CompactionFilter::Context::input_table_properties`; `MergeOperator::ShouldMerge`; `max_successive_merges`; `OnSubcompaction*` / `OnFile*Finish` listeners (audit #11)
+- [x] Custom filter policy reusing the built-in compatibility name gets its own reader, as upstream (audit #11)
 - [ ] Failed background compaction output possibly kept until the next open (unconfirmed)
 
 - [ ] Deprecate, then remove, the synchronous write methods (follows from the sync/async mixing rule, audit #8)
+
+## Audit #11 (2026-11-17; docs/validation.md "Audit #11")
+
+- [x] ShouldMerge, max_successive_merges (+ strict), input_table_properties, custom filter readers, listener callbacks (subcompaction, pre-commit, creation started, manual flush scheduled, blob files, file I/O)
+- [x] Row cache + ShouldMerge truncated entry (wrong reads; upstream too, draft 16)
+- [x] GetUpdatesSince TryAgain like native (recoverable on Next: deviation); WalTailer escalates damaged WAL records to a resync
+- [x] Compaction / auto readahead without Prefetch support reads synchronously
+- [ ] WAL tailer: fresh tailer at a manual_wal_flush-buffered start; recycled-WAL damage not escalated; damaged length past EOF
+- [ ] Listener: OnBackgroundJobPressureChanged; blob direct-write creation events; SstFileWriter / SstFileReader file I/O
