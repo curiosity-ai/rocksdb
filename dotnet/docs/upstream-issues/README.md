@@ -1,9 +1,9 @@
 # Upstream RocksDB issues
 
 These are bugs in native RocksDB found while porting and testing the managed engine (01-03 by the round-trip tests,
-04-07 by audit #5, 08-13 by audit #7, 14 by audit #8, 15 by audit #10). Each file follows RocksDB's
+04-07 by audit #5, 08-13 by audit #7, 14 by audit #8, 15 by audit #10, 16 by audit #11). Each file follows RocksDB's
 `issue_template.md` (Expected behavior / Actual behavior / Steps to reproduce) and includes a self-contained program
-(C API; C++ for 14) that reproduces the bug against the native library. Every program was run against the RocksDB 11.12.0 Linux
+(C API; C++ for 14 and 16) that reproduces the bug against the native library. Every program was run against the RocksDB 11.12.0 Linux
 x86-64 library from the `RocksDB` NuGet package (11.12.0.7385). The code involved was checked unchanged on
 facebook/rocksdb `main`.
 
@@ -24,10 +24,12 @@ facebook/rocksdb `main`.
 | [13-log-reader-drops-records-without-reporting.md](13-log-reader-drops-records-without-reporting.md) | A zeroed WAL record header mid-log, or a CRC-valid zstd WAL record that fails to decompress, drops records without any error in every recovery mode, `kAbsoluteConsistency` included |
 | [14-user-write-callback-not-exception-safe.md](14-user-write-callback-not-exception-safe.md) | A `UserWriteCallback` that throws leaves its writer linked in the write queue; every later write hangs |
 | [15-merge-without-operator-segfaults.md](15-merge-without-operator-segfaults.md) | A DB with merge operands in its table files, opened without a merge operator: reverse iteration over an operand, and `Get` / `MultiGet` of an operand above an older value, segfault (only `assert(merge_operator_ != nullptr)`); forward iteration fails with InvalidArgument |
+| [16-row-cache-should-merge-truncated-entry.md](16-row-cache-should-merge-truncated-entry.md) | With a row cache, a `Get` / `MultiGet` that `MergeOperator::ShouldMerge` ends inside a table file caches only the entries seen so far; a later snapshot read (or `GetMergeOperands`) replays the truncated entry and merges an older file's overwritten value |
 
 01-03, 05-07, 09-13 and 15 were reproduced with the C API programs they contain, 08 with the NuGet package's library
 in a child process (validation.md, "Audit #7"), 14 with the ABI-independent C++ variant it contains (the plain C++ program
-needs a library built from the same headers); 04 concerns a feature the released library does not have yet. 09-15 were
+needs a library built from the same headers), 16 with the C++ program it contains (C API plus a `MergeOperator`
+subclass, whose virtual table in the 11.12 library matches the headers); 04 concerns a feature the released library does not have yet. 09-16 were
 checked unchanged on `main` at `a87e2a0e43a79bc397b97803022fe7df24e5e22d`.
 
 How the managed port handles each one is described in [validation.md](../validation.md), "Combinatorial round trips"

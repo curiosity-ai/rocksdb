@@ -326,6 +326,12 @@ internal sealed class GetContext
                 // ends the lookup with a merge of the operands collected so far and no base value (kFound).
                 if (ShouldMergeOperator is { } op && op.ShouldMerge(MergeContext.OperandsNewestFirst))
                 {
+                    // Deviation (fixes upstream, docs/upstream-issues/16): the lookup ends before the file's last entry
+                    // for the key, so the entries recorded so far are not the file's complete row cache entry. A later
+                    // lookup reaching the file with fewer operands (a snapshot read, GetMergeOperands) would replay
+                    // them and continue with older files. Discard the log: TableCache::Get / MultiGet insert only a
+                    // non-empty one.
+                    ReplayLog?.Clear();
                     StopForMergeWithoutBase();
                     return false;
                 }
