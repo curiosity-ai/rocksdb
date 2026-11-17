@@ -1080,6 +1080,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
     private void ForgetAliveWalSize(ulong number)
     {
         if (_aliveWalSizes.Remove(number, out long size)) Interlocked.Add(ref _walsTotalSize, -size);
+        _closedWalWrittenEnds.Remove(number);
     }
 
     private void TryDeleteFile(string path)

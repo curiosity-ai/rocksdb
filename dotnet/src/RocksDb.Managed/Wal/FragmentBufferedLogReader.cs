@@ -109,6 +109,8 @@ public sealed class FragmentBufferedLogReader : IDisposable
     public long LastRecordOffset => _lastRecordOffset;
     /// <summary>File offset just past the last complete record read so far (excludes a torn or corrupt tail).</summary>
     public long LastRecordEnd => _consumedOffset;
+    /// <summary>The log has recyclable records (its end is the first record that is not of this log or not intact).</summary>
+    public bool IsRecycled => _recycled;
     public CompressionType CompressionType => _compressionType;
     /// <summary>
     /// The last read of a recycled log returned no record, so the bytes after the last complete record may be stale (a

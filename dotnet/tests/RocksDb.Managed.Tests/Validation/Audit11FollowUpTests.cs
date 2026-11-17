@@ -413,4 +413,230 @@ public sealed class Audit11FollowUpTests
         }
         Assert.AreEqual(0, fs.ReadAsyncCalls, "a sync read path called ReadAsync");
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // C. Follow-up: WAL data the tailing reader cannot get past although the writer completed it.
+
+    /// <summary>A physical record of a WAL file: offset, header size, payload length, log number (recyclable only).</summary>
+    internal readonly record struct WalRecord(long Offset, int HeaderSize, int Length, uint LogNumber);
+
+    /// <summary>The physical records of a WAL (legacy and recyclable headers, log::Writer block layout).</summary>
+    internal static List<WalRecord> WalRecords(byte[] log)
+    {
+        const int Block = 32768;
+        var list = new List<WalRecord>();
+        long off = 0;
+        while (off + 7 <= log.Length)
+        {
+            int inBlock = (int)(off % Block);
+            int type = log[off + 6];
+            int length = log[off + 4] | (log[off + 5] << 8);
+            bool recyclable = type is >= 5 and <= 8 or 11 or 131;
+            int header = recyclable ? 11 : 7;
+            if (Block - inBlock < header)
+            {
+                off += Block - inBlock;
+                continue;
+            }
+            if (type == 0 && length == 0) break;
+            uint logNumber = recyclable && off + 11 <= log.Length ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(log.AsSpan((int)off + 7)) : 0;
+            list.Add(new WalRecord(off, header, length, logNumber));
+            off += header + length;
+        }
+        return list;
+    }
+
+    /// <summary>The batch records of this incarnation of a WAL (a recycled WAL's old records carry another log number).</summary>
+    internal static List<WalRecord> LiveRecords(string walPath, ulong logNumber)
+    {
+        byte[] bytes;
+        using (var f = new FileStream(walPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            bytes = new byte[f.Length];
+            f.ReadExactly(bytes);
+        }
+        var live = new List<WalRecord>();
+        List<WalRecord> all = WalRecords(bytes);
+        bool recycled = all.Count > 0 && all[0].HeaderSize == 11;
+        foreach (WalRecord r in all)
+        {
+            if (recycled ? r.HeaderSize == 11 && r.LogNumber == unchecked((uint)logNumber) : r.HeaderSize == 7) live.Add(r);
+            else break;
+        }
+        return live;
+    }
+
+    /// <summary>Flips a payload byte of a record in place (past the 12-byte batch header): checksum mismatch.</summary>
+    internal static void FlipPayloadByte(string walPath, WalRecord r)
+    {
+        using var f = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        f.Position = r.Offset + r.HeaderSize + 12 + 3;
+        int b = f.ReadByte();
+        f.Position = r.Offset + r.HeaderSize + 12 + 3;
+        f.WriteByte((byte)(b ^ 0x40));
+    }
+
+    /// <summary>Makes a record's length field claim <paramref name="extra"/> more bytes than the file holds after it.</summary>
+    internal static void GrowRecordLength(string walPath, WalRecord r, int extra)
+    {
+        Assert.IsTrue(r.Offset % 32768 + r.HeaderSize + r.Length + extra < 32768, "the grown record stays inside its block");
+        using var f = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        int length = r.Length + extra;
+        f.Position = r.Offset + 4;
+        f.WriteByte((byte)length);
+        f.WriteByte((byte)(length >> 8));
+    }
+
+    private static string CurrentWalPath(RocksDatabase db, string path) => Path.Combine(path, FileNames.LogFileName(db.CurrentWalNumber));
+
+    /// <summary>
+    /// A DB whose current WAL is a recycled file (recycle_log_file_num = 2, two flushed rounds of
+    /// <paramref name="oldPuts"/> writes each): its bytes past the live end are records of the file's previous use.
+    /// </summary>
+    internal static RocksDatabase OpenWithRecycledWal(string path, int oldPuts)
+    {
+        RocksDatabase db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, RecycleLogFileNum = 2 });
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = 0; i < oldPuts; i++) db.Put(B("old" + i), B(new string('o', 100)));
+            db.Flush();
+            db.WaitForCompact();
+        }
+        db.Put(B("first"), B("live"));
+        var recs = WalRecords(File.ReadAllBytes(CurrentWalPath(db, path)));
+        Assert.AreEqual(7 + 4, recs[0].HeaderSize, "precondition: the current WAL has recyclable records");
+        Assert.IsTrue(recs.Count > 1 && recs[1].LogNumber != unchecked((uint)db.CurrentWalNumber), "precondition: old records follow the live end");
+        return db;
+    }
+
+    /// <summary>
+    /// log::FragmentBufferedReader::ReadRecord (db/log_reader.cc): "case kBadRecordChecksum: if (recycled_) {
+    /// fragments_.clear(); return false; }" - a damaged record of a recycled WAL ends the log without a report, so the
+    /// records written after it are never read and native's iterator ends with TryAgain. The managed iterator compares
+    /// where the reader stopped with what the WAL writer completed (DbImpl.WalWrittenEnd) and counts the rest as damaged
+    /// (SkippedCorruptBytes was 0 before).
+    /// </summary>
+    [TestMethod]
+    public void DamagedRecordOfARecycledWalIsCountedAsSkipped()
+    {
+        using var dir = new TempDirectory();
+        using RocksDatabase db = OpenWithRecycledWal(dir.Path, 20);
+        ulong first = db.GetLatestSequenceNumber();
+        for (int i = 0; i < 5; i++) db.Put(Key(i), Value(i, 0));
+        string wal = CurrentWalPath(db, dir.Path);
+        List<WalRecord> live = LiveRecords(wal, db.CurrentWalNumber);
+        Assert.IsTrue(live.Count >= 6);
+        FlipPayloadByte(wal, live[^3]); // Key(2): the batches of Key(0) .. Key(4) are the last five records
+        using TransactionLogIterator it = db.GetUpdatesSince(first);
+        List<ulong> seqs = ReadAll(it);
+        string what = "read " + string.Join(",", seqs) + " from " + first + "; records " + string.Join(" ", live) + "; " + it.Error?.Message;
+        CollectionAssert.AreEqual(new[] { first, first + 1, first + 2 }, seqs, what);
+        Assert.AreEqual(StatusCode.TryAgain, it.Error?.Code);
+        Assert.IsTrue(it.SkippedCorruptBytes > 0, "the records behind the damaged one are not reported");
+        StringAssert.Contains(it.SkippedCorruptionReason, "recycled");
+    }
+
+    /// <summary>
+    /// The legitimate end of a recycled WAL - old records after the live end (log::Reader kOldRecord: "Treat a record
+    /// from a previous instance of the log as EOF") - and unlogged writes after it: caught up / TryAgain without damage.
+    /// </summary>
+    [TestMethod]
+    public void RecycledWalEndIsNotDamage()
+    {
+        using var dir = new TempDirectory();
+        using RocksDatabase db = OpenWithRecycledWal(dir.Path, 20);
+        ulong first = db.GetLatestSequenceNumber();
+        db.Put(Key(1), Value(1, 0));
+        using TransactionLogIterator it = db.GetUpdatesSince(first);
+        CollectionAssert.AreEqual(new[] { first, first + 1 }, ReadAll(it));
+        Assert.IsNull(it.Error);
+        Assert.AreEqual(0, it.SkippedCorruptBytes);
+        // disableWAL is refused with recycle_log_file_num; an ingested file that overlaps the memtable takes a sequence
+        // number without a WAL record (and switches the WAL, which may recycle a file again).
+        string sst = Path.Combine(dir.Path, "ext.sst");
+        using (var w = new SstFileWriter(new ColumnFamilyOptions()))
+        {
+            w.Open(sst);
+            w.Put(Key(1), B("ingested"));
+            w.Finish();
+        }
+        db.IngestExternalFiles([sst], new IngestExternalFileOptions());
+        Assert.AreEqual(first + 2, db.GetLatestSequenceNumber());
+        it.Next();
+        Assert.AreEqual(StatusCode.TryAgain, it.Error?.Code);
+        Assert.AreEqual(0, it.SkippedCorruptBytes, it.SkippedCorruptionReason);
+    }
+
+    /// <summary>
+    /// log::FragmentBufferedReader::TryReadFragment: "while (header_size + length &gt; buffer_.size()) { ... TryReadMore
+    /// ... return false; }" - a record whose length reaches past the end of the data is an incomplete record to wait for
+    /// (log::Reader reports kBadRecordLen at eof_ only in kAbsoluteConsistency / kPointInTimeRecovery, as "truncated
+    /// record body"). In the live WAL, past what the writer completed, it is damage. Recovery is unchanged.
+    /// </summary>
+    [TestMethod]
+    public void RecordLengthPastTheWrittenEndIsCountedAsSkipped()
+    {
+        using var dir = new TempDirectory();
+        using RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true });
+        for (int i = 0; i < 4; i++) db.Put(Key(i), Value(i, 0));
+        string wal = CurrentWalPath(db, dir.Path);
+        GrowRecordLength(wal, LiveRecords(wal, db.CurrentWalNumber)[3], 200);
+        using TransactionLogIterator it = db.GetUpdatesSince(1);
+        CollectionAssert.AreEqual(new ulong[] { 1, 2, 3 }, ReadAll(it));
+        Assert.AreEqual(StatusCode.TryAgain, it.Error?.Code);
+        Assert.IsTrue(it.SkippedCorruptBytes > 0);
+        StringAssert.Contains(it.SkippedCorruptionReason, "cannot be read past offset");
+    }
+
+    /// <summary>
+    /// The same damage in a WAL that a switch closed (a second column family's flush keeps it alive) while the newer WAL
+    /// holds nothing yet: the iterator leaves the closed WAL short of its written end and reports it.
+    /// </summary>
+    [TestMethod]
+    public void RecordLengthPastTheEndOfAClosedWalIsCountedAsSkipped()
+    {
+        using var dir = new TempDirectory();
+        using RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true });
+        ColumnFamily other = db.CreateColumnFamily("other", new ColumnFamilyOptions());
+        for (int i = 0; i < 4; i++) db.Put(Key(i), Value(i, 0));
+        string wal = CurrentWalPath(db, dir.Path);
+        ulong closed = db.CurrentWalNumber;
+        other.Put(B("x"), B("y"));
+        other.Flush();
+        Assert.AreNotEqual(closed, db.CurrentWalNumber, "precondition: the flush switched the WAL");
+        // The CreateColumnFamily edit and the batches: the 4th batch is the last record but one (other's put).
+        List<WalRecord> live = LiveRecords(wal, closed);
+        GrowRecordLength(wal, live[^2], 200);
+        using TransactionLogIterator it = db.GetUpdatesSince(1);
+        List<ulong> seqs = ReadAll(it);
+        Assert.AreEqual(StatusCode.TryAgain, it.Error?.Code, string.Join(",", seqs));
+        Assert.IsTrue(it.SkippedCorruptBytes > 0);
+        StringAssert.Contains(it.SkippedCorruptionReason, "WAL #" + closed);
+    }
+
+    /// <summary>
+    /// A writer in the middle of a record on the active WAL: with manual_wal_flush a batch larger than the writer's
+    /// buffer is partly on disk until FlushWAL. Not damage: the writer has not completed it.
+    /// </summary>
+    [TestMethod]
+    public void RecordPartlyWrittenByTheActiveWalWriterIsNotDamage()
+    {
+        using var dir = new TempDirectory();
+        using RocksDatabase db = RocksDatabase.Open(dir.Path, new DbOptions { CreateIfMissing = true, ManualWalFlush = true, WritableFileMaxBufferSize = 64 << 10 });
+        db.Put(B("a"), B("1"));
+        db.FlushWal(sync: false);
+        string wal = CurrentWalPath(db, dir.Path);
+        long before = new FileInfo(wal).Length;
+        db.Put(B("big"), new byte[300 << 10]);
+        long partial = new FileInfo(wal).Length;
+        Assert.IsTrue(partial > before && partial < before + (300 << 10), "precondition: part of the record is on disk (" + before + " -> " + partial + ")");
+        using TransactionLogIterator it = db.GetUpdatesSince(1);
+        CollectionAssert.AreEqual(new ulong[] { 1 }, ReadAll(it));
+        Assert.AreEqual(StatusCode.TryAgain, it.Error?.Code);
+        Assert.AreEqual(0, it.SkippedCorruptBytes, it.SkippedCorruptionReason);
+        db.FlushWal(sync: false);
+        it.Next();
+        Assert.IsTrue(it.Valid, it.Error?.Message);
+        Assert.AreEqual(2UL, it.Current.Sequence);
+    }
 }

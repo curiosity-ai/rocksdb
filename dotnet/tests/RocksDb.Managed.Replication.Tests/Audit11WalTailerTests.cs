@@ -235,4 +235,226 @@ public sealed class Audit11WalTailerTests
         Assert.IsFalse(b.IsResyncing);
         Assert.AreEqual(0, a.WalStreamFaults);
     }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // Follow-up: the start sequence check and data the tailing reader cannot get past.
+
+    private readonly record struct Rec(long Offset, int HeaderSize, int Length);
+
+    /// <summary>The records of this incarnation of a WAL (legacy, or recyclable with this log number), in file order.</summary>
+    private static List<Rec> LiveRecords(string walPath, ulong logNumber)
+    {
+        byte[] log;
+        using (var f = new FileStream(walPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            log = new byte[f.Length];
+            f.ReadExactly(log);
+        }
+        var list = new List<Rec>();
+        bool? recycled = null;
+        long off = 0;
+        while (off + 7 <= log.Length)
+        {
+            int inBlock = (int)(off % 32768);
+            int type = log[off + 6];
+            int length = log[off + 4] | (log[off + 5] << 8);
+            int header = type is >= 5 and <= 8 or 11 or 131 ? 11 : 7;
+            if (32768 - inBlock < header)
+            {
+                off += 32768 - inBlock;
+                continue;
+            }
+            recycled ??= header == 11;
+            if ((type == 0 && length == 0) || (header == 11) != recycled) break;
+            if (header == 11 && System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(log.AsSpan((int)off + 7)) != unchecked((uint)logNumber)) break;
+            list.Add(new Rec(off, header, length));
+            off += header + length;
+        }
+        return list;
+    }
+
+    private static string CurrentWal(RocksDatabase db, string path) => System.IO.Path.Combine(path, FileNames.LogFileName(db.CurrentWalNumber));
+
+    private static void Patch(string walPath, long offset, Func<int, int> change)
+    {
+        using var f = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        f.Position = offset;
+        int b = f.ReadByte();
+        f.Position = offset;
+        f.WriteByte((byte)change(b));
+    }
+
+    /// <summary>
+    /// manual_wal_flush, right after a WAL switch: the new WAL holds no record on disk, so the WAL listing skips it
+    /// (WalManager::GetSortedWalsOfType: "if (sequence == 0) { // empty file continue; }") and the older WAL was purged.
+    /// A tail that starts at the buffered record used to get NotFound ("no WAL files") - a needless resync of a replica
+    /// that is exactly caught up. It now waits (CurrentWalBaseSequence) and reads the record once FlushWAL writes it.
+    /// Native's GetUpdatesSince returns an OK iterator here (Audit11FollowUpCompatTests); the purge check is managed.
+    /// </summary>
+    [TestMethod]
+    public async Task FreshTailAtARecordStillInTheManualFlushBufferWaits()
+    {
+        using var dir = new TempDir("a11-buffered-start");
+        string path = dir.Sub("db");
+        DbOptions o = DbOpts(null);
+        o.ManualWalFlush = true;
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(path, o);
+        db.Put(U(K(0)), U(V(0, 0)));
+        db.FlushWal(sync: false);
+        await db.FlushAsync();
+        await WaitUntilAsync(() => db.GetSortedWalFiles().Count == 0, "the flushed WAL to be purged");
+        db.Put(U(K(1)), U(V(1, 0))); // sequence 2, buffered
+        Assert.AreEqual(1UL, db.CurrentWalBaseSequence);
+
+        using WalTailer tailer = new ReplicationSource(db).TailWal(2);
+        (List<ulong> firsts, RocksDbException? error, _) = await TailForAsync(tailer, TimeSpan.FromMilliseconds(300));
+        Assert.IsNull(error, error?.Message);
+        Assert.AreEqual(0, firsts.Count);
+        db.FlushWal(sync: false);
+        (firsts, error, _) = await TailForAsync(tailer, TimeSpan.FromMilliseconds(300));
+        Assert.IsNull(error, error?.Message);
+        CollectionAssert.AreEqual(new ulong[] { 2 }, firsts);
+    }
+
+    /// <summary>A start sequence whose WAL was purged (written before the current WAL) is still NotFound on the first read.</summary>
+    [TestMethod]
+    public async Task PurgedStartIsNotFoundOnTheFirstRead()
+    {
+        using var dir = new TempDir("a11-purged");
+        string path = dir.Sub("db");
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(path, DbOpts(null));
+        for (int i = 0; i < 3; i++) db.Put(U(K(i)), U(V(i, 0)));
+        await db.FlushAsync();
+        await WaitUntilAsync(() => db.GetSortedWalFiles().Count == 0, "the flushed WAL to be purged");
+        Assert.AreEqual(3UL, db.CurrentWalBaseSequence);
+        using WalTailer tailer = new ReplicationSource(db).TailWal(2);
+        var e = Assert.ThrowsExactly<RocksDbException>(() => tailer.TryReadChunk(out _));
+        Assert.AreEqual(StatusCode.NotFound, e.Code);
+        StringAssert.Contains(e.Message, "no longer available");
+    }
+
+    /// <summary>
+    /// A damaged record in a recycled live WAL with records written after it: log::FragmentBufferedReader ends a recycled
+    /// log at a bad checksum without a report (db/log_reader.cc, ReadRecord: "case kBadRecordChecksum: if (recycled_) {
+    /// fragments_.clear(); return false; }"), so the records behind it are never read and the tail used to wait until the
+    /// next WAL switch. The iterator now counts what the writer completed past the reader's end, and the tail throws
+    /// NotFound after one confirming re-read.
+    /// </summary>
+    [TestMethod]
+    public async Task DamagedRecordOfARecycledWalEndsTheTailWithNotFound()
+    {
+        using var dir = new TempDir("a11-recycled");
+        string path = dir.Sub("db");
+        DbOptions o = DbOpts(null);
+        o.RecycleLogFileNum = 2;
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(path, o);
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = 0; i < 20; i++) db.Put(U("old" + i), U(new string('o', 100)));
+            await db.FlushAsync();
+            await db.WaitForCompactAsync();
+        }
+        ulong first = db.GetLatestSequenceNumber() + 1;
+        for (int i = 0; i < 6; i++) db.Put(U(K(i)), U(V(i, 0)));
+        string wal = CurrentWal(db, path);
+        List<Rec> live = LiveRecords(wal, db.CurrentWalNumber);
+        Assert.AreEqual(11, live[^1].HeaderSize, "precondition: a recycled WAL");
+        Rec damaged = live[^3]; // K(3)
+        Patch(wal, damaged.Offset + damaged.HeaderSize + 12 + 3, static b => b ^ 0x40);
+
+        using WalTailer tailer = new ReplicationSource(db).TailWal(first);
+        (List<ulong> firsts, RocksDbException? error, int polls) = await TailForAsync(tailer, TimeSpan.FromSeconds(5));
+        CollectionAssert.AreEqual(new[] { first }, firsts, "K(0) .. K(2) in one chunk");
+        Assert.IsNotNull(error, "the tail stalled for 5 s (" + polls + " polls) at the damaged recycled record");
+        Assert.AreEqual(StatusCode.NotFound, error.Code);
+        StringAssert.Contains(error.Message, "sequence " + (first + 3) + " is damaged");
+        StringAssert.Contains(error.Message, "recycled");
+    }
+
+    /// <summary>
+    /// The legitimate end of a recycled WAL (records of its previous use after the live end, log::Reader kOldRecord "Treat
+    /// a record from a previous instance of the log as EOF") with the tail caught up: no error, and new writes arrive.
+    /// </summary>
+    [TestMethod]
+    public async Task RecycledWalEndDoesNotEndTheTail()
+    {
+        using var dir = new TempDir("a11-recycled-end");
+        string path = dir.Sub("db");
+        DbOptions o = DbOpts(null);
+        o.RecycleLogFileNum = 2;
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(path, o);
+        for (int round = 0; round < 3; round++)
+        {
+            for (int i = 0; i < 20; i++) db.Put(U("old" + i), U(new string('o', 100)));
+            await db.FlushAsync();
+            await db.WaitForCompactAsync();
+        }
+        ulong first = db.GetLatestSequenceNumber() + 1;
+        db.Put(U(K(0)), U(V(0, 0)));
+        using WalTailer tailer = new ReplicationSource(db).TailWal(first);
+        (List<ulong> firsts, RocksDbException? error, _) = await TailForAsync(tailer, TimeSpan.FromMilliseconds(300));
+        Assert.IsNull(error, error?.Message);
+        CollectionAssert.AreEqual(new[] { first }, firsts);
+        db.Put(U(K(1)), U(V(1, 0)));
+        (firsts, error, _) = await TailForAsync(tailer, TimeSpan.FromMilliseconds(300));
+        Assert.IsNull(error, error?.Message);
+        CollectionAssert.AreEqual(new[] { first + 1 }, firsts);
+    }
+
+    /// <summary>
+    /// A record length that reaches past the end of the written data (log::FragmentBufferedReader::TryReadFragment waits
+    /// for more data: "while (header_size + length &gt; buffer_.size()) ... return false"): the tail used to wait until the
+    /// next write. Past what the WAL writer completed it is damage: NotFound.
+    /// </summary>
+    [TestMethod]
+    public async Task RecordLengthPastTheWrittenEndEndsTheTailWithNotFound()
+    {
+        using var dir = new TempDir("a11-length");
+        string path = dir.Sub("db");
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(path, DbOpts(null));
+        for (int i = 0; i < 4; i++) db.Put(U(K(i)), U(V(i, 0)));
+        string wal = CurrentWal(db, path);
+        Rec last = LiveRecords(wal, db.CurrentWalNumber)[^1];
+        int grown = last.Length + 200;
+        Patch(wal, last.Offset + 4, _ => grown & 0xff);
+        Patch(wal, last.Offset + 5, _ => grown >> 8);
+
+        using WalTailer tailer = new ReplicationSource(db).TailWal(1);
+        (List<ulong> firsts, RocksDbException? error, int polls) = await TailForAsync(tailer, TimeSpan.FromSeconds(5));
+        CollectionAssert.AreEqual(new ulong[] { 1 }, firsts);
+        Assert.IsNotNull(error, "the tail stalled for 5 s (" + polls + " polls) at the record length past the end");
+        Assert.AreEqual(StatusCode.NotFound, error.Code);
+        StringAssert.Contains(error.Message, "sequence 4 is damaged");
+    }
+
+    /// <summary>
+    /// A writer in the middle of a record on the active WAL (manual_wal_flush, a batch larger than the writer's buffer:
+    /// part of it is on disk until FlushWAL) is not damage: the tail waits, then reads it.
+    /// </summary>
+    [TestMethod]
+    public async Task RecordPartlyWrittenByTheActiveWriterDoesNotEndTheTail()
+    {
+        using var dir = new TempDir("a11-midrecord");
+        string path = dir.Sub("db");
+        DbOptions o = DbOpts(null);
+        o.ManualWalFlush = true;
+        o.WritableFileMaxBufferSize = 64 << 10;
+        await using RocksDatabase db = await RocksDatabase.OpenAsync(path, o);
+        db.Put(U(K(0)), U(V(0, 0)));
+        db.FlushWal(sync: false);
+        using WalTailer tailer = new ReplicationSource(db).TailWal(1);
+        Assert.IsTrue(tailer.TryReadChunk(out _));
+        string wal = CurrentWal(db, path);
+        long before = new FileInfo(wal).Length;
+        db.Put(U(K(1)), new byte[300 << 10]);
+        long partial = new FileInfo(wal).Length;
+        Assert.IsTrue(partial > before && partial < before + (300 << 10), "precondition: part of the record is on disk");
+        (List<ulong> firsts, RocksDbException? error, _) = await TailForAsync(tailer, TimeSpan.FromMilliseconds(300));
+        Assert.IsNull(error, error?.Message);
+        Assert.AreEqual(0, firsts.Count);
+        db.FlushWal(sync: false);
+        (firsts, error, _) = await TailForAsync(tailer, TimeSpan.FromMilliseconds(300));
+        Assert.IsNull(error, error?.Message);
+        CollectionAssert.AreEqual(new ulong[] { 2 }, firsts);
+    }
 }

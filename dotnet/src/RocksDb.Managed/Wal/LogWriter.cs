@@ -75,6 +75,19 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
     public int BlockOffset => _blockOffset;
     /// <summary>The largest sequence number passed to <c>AddRecord</c> so far (for predecessor WAL info).</summary>
     public ulong LastSequenceRecorded { get; private set; }
+
+    // Dest.Size at the last flush (always between records): see FlushedRecordEnd.
+    private long _flushedRecordEnd;
+
+    /// <summary>
+    /// File offset of the end of the last complete record this writer has pushed to the file (to the OS): the logical
+    /// size at its last flush, which is always at a record boundary (after a record without manual_wal_flush, at
+    /// FlushWAL / WriteBuffer / Sync otherwise). Bytes a full buffer spilled before a record was complete, and records
+    /// still in the buffer, are not included. Read by WAL tailing (TransactionLogIterator) from other threads.
+    /// </summary>
+    public long FlushedRecordEnd => Volatile.Read(ref _flushedRecordEnd);
+
+    private void NoteFlushed(IWritableFile dest) => Volatile.Write(ref _flushedRecordEnd, dest.Size);
     /// <summary>The compression type that records are written with (None until the compression record is written).</summary>
     public CompressionType CompressionType => _compress is null ? CompressionType.None : _compressionType;
     /// <summary>The underlying file (null after close).</summary>
@@ -268,7 +281,11 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
             AdvanceFragment(ref st, fragmentLength);
         } while (st.Left > 0 || st.CompressRemaining > 0);
 
-        if (!_manualFlush) dest.Flush();
+        if (!_manualFlush)
+        {
+            dest.Flush();
+            NoteFlushed(dest);
+        }
         if (sequence > LastSequenceRecorded) LastSequenceRecorded = sequence;
     }
 
@@ -298,7 +315,11 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
                 AdvanceFragment(ref st, fragmentLength);
             } while (st.Left > 0 || st.CompressRemaining > 0);
 
-            if (!_manualFlush) await dest.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (!_manualFlush)
+            {
+                await dest.FlushAsync(cancellationToken).ConfigureAwait(false);
+                NoteFlushed(dest);
+            }
             if (sequence > LastSequenceRecorded) LastSequenceRecorded = sequence;
         }
         catch
@@ -325,7 +346,11 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
         try
         {
             EmitPhysicalRecord(dest, LogRecordType.SetCompressionType, payload);
-            if (!_manualFlush) dest.Flush();
+            if (!_manualFlush)
+            {
+                dest.Flush();
+                NoteFlushed(dest);
+            }
         }
         catch
         {
@@ -346,7 +371,11 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
         info.EncodeTo(payload);
         MaybeSwitchToNewBlock(dest, payload.Length);
         EmitPhysicalRecord(dest, _recycleLogFiles ? LogRecordType.RecyclePredecessorWalInfo : LogRecordType.PredecessorWalInfo, payload);
-        if (!_manualFlush) dest.Flush();
+        if (!_manualFlush)
+        {
+            dest.Flush();
+            NoteFlushed(dest);
+        }
     }
 
     /// <summary>
@@ -443,8 +472,19 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
     }
 
     /// <summary>Pushes buffered data to the OS (<c>Writer::WriteBuffer</c>).</summary>
-    public void WriteBuffer() => Dest.Flush();
-    public ValueTask WriteBufferAsync(CancellationToken cancellationToken = default) => Dest.FlushAsync(cancellationToken);
+    public void WriteBuffer()
+    {
+        IWritableFile dest = Dest;
+        dest.Flush();
+        NoteFlushed(dest);
+    }
+
+    public async ValueTask WriteBufferAsync(CancellationToken cancellationToken = default)
+    {
+        IWritableFile dest = Dest;
+        await dest.FlushAsync(cancellationToken).ConfigureAwait(false);
+        NoteFlushed(dest);
+    }
 
     /// <summary>Flushes and fsyncs the log file.</summary>
     public void Sync()
@@ -452,7 +492,9 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
         ThrowIfSeenError();
         try
         {
-            Dest.Sync();
+            IWritableFile dest = Dest;
+            dest.Sync();
+            NoteFlushed(dest);
         }
         catch
         {
@@ -466,7 +508,9 @@ public sealed class LogWriter : IDisposable, IAsyncDisposable
         ThrowIfSeenError();
         try
         {
-            await Dest.SyncAsync(cancellationToken).ConfigureAwait(false);
+            IWritableFile dest = Dest;
+            await dest.SyncAsync(cancellationToken).ConfigureAwait(false);
+            NoteFlushed(dest);
         }
         catch
         {

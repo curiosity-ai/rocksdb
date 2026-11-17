@@ -20,6 +20,8 @@ public sealed class Audit11FollowUpCompatTests
         string Path { get; }
         void Put(string key, bool wal);
         void FlushWal();
+        /// <summary>Flushes the memtable (switches the WAL).</summary>
+        void Flush();
         /// <summary>GetUpdatesSince(<paramref name="seq"/>), read while valid, then <paramref name="extraNexts"/> more
         /// Next calls with <paramref name="between"/> run before each: "s1,s2,...|status".</summary>
         string Updates(ulong seq, int extraNexts, Action? between);
@@ -29,11 +31,16 @@ public sealed class Audit11FollowUpCompatTests
     {
         private readonly RocksDbSharp.RocksDb _db;
 
-        public Native(string path, bool manualWalFlush)
+        public Native(string path, bool manualWalFlush) : this(path, manualWalFlush, recycle: false)
+        {
+        }
+
+        public Native(string path, bool manualWalFlush, bool recycle)
         {
             Path = path;
             var o = new RocksDbSharp.DbOptions().SetCreateIfMissing(true);
             RocksDbSharp.Native.Instance.rocksdb_options_set_manual_wal_flush(o.Handle, manualWalFlush ? (byte)1 : (byte)0);
+            if (recycle) RocksDbSharp.Native.Instance.rocksdb_options_set_recycle_log_file_num(o.Handle, (UIntPtr)2);
             _db = RocksDbSharp.RocksDb.Open(o, path);
         }
 
@@ -43,6 +50,8 @@ public sealed class Audit11FollowUpCompatTests
             _db.Put(U(key), U("v-" + key), null, wal ? new RocksDbSharp.WriteOptions() : new RocksDbSharp.WriteOptions().DisableWal(1));
 
         public void FlushWal() => RocksDbSharp.Native.Instance.rocksdb_flush_wal(_db.Handle, 0);
+
+        public void Flush() => _db.Flush(new RocksDbSharp.FlushOptions().SetWaitForFlush(true));
 
         public string Updates(ulong seq, int extraNexts, Action? between)
         {
@@ -81,10 +90,14 @@ public sealed class Audit11FollowUpCompatTests
     {
         private readonly RocksDatabase _db;
 
-        public Managed(string path, bool manualWalFlush)
+        public Managed(string path, bool manualWalFlush) : this(path, manualWalFlush, recycle: false)
+        {
+        }
+
+        public Managed(string path, bool manualWalFlush, bool recycle)
         {
             Path = path;
-            _db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, ManualWalFlush = manualWalFlush });
+            _db = RocksDatabase.Open(path, new DbOptions { CreateIfMissing = true, ManualWalFlush = manualWalFlush, RecycleLogFileNum = recycle ? 2UL : 0 });
         }
 
         public string Path { get; }
@@ -92,6 +105,12 @@ public sealed class Audit11FollowUpCompatTests
         public void Put(string key, bool wal) => _db.Put(new WriteOptions { DisableWal = !wal }, U(key), U("v-" + key));
 
         public void FlushWal() => _db.FlushWal(sync: false);
+
+        public void Flush()
+        {
+            _db.Flush();
+            _db.WaitForCompact();
+        }
 
         public string Updates(ulong seq, int extraNexts, Action? between)
         {
@@ -126,10 +145,56 @@ public sealed class Audit11FollowUpCompatTests
     private static long NewestWalLength(string dir) =>
         new FileInfo(Directory.GetFiles(dir, "*.log").OrderBy(f => f, StringComparer.Ordinal).Last()).Length;
 
-    private static string Run(Func<string, bool, IEngine> open, string dir, string scenario)
+    private static string NewestWal(string dir) => Directory.GetFiles(dir, "*.log").OrderBy(f => f, StringComparer.Ordinal).Last();
+
+    /// <summary>(offset, header size, payload length) of the records of this incarnation of a WAL (legacy, or recyclable
+    /// with the file's own log number).</summary>
+    private static List<(long Offset, int Header, int Length)> LiveRecords(string walPath)
     {
-        bool manual = scenario == "manual-flush-buffered";
-        using IEngine e = open(dir, manual);
+        uint logNumber = uint.Parse(Path.GetFileNameWithoutExtension(walPath), System.Globalization.CultureInfo.InvariantCulture);
+        byte[] log;
+        using (var f = new FileStream(walPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            log = new byte[f.Length];
+            f.ReadExactly(log);
+        }
+        var list = new List<(long, int, int)>();
+        bool? recycled = null;
+        long off = 0;
+        while (off + 7 <= log.Length)
+        {
+            int inBlock = (int)(off % 32768);
+            int type = log[off + 6];
+            int length = log[off + 4] | (log[off + 5] << 8);
+            int header = type is >= 5 and <= 8 or 11 or 131 ? 11 : 7;
+            if (32768 - inBlock < header)
+            {
+                off += 32768 - inBlock;
+                continue;
+            }
+            recycled ??= header == 11;
+            if ((type == 0 && length == 0) || (header == 11) != recycled) break;
+            if (header == 11 && System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(log.AsSpan((int)off + 7)) != logNumber) break;
+            list.Add((off, header, length));
+            off += header + length;
+        }
+        return list;
+    }
+
+    private static void Patch(string walPath, long offset, Func<int, int> change)
+    {
+        using var f = new FileStream(walPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        f.Position = offset;
+        int b = f.ReadByte();
+        f.Position = offset;
+        f.WriteByte((byte)change(b));
+    }
+
+    private static string Run(Func<string, bool, bool, IEngine> open, string dir, string scenario)
+    {
+        bool manual = scenario is "manual-flush-buffered" or "manual-flush-start-after-switch";
+        bool recycle = scenario == "recycled-damaged-record";
+        using IEngine e = open(dir, manual, recycle);
         switch (scenario)
         {
             case "caught-up":
@@ -161,6 +226,42 @@ public sealed class Audit11FollowUpCompatTests
                 e.FlushWal();
                 e.Put("b", true);
                 return e.Updates(1, 0, null);
+            case "manual-flush-start-after-switch":
+                // The new WAL holds only the buffered record (not on disk: not listed). Native's iterator is OK and not
+                // valid; its Next would dereference the missing log reader (no file), so it is not called.
+                e.Put("a", true);
+                e.FlushWal();
+                e.Flush();
+                e.Put("b", true);
+                return e.Updates(2, 0, null);
+            case "recycled-damaged-record":
+            {
+                // A recycled WAL ends at a bad checksum (FragmentBufferedReader: kBadRecordChecksum with recycled_ returns
+                // false, no report): the records written after the damaged one are not read.
+                for (int round = 0; round < 3; round++)
+                {
+                    for (int i = 0; i < 20; i++) e.Put("old" + i, true);
+                    e.Flush();
+                }
+                for (int i = 0; i < 6; i++) e.Put("k" + i, true);
+                string wal = NewestWal(e.Path);
+                var live = LiveRecords(wal);
+                if (live[^1].Header != 11) return "not a recycled WAL";
+                Patch(wal, live[^3].Offset + live[^3].Header + 12 + 3, static b => b ^ 0x40);
+                return e.Updates(61, 0, null);
+            }
+            case "length-past-end":
+            {
+                // FragmentBufferedReader::TryReadFragment waits for the rest of a record whose length reaches past the
+                // end of the data.
+                for (int i = 0; i < 4; i++) e.Put("k" + i, true);
+                string wal = NewestWal(e.Path);
+                var last = LiveRecords(wal)[^1];
+                int grown = last.Length + 200;
+                Patch(wal, last.Offset + 4, _ => grown & 0xff);
+                Patch(wal, last.Offset + 5, _ => grown >> 8);
+                return e.Updates(1, 0, null);
+            }
             case "damaged-tail-record":
             {
                 for (int i = 0; i < 3; i++) e.Put("k" + i, true);
@@ -197,11 +298,14 @@ public sealed class Audit11FollowUpCompatTests
     [DataRow("gap")]
     [DataRow("manual-flush-buffered")]
     [DataRow("damaged-tail-record")]
+    [DataRow("manual-flush-start-after-switch")]
+    [DataRow("recycled-damaged-record")]
+    [DataRow("length-past-end")]
     public void RunEndsLikeNative(string scenario)
     {
         using var dir = new TempDir("a11run");
-        string native = Run(static (p, m) => new Native(p, m), Path.Combine(dir.Path, "n"), scenario);
-        string managed = Run(static (p, m) => new Managed(p, m), Path.Combine(dir.Path, "m"), scenario);
+        string native = Run(static (p, m, r) => new Native(p, m, r), Path.Combine(dir.Path, "n"), scenario);
+        string managed = Run(static (p, m, r) => new Managed(p, m, r), Path.Combine(dir.Path, "m"), scenario);
         Console.WriteLine(scenario + ": native=" + native + " managed=" + managed);
         Assert.AreEqual(native, managed);
     }
