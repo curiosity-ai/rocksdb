@@ -54,6 +54,13 @@ public sealed class NodeContext(ClusterNodeHost host, NodeConfig cfg, EventLog e
     public NodeConfig Config { get; } = cfg;
     public EventLog Events { get; } = events;
     public volatile bool AckEarly = cfg.UnsafeAckEarly;
+
+    /// <summary>
+    /// Orders the start event against granted votes. The gRPC server answers votes before the start event is written, and
+    /// a vote handled between reading the start event's term and writing it would put a newer term ahead of an older one
+    /// in the log - which the election-safety check reads as Raft state lost across the restart.
+    /// </summary>
+    public SemaphoreSlim VoteEventOrder { get; } = new(1, 1);
 }
 
 /// <summary>
@@ -281,8 +288,16 @@ internal static class NodeMain
 
         await host.StartAsync(CancellationToken.None).ConfigureAwait(false);
         RaftClusterNode node = host.Node;
-        events.Write("start term=" + node.CurrentTerm + " role=" + node.Role + " leader=" + (node.CurrentLeaderId ?? "-") + " seq=" +
-                     host.Db.GetLatestSequenceNumber() + " mode=" + node.Mode + " pid=" + Environment.ProcessId);
+        await ctx.VoteEventOrder.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            events.Write("start term=" + node.CurrentTerm + " role=" + node.Role + " leader=" + (node.CurrentLeaderId ?? "-") + " seq=" +
+                         host.Db.GetLatestSequenceNumber() + " mode=" + node.Mode + " pid=" + Environment.ProcessId);
+        }
+        finally
+        {
+            ctx.VoteEventOrder.Release();
+        }
         // Raised under the node's gate (not reentrant): only volatile reads here (commit index; the latest sequence of the current instance).
         node.RoleChanged += (_, e) => events.Write("role " + e.Role + " term=" + e.Term + " commit=" + node.CommitSeq + " seq=" + LatestSeq(host));
         node.LeaderChanged += (_, e) => events.Write("leader " + (e.LeaderId ?? "-") + " term=" + e.Term + " commit=" + node.CommitSeq + " seq=" + LatestSeq(host));
@@ -336,9 +351,20 @@ public sealed class SoakClusterService(ClusterNodeHost host, NodeContext ctx) : 
 {
     public async UnaryResult<RequestVoteResultDto> RequestVoteAsync(RequestVoteDto request)
     {
-        RequestVoteResult r = await host.HandleRequestVoteAsync(new RequestVotePayload(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm),
-            Context.CallContext.CancellationToken).ConfigureAwait(false);
-        if (r.VoteGranted) ctx.Events.Write("vote term=" + request.Term + " cand=" + request.CandidateId);
+        CancellationToken ct = Context.CallContext.CancellationToken;
+        RequestVoteResult r;
+        // The vote and its event line as one step against the start event (NodeContext.VoteEventOrder).
+        await ctx.VoteEventOrder.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            r = await host.HandleRequestVoteAsync(new RequestVotePayload(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm), ct)
+                .ConfigureAwait(false);
+            if (r.VoteGranted) ctx.Events.Write("vote term=" + request.Term + " cand=" + request.CandidateId);
+        }
+        finally
+        {
+            ctx.VoteEventOrder.Release();
+        }
         return new RequestVoteResultDto { Term = r.Term, VoteGranted = r.VoteGranted };
     }
 
