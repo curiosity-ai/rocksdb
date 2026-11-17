@@ -92,7 +92,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         _lastSeqSameAsPublishSeq = !(_seqPerBatch && _twoWriteQueues);
         if (_twoWriteQueues)
         {
-            _nonmemWriteThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes, options.EnableWriteThreadAdaptiveYield ? options.WriteThreadMaxYieldUsec : 0);
+            _nonmemWriteThread = new WriteThread(options.MaxWriteBatchGroupSizeBytes, options.EnableWriteThreadAdaptiveYield ? options.WriteThreadMaxYieldUsec : 0, sharesModeWith: _writeThread);
             _walWriteLock = new SemaphoreSlim(1, 1);
         }
     }

@@ -31,7 +31,11 @@ internal sealed partial class DbImpl
         VerifyNewColumnFamilyOptions?.Invoke(options);
         ColumnFamilyOptions opts = PrepareCfOptions(options);
         RegisterComparator(opts);
-        WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+        // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+        // moves to a write wake-up thread first, so that it never blocks its caller.
+        bool exclusive = LeadsSynchronously(synchronous);
+        if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+        WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
         ColumnFamilyData cfd;
         try
         {
@@ -54,7 +58,7 @@ internal sealed partial class DbImpl
                 LogNumber = logNumber,
             };
             edit.AddColumnFamily(name);
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+            await Versions.LogAndApplyAsync(cfd, edit, exclusive, ct).ConfigureAwait(false);
             lock (_mutex)
             {
                 cfd.NextEpochNumber = 1;
@@ -65,7 +69,9 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            ExitUnbatched(w, synchronous);
+            ExitUnbatched(w, exclusive);
+            // Back to the thread pool before the caller resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
         }
         // The column family is committed: a cancellation now would report a creation that happened as not done.
         if (writeOptionsFile) await WriteOptionsFileAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
@@ -85,13 +91,17 @@ internal sealed partial class DbImpl
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
         if (cfd.Id == 0) ThrowHelper.InvalidArgument("Can't drop default column family");
-        WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+        // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+        // moves to a write wake-up thread first, so that it never blocks its caller.
+        bool exclusive = LeadsSynchronously(synchronous);
+        if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+        WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
         try
         {
             if (cfd.Dropped) ThrowHelper.InvalidArgument("Column family already dropped!\n");
             var edit = new VersionEdit { ColumnFamily = cfd.Id };
             edit.DropColumnFamily();
-            await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+            await Versions.LogAndApplyAsync(cfd, edit, exclusive, ct).ConfigureAwait(false);
             UnregisterCfForWrite(cfd);
             lock (_mutex)
             {
@@ -104,7 +114,9 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            ExitUnbatched(w, synchronous);
+            ExitUnbatched(w, exclusive);
+            // Back to the thread pool before the caller resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
         }
         PurgeObsoleteFiles();
         RegisterRecordSeqnoTimeWorker();

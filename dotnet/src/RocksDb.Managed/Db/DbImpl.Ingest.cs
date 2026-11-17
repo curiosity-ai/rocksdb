@@ -153,7 +153,11 @@ internal sealed partial class DbImpl
             for (int attempt = 0; ; attempt++)
             {
                 // Stop writes to the DB (WriteThread::EnterUnbatched), then check the memtables.
-                WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+                // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+                // moves to a write wake-up thread first, so that it never blocks its caller.
+                bool exclusive = LeadsSynchronously(synchronous);
+                if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+                WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
                 bool needFlush;
                 try
                 {
@@ -194,7 +198,7 @@ internal sealed partial class DbImpl
                                 // the MANIFEST is written must not get the ingested files' seqno before they are visible
                                 // (DBImpl::IngestExternalFiles updates the last seqno after LogAndApply for the same
                                 // reason).
-                                await Versions.LogAndApplyAsync(cfd, edit, synchronous, CancellationToken.None).ConfigureAwait(false);
+                                await Versions.LogAndApplyAsync(cfd, edit, exclusive, CancellationToken.None).ConfigureAwait(false);
                                 applied = true;
                             }
                             finally
@@ -228,7 +232,9 @@ internal sealed partial class DbImpl
                 }
                 finally
                 {
-                    ExitUnbatched(w, synchronous);
+                    ExitUnbatched(w, exclusive);
+                    // Back to the thread pool before the caller resumes.
+                    if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
                 }
                 if (success) break;
                 if (!options.AllowBlockingFlush) ThrowHelper.InvalidArgument("External file requires flush");

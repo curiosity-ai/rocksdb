@@ -762,7 +762,11 @@ internal sealed partial class DbImpl
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
-        WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+        // moves to a write wake-up thread first, so that it never blocks its caller.
+        bool exclusive = LeadsSynchronously(synchronous);
+        if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+        WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, cancellationToken).ConfigureAwait(false);
         // The newest sealed memtable of every column family to wait for (flush_memtable_ids): the requested one, or with
         // atomic_flush every column family (DBImpl::AtomicFlushMemTables).
         var targets = new List<(ColumnFamilyData Cfd, ImmutableMemTable Mem)>(1);
@@ -771,7 +775,7 @@ internal sealed partial class DbImpl
             // DBImpl::FlushMemTable does not look at the background error before SwitchMemtable: the memtable is sealed
             // and the flush requested; WaitForFlushMemTables reports the error (only with FlushOptions::wait).
             if (cfd.Dropped) ThrowDropped(cfd);
-            await SwitchMemtablesForFlushAsync([cfd], reason, synchronous, cancellationToken).ConfigureAwait(false);
+            await SwitchMemtablesForFlushAsync([cfd], reason, exclusive, cancellationToken).ConfigureAwait(false);
             lock (_mutex)
             {
                 // DBImpl::FlushMemTable: the column families with sealed memtables get FlushRequested, also when nothing
@@ -806,7 +810,9 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            ExitUnbatched(w, synchronous);
+            ExitUnbatched(w, exclusive);
+            // Back to the thread pool before the caller resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
         }
         // FlushMemTable / AtomicFlushMemTables: "if (flush_reason != FlushReason::kWriteBufferManager)
         // NotifyOnManualFlushScheduled(cfds, flush_reason)", before waiting (also when nothing was switched).

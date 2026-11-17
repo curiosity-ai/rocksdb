@@ -646,14 +646,18 @@ public sealed class Audit8AsyncBackgroundIoTests
     /// that leader finishes the group. With the pool capped at the processor count (no thread injection) this deadlocks;
     /// with the default pool it stalls until the pool injects a thread (hill climbing, about one per 0.5 s per blocked
     /// round). Native has no async writers; the managed sync API is documented not to wait on thread-pool work.
+    /// Fixed in audit #12 (see Audit12SyncAsyncWriteTests): once the DB has synchronous writers, asynchronous leaders
+    /// lead synchronously and are woken on a write wake-up thread. The DB gets its first synchronous write before the
+    /// writers start: an asynchronous WAL write started before any synchronous writer joined finishes on the pool
+    /// (WriteThread.SyncWriterJoined).
     /// </summary>
     [TestMethod]
     [DoNotParallelize]
-    [Ignore("audit #8 open: a sync writer that follows an async write leader waits for the leader's thread-pool continuation (WAL I/O that completes asynchronously, a stall wait); sync writers occupying the pool deadlock a capped pool and stall the default one until it injects threads")]
     public void SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress()
     {
         var fs = new YieldingFileSystem(NewFs());
         using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs));
+        db.Put(B("first"), B("sync"));
         int n = Environment.ProcessorCount;
         Task all;
         using (new DeadThreadPool(block: false))

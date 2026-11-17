@@ -654,14 +654,18 @@ internal sealed partial class DbImpl
             {
                 // SwitchWAL when wal_bytes_per_sync changed or the WALs already exceed a lowered max_total_wal_size: the
                 // column families holding the oldest WAL are flushed so it can be released.
-                WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
+                // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+                // moves to a write wake-up thread first, so that it never blocks its caller.
+                bool exclusive = LeadsSynchronously(synchronous);
+                if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+                WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, CancellationToken.None).ConfigureAwait(false);
                 try
                 {
                     if (walOtherOptionChanged || Volatile.Read(ref _walsTotalSize) > (long)GetMaxTotalWalSize())
                     {
                         try
                         {
-                            await SwitchWalAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
+                            await SwitchWalAsync(exclusive, CancellationToken.None).ConfigureAwait(false);
                         }
                         catch (Exception e) when (e is RocksDbException or IOException)
                         {
@@ -671,7 +675,9 @@ internal sealed partial class DbImpl
                 }
                 finally
                 {
-                    ExitUnbatched(w, synchronous);
+                    ExitUnbatched(w, exclusive);
+                    // Back to the thread pool before the caller resumes.
+                    if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
                 }
             }
             LogInfo("SetDBOptions(), inputs:" + description);

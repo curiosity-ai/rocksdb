@@ -263,17 +263,21 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
     async ValueTask IWriteBufferManagerFlushInitiator.FlushForWriteBufferManagerAsync()
     {
         if (IsDisposed || _readOnly) return;
-        WriteThread.Writer w = await EnterUnbatchedAsync(synchronous: false, CancellationToken.None).ConfigureAwait(false);
+        // Synchronous once the DB has synchronous writers (see LeadsSynchronously). The coordinator that calls this runs on
+        // a write wake-up thread (it stays there: it is not a caller's code).
+        bool exclusive = LeadsSynchronously(synchronous: false);
+        if (exclusive && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+        WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, CancellationToken.None).ConfigureAwait(false);
         try
         {
             ColumnFamilyData? cfd;
             lock (_mutex) cfd = CollectFlushableColumnFamilies(includeWaitingImmutable: true, out _, out _);
             if (cfd is not null)
-                await SwitchMemtablesForFlushAsync([cfd], FlushReason.WriteBufferManager, synchronous: false, CancellationToken.None).ConfigureAwait(false);
+                await SwitchMemtablesForFlushAsync([cfd], FlushReason.WriteBufferManager, exclusive, CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {
-            ExitUnbatched(w, synchronous: false);
+            ExitUnbatched(w, exclusive);
         }
     }
 }

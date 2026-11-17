@@ -870,9 +870,13 @@ internal sealed partial class DbImpl
         if (!retryOnly)
         {
             WriteThread.Writer w;
+            // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call moves
+            // to a write wake-up thread first.
+            bool exclusive = LeadsSynchronously(synchronous);
+            if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
             try
             {
-                w = await EnterUnbatchedAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
+                w = await EnterUnbatchedAsync(exclusive, CancellationToken.None).ConfigureAwait(false);
             }
             catch (ObjectDisposedException)
             {
@@ -894,7 +898,7 @@ internal sealed partial class DbImpl
                     foreach (ColumnFamilyData cfd in cfds)
                     {
                         if (cfd.Dropped) continue;
-                        if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, synchronous, CancellationToken.None).ConfigureAwait(false);
+                        if (walError || !cfd.Mem.IsEmpty) await SwitchMemtableAsync(cfd, FlushReason.ErrorRecovery, exclusive, CancellationToken.None).ConfigureAwait(false);
                     }
                 }
                 finally
@@ -908,7 +912,8 @@ internal sealed partial class DbImpl
             }
             finally
             {
-                ExitUnbatched(w, synchronous);
+                ExitUnbatched(w, exclusive);
+                if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
             }
         }
         // RetryFlushesForErrorRecovery without atomic_flush: a flush request per column family with sealed memtables.

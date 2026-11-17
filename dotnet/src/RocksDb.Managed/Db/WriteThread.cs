@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks.Sources;
 
 namespace RocksDb.Managed.Db;
@@ -12,11 +14,25 @@ namespace RocksDb.Managed.Db;
 /// them, completes the followers (STATE_COMPLETED) and hands leadership to the next queued writer
 /// (<see cref="ExitAsBatchGroupLeader"/>).</item>
 /// </list>
-/// Waiting is either asynchronous (an <see cref="IValueTaskSource{TResult}"/> backed by
-/// <see cref="ManualResetValueTaskSourceCore{TResult}"/>, continuations run asynchronously so they never execute on
+/// Waiting is either asynchronous (the writer is an <see cref="IValueTaskSource{TResult}"/> with the protocol of
+/// <see cref="ManualResetValueTaskSourceCore{TResult}"/>; continuations run asynchronously so they never execute on
 /// the leader) or synchronous (<see cref="Writer.WaitSync"/>: AwaitState's busy spin, then the adaptive yield phase
 /// of up to <c>write_thread_max_yield_usec</c>, then a blocking wait on a monitor, BlockingAwaitWaitImpl). A synchronous writer
 /// promoted to leader performs the group's I/O on its own thread, so the sync API never blocks on thread-pool work.
+/// <para>
+/// Mixed synchronous and asynchronous writers (<see cref="SyncWriterJoined"/>): a synchronous writer blocks its thread
+/// until the writers ahead of it are done, so nothing it waits for may need a .NET thread-pool thread (its own thread may
+/// be the pool's last one). Once a DB has synchronous writers, asynchronous writers therefore do their leading work
+/// synchronously (DbImpl.LeadsSynchronously: group I/O, stall waits, lock waits), are woken to lead on a write wake-up
+/// thread rather than the pool (<see cref="Writer.WakesOnWriteThread"/>), leave their memtable inserts to the group's
+/// leader (parallel and unordered inserts), and return to the pool before their caller resumes. A leader that is likely
+/// to wait for a write stall, and an asynchronous operation that takes the write queue (FlushAsync,
+/// CreateColumnFamilyAsync, FlushWalAsync...), first moves to a wake-up thread, so that it does not block its caller.
+/// The thread changes happen in the frame of the method that holds the leadership: a continuation further up the call
+/// chain may be queued to the thread pool (an await that registers after the awaited task completed), which is fine
+/// once the leadership is released, never before. Waits as followers stay asynchronous. A DB that only has asynchronous
+/// writers is unchanged.
+/// </para>
 /// <para>
 /// With <c>allow_concurrent_memtable_write</c> the leader may wake its followers with
 /// <see cref="StateParallelMemtableWriter"/> after the WAL write (LaunchParallelMemTableWriters): every writer inserts
@@ -67,8 +83,19 @@ internal sealed class WriteThread
 
     /// <param name="maxWriteBatchGroupSizeBytes">max_write_batch_group_size_bytes.</param>
     /// <param name="maxYieldMicros">write_thread_max_yield_usec when enable_write_thread_adaptive_yield, else 0.</param>
-    public WriteThread(ulong maxWriteBatchGroupSizeBytes, ulong maxYieldMicros)
+    public WriteThread(ulong maxWriteBatchGroupSizeBytes, ulong maxYieldMicros) : this(maxWriteBatchGroupSizeBytes, maxYieldMicros, sharesModeWith: null)
     {
+    }
+
+    /// <param name="maxWriteBatchGroupSizeBytes">max_write_batch_group_size_bytes.</param>
+    /// <param name="maxYieldMicros">write_thread_max_yield_usec when enable_write_thread_adaptive_yield, else 0.</param>
+    /// <param name="sharesModeWith">
+    /// The other write queue of the same DB (two_write_queues), whose <see cref="SyncWriterJoined"/> flag this queue
+    /// shares; null for a DB's main queue.
+    /// </param>
+    public WriteThread(ulong maxWriteBatchGroupSizeBytes, ulong maxYieldMicros, WriteThread? sharesModeWith)
+    {
+        _modeOwner = sharesModeWith?._modeOwner ?? this;
         _maxGroupBytes = (long)Math.Min(maxWriteBatchGroupSizeBytes, (ulong)int.MaxValue);
         _maxYieldTicks = (long)Math.Min(maxYieldMicros * (ulong)Stopwatch.Frequency / 1_000_000UL, (ulong)Stopwatch.Frequency);
         // write_thread_slow_yield_usec (default 3): a yield that takes longer is assumed to be an involuntary context switch.
@@ -124,13 +151,28 @@ internal sealed class WriteThread
     }
 
     /// <summary>A queued write request. Pooled; reset with <see cref="Prepare"/> before each use.</summary>
-    internal sealed class Writer : IValueTaskSource<int>
+    internal sealed class Writer : IValueTaskSource<int>, IThreadPoolWorkItem
     {
-        private ManualResetValueTaskSourceCore<int> _core = new() { RunContinuationsAsynchronously = true };
         // STATE_LOCKED_WAITING: the waiter is blocked on the monitor of _stateLock (BlockingAwaitWaitImpl).
         private const int StateLockedWaiting = -1;
         private readonly object _stateLock = new();
         private int _syncState;
+
+        // ---- the asynchronous wait: the protocol of ManualResetValueTaskSourceCore with RunContinuationsAsynchronously
+        // (one result, never run inline on the completing thread), except that Complete decides where the continuation
+        // runs: on the .NET thread pool, like the core does, or on a write wake-up thread (see WakesOnWriteThread).
+        private static readonly Action<object?> s_completedSentinel = static _ => Debug.Fail("the completion sentinel is never invoked");
+        /// <summary>null: not completed and no waiter yet; <see cref="s_completedSentinel"/>: completed; otherwise the waiter's continuation.</summary>
+        private Action<object?>? _continuation;
+        private object? _continuationState;
+        private ExecutionContext? _executionContext;
+        private int _asyncResult;
+        private short _version;
+        /// <summary>Where the continuation of the current wake-up runs (written by Complete before it publishes the result).</summary>
+        private bool _wakeOnWriteThread;
+        // The continuation this writer queued as a work item (on the thread pool or a write wake-up thread).
+        private Action<object?>? _work;
+        private object? _workState;
 
         public WriteBatch? Batch;
         public bool Sync;
@@ -223,10 +265,17 @@ internal sealed class WriteThread
             MemNext = null;
             Txn = null;
             CallbackFailed = false;
+            InsertedByLeader = false;
             UserCallback = null;
             UserCallbackError = null;
             Rearm();
         }
+
+        /// <summary>
+        /// unordered_write: the group's leader inserted this (asynchronous) writer's batch into the memtables on its behalf
+        /// (see DbImpl.LeadUnorderedWalGroupAsync), so the writer does not insert it once it is completed.
+        /// </summary>
+        public bool InsertedByLeader;
 
         /// <summary>Re-arms the wait primitive so the writer can be woken once more (after it consumed its last wake-up).</summary>
         public void Rearm()
@@ -237,7 +286,11 @@ internal sealed class WriteThread
             }
             else
             {
-                _core.Reset();
+                // ManualResetValueTaskSourceCore.Reset.
+                _version++;
+                _continuationState = null;
+                _executionContext = null;
+                Volatile.Write(ref _continuation, null);
             }
         }
 
@@ -267,8 +320,90 @@ internal sealed class WriteThread
             }
             else
             {
-                _core.SetResult(state);
+                // ManualResetValueTaskSourceCore.SetResult, with the choice of the thread the continuation runs on.
+                _asyncResult = state;
+                _wakeOnWriteThread = WakesOnWriteThread(state);
+                Action<object?>? continuation = Interlocked.Exchange(ref _continuation, s_completedSentinel);
+                if (continuation is not null) DispatchContinuation(continuation, _continuationState);
             }
+        }
+
+        /// <summary>
+        /// Whether the continuation of an asynchronous writer woken with <paramref name="state"/> runs on a write wake-up
+        /// thread (<see cref="WakeupThreads"/>) instead of the .NET thread pool: when it is woken to lead a write group or a
+        /// memtable group while its DB has synchronous writers (<see cref="SyncWriterJoined"/>). Synchronous writers
+        /// queued behind the group wait for that leader; with every pool thread blocked in such a wait, a wake-up queued
+        /// to the pool would never run. On the wake-up thread the leader does the group's work synchronously
+        /// (DbImpl.LeadsSynchronously) and returns to the thread pool before its caller's code resumes
+        /// (<see cref="ResumeOnThreadPool"/>). Other wake-ups (completed writes, which nobody waits for, and unbatched
+        /// writers, which in that mode wait synchronously) go to the thread pool as before.
+        /// </summary>
+        private bool WakesOnWriteThread(int state) =>
+            state is StateGroupLeader or StateMemtableWriterLeader && Batch is not null && Owner is { SyncWriterJoined: true };
+
+        private void DispatchContinuation(Action<object?> continuation, object? state)
+        {
+            if (_executionContext is { } ec)
+            {
+                // A waiter that asked for its ExecutionContext to flow (OnCompleted with FlowExecutionContext; the write
+                // path's own awaits never do). Cold path.
+                state = new FlowingContinuation(ec, continuation, state);
+                continuation = FlowingContinuation.Run;
+            }
+            if (_wakeOnWriteThread)
+            {
+                _work = continuation;
+                _workState = state;
+                try
+                {
+                    WakeupThreads.Schedule(this);
+                    return;
+                }
+                catch (OutOfMemoryException)
+                {
+                    // No thread could be started (Schedule withdrew the item): the thread pool still runs the write.
+                    _work = null;
+                    _workState = null;
+                }
+            }
+            ThreadPool.UnsafeQueueUserWorkItem(continuation, state, preferLocal: true);
+        }
+
+        /// <summary>Runs the continuation this writer queued (IThreadPoolWorkItem, for both the thread pool and the wake-up threads).</summary>
+        void IThreadPoolWorkItem.Execute()
+        {
+            Action<object?> work = _work!;
+            object? state = _workState;
+            // Cleared first: the continuation may queue this writer again (ResumeOnThreadPool).
+            _work = null;
+            _workState = null;
+            work(state);
+        }
+
+        /// <summary>
+        /// Continues the awaiting method on the .NET thread pool (always asynchronously, without allocating). Awaited by an
+        /// asynchronous write that ran on a write wake-up thread (<see cref="OnWakeupThread"/>) once its part in the write
+        /// path is done, so that its caller's continuation never runs on a wake-up thread.
+        /// </summary>
+        public ResumeOnThreadPoolAwaitable ResumeOnThreadPool() => new(this);
+
+        private void QueueToThreadPool(Action continuation)
+        {
+            _work = s_invokeAction;
+            _workState = continuation;
+            ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
+        }
+
+        private static readonly Action<object?> s_invokeAction = static a => ((Action)a!)();
+
+        /// <summary>The awaitable of <see cref="ResumeOnThreadPool"/>.</summary>
+        internal readonly struct ResumeOnThreadPoolAwaitable(Writer writer) : ICriticalNotifyCompletion
+        {
+            public ResumeOnThreadPoolAwaitable GetAwaiter() => this;
+            public bool IsCompleted => false;
+            public void GetResult() { }
+            public void OnCompleted(Action continuation) => writer.QueueToThreadPool(continuation);
+            public void UnsafeOnCompleted(Action continuation) => writer.QueueToThreadPool(continuation);
         }
 
         /// <summary>
@@ -304,13 +439,108 @@ internal sealed class WriteThread
 
         internal int SyncState => Volatile.Read(ref _syncState);
 
-        public ValueTask<int> WaitAsync() => new(this, _core.Version);
+        public ValueTask<int> WaitAsync() => new(this, _version);
 
-        int IValueTaskSource<int>.GetResult(short token) => _core.GetResult(token);
-        ValueTaskSourceStatus IValueTaskSource<int>.GetStatus(short token) => _core.GetStatus(token);
-        void IValueTaskSource<int>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags) =>
-            _core.OnCompleted(continuation, state, token, flags);
+        private bool IsAsyncCompleted => ReferenceEquals(Volatile.Read(ref _continuation), s_completedSentinel);
+
+        int IValueTaskSource<int>.GetResult(short token)
+        {
+            if (token != _version || !IsAsyncCompleted) ThrowInvalidOperation();
+            return _asyncResult;
+        }
+
+        ValueTaskSourceStatus IValueTaskSource<int>.GetStatus(short token)
+        {
+            if (token != _version) ThrowInvalidOperation();
+            return IsAsyncCompleted ? ValueTaskSourceStatus.Succeeded : ValueTaskSourceStatus.Pending;
+        }
+
+        void IValueTaskSource<int>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        {
+            ArgumentNullException.ThrowIfNull(continuation);
+            if (token != _version) ThrowInvalidOperation();
+            // The write path awaits with ConfigureAwait(false): there is no scheduling context to return to.
+            Debug.Assert((flags & ValueTaskSourceOnCompletedFlags.UseSchedulingContext) == 0, "the write path awaits with ConfigureAwait(false)");
+            if ((flags & ValueTaskSourceOnCompletedFlags.FlowExecutionContext) != 0) _executionContext = ExecutionContext.Capture();
+            _continuationState = state;
+            Action<object?>? previous = Interlocked.CompareExchange(ref _continuation, continuation, null);
+            if (previous is null) return;
+            // Completed before the waiter registered: queue the continuation where Complete decided it runs (never inline
+            // on the registering thread, like the core).
+            if (!ReferenceEquals(previous, s_completedSentinel)) ThrowInvalidOperation();
+            DispatchContinuation(continuation, state);
+        }
+
+        [DoesNotReturn]
+        private static void ThrowInvalidOperation() => throw new InvalidOperationException("The write thread's wait was used incorrectly.");
+
+        /// <summary>A continuation run under the ExecutionContext its waiter captured.</summary>
+        private sealed class FlowingContinuation(ExecutionContext context, Action<object?> continuation, object? state)
+        {
+            public static readonly Action<object?> Run = static s =>
+            {
+                var f = (FlowingContinuation)s!;
+                ExecutionContext.Run(f._context, static s2 =>
+                {
+                    var f2 = (FlowingContinuation)s2!;
+                    f2._continuation(f2._state);
+                }, f);
+            };
+
+            private readonly ExecutionContext _context = context;
+            private readonly Action<object?> _continuation = continuation;
+            private readonly object? _state = state;
+        }
     }
+
+    // ---- write wake-up threads ----------------------------------------------------------------------------
+
+    /// <summary>
+    /// The threads that run asynchronous leaders while their DB has synchronous writers (wake-ups to lead, see
+    /// <see cref="Writer.WakesOnWriteThread"/>; leaders likely to stall and asynchronous unbatched operations, which move
+    /// there; the write buffer manager's flush coordinator): a dedicated, process-wide <see cref="BackgroundThreadPool"/>,
+    /// so such work never waits for a .NET thread-pool thread. It starts a thread whenever none is idle, because a leader
+    /// running on it may block (synchronous WAL I/O, stall waits, waiting for the memtable writers or for the other write
+    /// queue's leader, which may itself be a wake-up queued behind it); at most a few leaders per DB wait at once. Idle
+    /// threads exit after <see cref="BackgroundThreadPool.IdleTimeout"/>.
+    /// </summary>
+    internal static BackgroundThreadPool WakeupThreads => BackgroundThreadPool.WriteWakeup;
+
+    /// <summary>True on a write wake-up thread.</summary>
+    public static bool OnWakeupThread => ReferenceEquals(BackgroundThreadPool.Current, WakeupThreads);
+
+    /// <summary>
+    /// Continues the awaiting method on the .NET thread pool (always asynchronously; allocates a work item). For
+    /// asynchronous operations that led the write queue on a write wake-up thread (unbatched writers), before their
+    /// caller's code resumes. Cold path; writes use <see cref="Writer.ResumeOnThreadPool"/>.
+    /// </summary>
+    public static ResumeOnThreadPoolStaticAwaitable ResumeOnThreadPoolAsync() => default;
+
+    /// <summary>The awaitable of <see cref="ResumeOnThreadPoolAsync"/>.</summary>
+    internal readonly struct ResumeOnThreadPoolStaticAwaitable : ICriticalNotifyCompletion
+    {
+        public ResumeOnThreadPoolStaticAwaitable GetAwaiter() => this;
+        public bool IsCompleted => false;
+        public void GetResult() { }
+        public void OnCompleted(Action continuation) => ThreadPool.QueueUserWorkItem(static c => c(), continuation, preferLocal: false);
+        public void UnsafeOnCompleted(Action continuation) => ThreadPool.UnsafeQueueUserWorkItem(static c => c(), continuation, preferLocal: false);
+    }
+
+    // ---- synchronous writers (the mixed sync/async mode) ------------------------------------------------------
+
+    /// <summary>The write thread whose flag is shared (the main queue's, also for the WAL-only queue of two_write_queues).</summary>
+    private readonly WriteThread _modeOwner;
+    private volatile bool _syncWriterJoined;
+
+    /// <summary>
+    /// True once a synchronous writer (Put / Write, or a synchronous unbatched operation such as Flush) joined this DB's
+    /// write queues; never reset. From then on the write path runs the work that other writers may wait for (leading a
+    /// write group, a memtable group, an unbatched operation) synchronously and wakes asynchronous leaders on a write
+    /// wake-up thread, so that no synchronous writer waits for a .NET thread-pool thread (see docs/architecture.md, write
+    /// path). Sticky: an asynchronous writer that started an asynchronous WAL write or stall wait before the first
+    /// synchronous writer joined still finishes it on the thread pool, and that can only happen once per DB.
+    /// </summary>
+    public bool SyncWriterJoined => _modeOwner._syncWriterJoined;
 
     /// <summary>
     /// Port of JoinBatchGroup: returns true if <paramref name="w"/> became the leader right away; otherwise the caller
@@ -320,6 +550,8 @@ internal sealed class WriteThread
     public bool JoinBatchGroup(Writer w)
     {
         w.Owner = this;
+        // Before the writer is linked: a leader that decides how to run its group after this point sees the flag.
+        if (w.IsSyncWaiter && !_modeOwner._syncWriterJoined) _modeOwner._syncWriterJoined = true;
         bool linkedAsLeader;
         bool stalled = false;
         lock (_lock)

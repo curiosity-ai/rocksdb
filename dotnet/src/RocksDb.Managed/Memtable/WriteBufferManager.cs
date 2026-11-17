@@ -322,7 +322,19 @@ public sealed class WriteBufferManager
     {
         if (_flushPolicy != WriteBufferFlushPolicy.FlushLargestAcrossDbs || !ShouldFlush()) return;
         if (Interlocked.CompareExchange(ref _coordinatorRunning, 1, 0) != 0) return;
-        _ = Task.Run(RunCoordinatorAsync);
+        // On a dedicated thread rather than the .NET thread pool: writers stalled by the manager, synchronous ones
+        // included, wait for the flushes it requests (a starved pool would never start it). Its awaits continue on the
+        // thread pool only for DBs without synchronous writers (DbImpl.LeadsSynchronously).
+        try
+        {
+            _ = Db.BackgroundThreadPool.WriteWakeup.RunAsync(static s => new ValueTask(((WriteBufferManager)s!).RunCoordinatorAsync()), this);
+        }
+        catch
+        {
+            // No thread could be started: let a later request try again.
+            Volatile.Write(ref _coordinatorRunning, 0);
+            throw;
+        }
     }
 
     private async Task RunCoordinatorAsync()

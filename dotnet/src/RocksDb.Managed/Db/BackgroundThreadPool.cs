@@ -36,6 +36,12 @@ internal sealed class BackgroundThreadPool
     /// <summary>Env::Priority::BOTTOM: compactions forwarded to the bottom-priority pool.</summary>
     public static readonly BackgroundThreadPool Bottom = new("rocksdb:bottom");
 
+    /// <summary>
+    /// Not an Env pool: the wake-ups of asynchronous write leaders in a DB that also has synchronous writers
+    /// (<see cref="WriteThread.WakeupThreads"/>), so that synchronous writers never wait for the .NET thread pool.
+    /// </summary>
+    public static readonly BackgroundThreadPool WriteWakeup = new("rocksdb:write");
+
     /// <summary>How long a thread above the kept count waits for work before it exits.</summary>
     internal static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(30);
 
@@ -176,8 +182,14 @@ internal sealed class BackgroundThreadPool
         public void Execute() => continuation();
     }
 
+    [ThreadStatic] private static BackgroundThreadPool? t_current;
+
+    /// <summary>The pool whose thread runs the caller (null on any other thread).</summary>
+    internal static BackgroundThreadPool? Current => t_current;
+
     private void WorkerLoop()
     {
+        t_current = this;
         while (true)
         {
             IThreadPoolWorkItem? work;
