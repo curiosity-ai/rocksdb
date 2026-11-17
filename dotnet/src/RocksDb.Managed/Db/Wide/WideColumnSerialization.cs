@@ -464,6 +464,23 @@ internal static class WideColumnSerialization
         return entity.Slice(s.ValueOffset, s.ValueLength);
     }
 
+    /// <summary>
+    /// WideColumnsHelper::HasDefaultColumnOnly over a serialized, fully resolved entity: true when it has exactly one
+    /// column, the default (empty-named) one, whose value is returned in <paramref name="value"/>.
+    /// </summary>
+    public static bool HasDefaultColumnOnly(ReadOnlySpan<byte> entity, out ReadOnlySpan<byte> value)
+    {
+        List<WideColumnSlot> slots = t_slots ??= new List<WideColumnSlot>(8);
+        Deserialize(entity, slots);
+        if (slots.Count != 1 || slots[0].NameLength != 0)
+        {
+            value = default;
+            return false;
+        }
+        value = entity.Slice(slots[0].ValueOffset, slots[0].ValueLength);
+        return true;
+    }
+
     [ThreadStatic] private static List<WideColumnSlot>? t_slots;
 
     /// <summary>

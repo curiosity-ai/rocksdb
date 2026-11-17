@@ -93,6 +93,9 @@ internal static class KvChecksum
     public static ulong UpdateK(ulong info, ReadOnlySpan<byte> key, ReadOnlySpan<byte> rangeEnd) =>
         rangeEnd.IsEmpty ? info ^ HashK(key) : info ^ HashK(key) ^ HashV(rangeEnd);
 
+    /// <summary>ProtectionInfoKVO::UpdateV: replaces the hash of <paramref name="oldValue"/> by the one of <paramref name="newValue"/>.</summary>
+    public static ulong UpdateV(ulong info, ReadOnlySpan<byte> oldValue, ReadOnlySpan<byte> newValue) => info ^ HashV(oldValue) ^ HashV(newValue);
+
     /// <summary>ProtectionInfoKVO::UpdateO.</summary>
     public static ulong UpdateO(ulong info, EntryType oldType, EntryType newType) => info ^ HashO(oldType) ^ HashO(newType);
 

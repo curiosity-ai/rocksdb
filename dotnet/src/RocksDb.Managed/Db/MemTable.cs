@@ -136,6 +136,56 @@ public sealed unsafe class MemTable : IDisposable
         }
         _insertHintExtractor = options.InsertWithHintPrefixExtractor;
         _protectionBytes = (int)options.ProtectionBytesPerKey;
+        _maxSuccessiveMerges = options.MaxSuccessiveMerges;
+        _strictMaxSuccessiveMerges = options.StrictMaxSuccessiveMerges;
+    }
+
+    // moptions_.max_successive_merges / strict_max_successive_merges (ImmutableMemTableOptions: fixed at creation).
+    private readonly ulong _maxSuccessiveMerges;
+    private readonly bool _strictMaxSuccessiveMerges;
+
+    /// <summary>max_successive_merges captured when the memtable was created (0: merges are never folded at write time).</summary>
+    public ulong MaxSuccessiveMerges => _maxSuccessiveMerges;
+
+    /// <summary>strict_max_successive_merges captured when the memtable was created.</summary>
+    public bool StrictMaxSuccessiveMerges => _strictMaxSuccessiveMerges;
+
+    /// <summary>
+    /// Port of MemTable::CountSuccessiveMergeEntries (db/memtable.cc): the number of merge entries of
+    /// <paramref name="userKey"/> visible at <paramref name="sequence"/> at the head of the key in this memtable (newest
+    /// first, stopping at the first entry of another type), counting at most <paramref name="limit"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    public ulong CountSuccessiveMergeEntries(ReadOnlySpan<byte> userKey, ulong sequence, ulong limit)
+    {
+        Span<byte> scratch = stackalloc byte[LookupKey.StackBufferSize];
+        var lkey = new LookupKey(userKey, sequence, scratch);
+        try
+        {
+            ReadOnlySpan<byte> ikey = lkey.InternalKey;
+            var it = new InlineSkipList<MemTableKeyComparer>.Iterator(_table);
+            fixed (byte* pk = ikey)
+            {
+                it.Seek(new SkipListKey(pk, ikey.Length));
+            }
+            ulong numSuccessiveMerges = 0;
+            for (; it.Valid && numSuccessiveMerges < limit; it.Next())
+            {
+                SkipListKey ek = MemTableKeyComparer.DecodeEntryKey(it.Key);
+                int userKeyLen = ek.Length - DbFormat.InternalKeyFooterSize;
+                var entryUserKey = new ReadOnlySpan<byte>(ek.Ptr, userKeyLen);
+                // comparator_.comparator.user_comparator()->Equal(...): the whole user key, timestamp included.
+                if (!(_bytewise ? entryUserKey.SequenceEqual(userKey) : _ucmp.Equal(entryUserKey, userKey))) break;
+                ulong tag = Coding.DecodeFixed64(new ReadOnlySpan<byte>(ek.Ptr + userKeyLen, DbFormat.InternalKeyFooterSize));
+                if ((EntryType)(byte)tag != EntryType.Merge) break;
+                ++numSuccessiveMerges;
+            }
+            return numSuccessiveMerges;
+        }
+        finally
+        {
+            lkey.Dispose();
+        }
     }
 
     /// <summary>memtable_protection_bytes_per_key of this memtable (bytes of checksum after each entry).</summary>
@@ -689,12 +739,19 @@ public sealed unsafe class MemTable : IDisposable
     /// <param name="callback">Read callback (SaveValue's CheckCallback): entries it reports as invisible are skipped.</param>
     internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
         MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback) =>
-        Get(key, out value, out valueType, out sequence, mergeContext, ref maxCoveringTombstoneSeq, timestampSink, callback, ignoreRangeDeletions: false);
+        Get(key, out value, out valueType, out sequence, mergeContext, ref maxCoveringTombstoneSeq, timestampSink, callback, ignoreRangeDeletions: false,
+            shouldMerge: null);
 
     /// <inheritdoc cref="Get(in LookupKey, out ReadOnlySpan{byte}, out EntryType, out ulong, MergeContext?, ref ulong)"/>
     /// <param name="ignoreRangeDeletions">ReadOptions::ignore_range_deletions: this memtable's range tombstones are not consulted (MemTable::Get).</param>
+    /// <param name="shouldMerge">
+    /// With do_merge, the merge operator whose ShouldMerge is asked after each operand pushed (HandleTypeMerge): true ends
+    /// the lookup with <see cref="MemTableGetResult.MergeWithoutBase"/>. Null: not asked (GetMergeOperands, or an operator
+    /// that keeps the default ShouldMerge).
+    /// </param>
     internal MemTableGetResult Get(scoped in LookupKey key, out ReadOnlySpan<byte> value, out EntryType valueType, out ulong sequence,
-        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback, bool ignoreRangeDeletions)
+        MergeContext? mergeContext, ref ulong maxCoveringTombstoneSeq, GetContext? timestampSink, ReadCallback? callback, bool ignoreRangeDeletions,
+        MergeOperator? shouldMerge)
     {
         value = default;
         valueType = EntryType.Value;
@@ -790,6 +847,9 @@ public sealed unsafe class MemTable : IDisposable
                     if (mergeContext is null) return MemTableGetResult.MergeInProgress;
                     mergeContext.PushOperand(EntryValue(ek));
                     mergeInProgress = true;
+                    // HandleTypeMerge (db/memtable.h): do_merge && ShouldMerge(GetOperandsDirectionBackward()) ends the
+                    // lookup; the operands collected so far are merged with no base value (found_final_value).
+                    if (shouldMerge is not null && shouldMerge.ShouldMerge(mergeContext.OperandsNewestFirst)) return MemTableGetResult.MergeWithoutBase;
                     continue;
                 default:
                     valueType = type;

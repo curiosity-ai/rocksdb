@@ -186,6 +186,43 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>read_options.read_tier = kBlockCacheTier of the max_successive_merges read (shared, never modified).</summary>
+    private static readonly ReadOptions s_successiveMergesReadOptions = new() { ReadTier = ReadTier.BlockCacheTier };
+
+    /// <summary>
+    /// The read of MemTableInserter::MergeCF (db/write_batch.cc) once max_successive_merges is reached:
+    /// <c>db_-&gt;GetEntity(read_options, cf_handle, key, &amp;existing)</c> with <c>read_options.snapshot</c> at the
+    /// batch's <paramref name="sequence"/> ("so that we also include previous merge operations in the same batch") and,
+    /// unless <paramref name="strict"/>, <c>read_tier = kBlockCacheTier</c> ("Blocking the write path with read I/O is
+    /// typically unacceptable"): data not in the memtables or the block cache fails the read with Incomplete. Writes the
+    /// key's serialized entity (a plain value as a default-column entity, merge operands applied) to
+    /// <paramref name="entity"/>; false if the key does not exist. Throws on read errors like a Get. Reads DBImpl
+    /// directly (no transaction read callback, as upstream's db_ is the DBImpl).
+    /// </summary>
+    internal bool GetEntityForSuccessiveMerges(ColumnFamilyData cfd, ReadOnlySpan<byte> key, ulong sequence, bool strict,
+        System.Buffers.IBufferWriter<byte> entity)
+    {
+        ReadOptions? options = strict ? null : s_successiveMergesReadOptions;
+        GetContext ctx = GetContext.Rent(cfd.MergeOperator);
+        try
+        {
+            SuperVersion sv = GetAndRefSuperVersion(cfd, out int svSlot);
+            try
+            {
+                GetWithSuperVersion(cfd, sv, sequence, options, key, ctx);
+            }
+            finally
+            {
+                ReturnAndCleanupSuperVersion(cfd, sv, svSlot);
+            }
+            return ctx.TryResolveEntity(key, entity);
+        }
+        finally
+        {
+            GetContext.Return(ctx);
+        }
+    }
+
     internal bool GetWithCallback(ColumnFamilyData cfd, ReadOptions? options, ReadOnlySpan<byte> key, ReadCallback callback, System.Buffers.IBufferWriter<byte> value)
     {
         ThrowIfDisposed();
@@ -305,7 +342,7 @@ internal sealed partial class DbImpl
         int operands = ctx.MergeContext.Count;
         PerfContext.Add(PerfMetric.GetFromMemtableCount, 1); // MemTable::Get, once per memtable searched
         bool noRangeDel = ctx.IgnoreRangeDeletions;
-        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel);
+        MemTableGetResult r = sv.Mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel, ctx.ShouldMergeOperator);
         // GetMergeOperands with continue_cb: the callback may end the lookup at an operand of this memtable.
         if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
         if (ctx.ApplyMemTableResult(r, v, t)) return true;
@@ -314,7 +351,7 @@ internal sealed partial class DbImpl
         {
             operands = ctx.MergeContext.Count;
             PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
-            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel);
+            r = imm[i].Get(lkey, out v, out t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq, tsSink, cb, noRangeDel, ctx.ShouldMergeOperator);
             if (ctx.ContinueCallback is not null && ctx.ApplyContinueCallback(operands)) return true;
             if (ctx.ApplyMemTableResult(r, v, t)) return true;
         }

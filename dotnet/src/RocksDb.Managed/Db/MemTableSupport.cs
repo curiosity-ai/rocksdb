@@ -56,6 +56,16 @@ public sealed class MemTableOptions
     /// <summary>inplace_callback (see <see cref="MemTable.UpdateCallback"/>).</summary>
     public InplaceUpdateCallback? InplaceCallback { get; set; }
 
+    /// <summary>
+    /// max_successive_merges (ImmutableMemTableOptions, taken from the mutable options when the memtable is created): a
+    /// merge that finds this many successive merge operands of its key at the head of the memtable is folded into a
+    /// value at write time (MemTableInserter::MergeCF). 0 disables it.
+    /// </summary>
+    public ulong MaxSuccessiveMerges { get; set; }
+
+    /// <summary>strict_max_successive_merges: the write-time merge may read table files (otherwise block cache tier only).</summary>
+    public bool StrictMaxSuccessiveMerges { get; set; }
+
     /// <summary>memtable_insert_with_hint_prefix_extractor: serial point inserts use a per-prefix skiplist splice hint.</summary>
     public SliceTransform? InsertWithHintPrefixExtractor { get; set; }
 
@@ -95,6 +105,10 @@ public sealed class MemTableOptions
         // memtable_max_range_deletions (MutableCFOptions): read by memtables created from now on.
         MaxRangeDeletions = options.MemtableMaxRangeDeletions;
         InplaceCallback = options.InplaceCallback;
+        // max_successive_merges / strict_max_successive_merges (MutableCFOptions): read by memtables created from now on
+        // (ImmutableMemTableOptions, db/memtable.cc).
+        MaxSuccessiveMerges = options.MaxSuccessiveMerges;
+        StrictMaxSuccessiveMerges = options.StrictMaxSuccessiveMerges;
         InsertWithHintPrefixExtractor = options.MemtableInsertWithHintPrefixExtractor;
     }
 
@@ -122,6 +136,11 @@ public enum MemTableGetResult : byte
     MergeInProgress = 3,
     /// <summary>An entry with an unexpected value type was found.</summary>
     Corruption = 4,
+    /// <summary>
+    /// The merge operator's ShouldMerge returned true for the operands collected (in the merge context): merge them with
+    /// no base value; older entries and sources are not read (HandleTypeMerge, db/memtable.h).
+    /// </summary>
+    MergeWithoutBase = 5,
 }
 
 /// <summary>Counters accumulated by concurrent memtable inserts, applied with <see cref="MemTable.BatchPostProcess"/>. Port of MemTablePostProcessInfo.</summary>
@@ -141,8 +160,17 @@ public struct MemTablePostProcessInfo
 public sealed class MergeContext : IDisposable
 {
     private readonly PooledBufferWriter _data = new(256);
-    private int[] _ends = RocksArrayPool<int>.Shared.Rent(8);
+    // Count + 1 offsets into _data: operand i (push order, newest first) spans [_offsets[i], _offsets[i + 1]), so the
+    // operands can be viewed as a MergeOperands in push order without a copy (OperandsNewestFirst).
+    private int[] _offsets = NewOffsets(8);
     private int _count;
+
+    private static int[] NewOffsets(int minLength)
+    {
+        int[] a = RocksArrayPool<int>.Shared.Rent(minLength);
+        a[0] = 0;
+        return a;
+    }
 
     /// <summary>Number of operands collected.</summary>
     public int Count => _count;
@@ -156,15 +184,15 @@ public sealed class MergeContext : IDisposable
     /// <summary>Adds an operand older than all operands added so far (lookups walk newest to oldest).</summary>
     public void PushOperand(ReadOnlySpan<byte> operand)
     {
-        if (_count == _ends.Length)
+        if (_count + 1 == _offsets.Length)
         {
-            int[] n = RocksArrayPool<int>.Shared.Rent(_count * 2);
-            _ends.AsSpan(0, _count).CopyTo(n);
-            RocksArrayPool<int>.Shared.Return(_ends);
-            _ends = n;
+            int[] n = RocksArrayPool<int>.Shared.Rent(Math.Max(8, _offsets.Length * 2));
+            _offsets.AsSpan(0, _count + 1).CopyTo(n);
+            if (_offsets.Length > 1) RocksArrayPool<int>.Shared.Return(_offsets);
+            _offsets = n;
         }
         _data.Write(operand);
-        _ends[_count++] = _data.WrittenCount;
+        _offsets[++_count] = _data.WrittenCount;
     }
 
     /// <summary>Keeps only the <paramref name="count"/> newest operands (the first pushed).</summary>
@@ -172,27 +200,32 @@ public sealed class MergeContext : IDisposable
     {
         ArgumentOutOfRangeException.ThrowIfGreaterThan((uint)count, (uint)_count);
         _count = count;
-        _data.Truncate(count == 0 ? 0 : _ends[count - 1]);
+        _data.Truncate(_offsets[count]);
     }
 
     /// <summary>Operand by push order: index 0 is the newest operand.</summary>
     public ReadOnlySpan<byte> GetOperandNewestFirst(int index)
     {
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual((uint)index, (uint)_count);
-        int start = index == 0 ? 0 : _ends[index - 1];
-        return _data.WrittenSpan[start.._ends[index]];
+        return _data.WrittenSpan[_offsets[index].._offsets[index + 1]];
     }
 
     /// <summary>Operand in merge order: index 0 is the oldest operand (the order passed to FullMerge).</summary>
     public ReadOnlySpan<byte> GetOperand(int index) => GetOperandNewestFirst(_count - 1 - index);
 
+    /// <summary>
+    /// The operands collected so far in push order, newest first (MergeContext::GetOperandsDirectionBackward), the order
+    /// <see cref="Managed.MergeOperator.ShouldMerge"/> receives. No copy; valid until the next change of this context.
+    /// </summary>
+    internal MergeOperands OperandsNewestFirst => new(_data.WrittenSpan, _offsets.AsSpan(0, _count + 1));
+
     public void Dispose()
     {
         _data.Dispose();
-        int[] e = _ends;
-        _ends = [];
+        int[] e = _offsets;
+        _offsets = [0];
         _count = 0;
-        if (e.Length > 0) RocksArrayPool<int>.Shared.Return(e);
+        if (e.Length > 1) RocksArrayPool<int>.Shared.Return(e);
     }
 }
 

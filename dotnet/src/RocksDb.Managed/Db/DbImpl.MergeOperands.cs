@@ -22,6 +22,7 @@ internal sealed partial class DbImpl
         try
         {
             ctx.ContinueCallback = mergeOptions.ContinueCallback;
+            ctx.ShouldMergeOperator = null; // do_merge_ = false: ShouldMerge is not consulted
             Get(cfd, options, key, ctx);
             Finalize(ctx, mergeOptions, result);
         }
@@ -42,6 +43,7 @@ internal sealed partial class DbImpl
         try
         {
             ctx.ContinueCallback = mergeOptions.ContinueCallback;
+            ctx.ShouldMergeOperator = null; // do_merge_ = false: ShouldMerge is not consulted
             await GetAsync(cfd, options, key, ctx, ct).ConfigureAwait(false);
             Finalize(ctx, mergeOptions, result);
         }

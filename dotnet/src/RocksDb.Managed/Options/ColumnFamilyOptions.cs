@@ -198,14 +198,25 @@ public sealed class ColumnFamilyOptions : PersistedOptions<ColumnFamilyOptions>
     public bool MemtableWholeKeyFiltering { get; set; }
     public ulong MemtableHugePageSize { get; set; }
     public uint BloomLocality { get; set; }
+    /// <summary>
+    /// max_successive_merges: the maximum number of successive merge operands of a key in the memtable. When a merge is
+    /// written and the key already has this many merge operands at its head in the memtable, the write reads the key's
+    /// current value (at the write's sequence number, so earlier merges of the same batch count), applies the merge and
+    /// stores the result as a value instead of the operand; reads then stop at that value. The read only uses the
+    /// memtables and the block cache unless <see cref="StrictMaxSuccessiveMerges"/> is set, so the limit can be exceeded
+    /// when the value would need a table file read; if the read or the merge fails the operand is stored as usual. Not
+    /// applied while the WAL is replayed at open. 0 (default) disables it. Mutable (SetOptions): a memtable keeps the value
+    /// it was created with, so a change applies from the next memtable. Incompatible with
+    /// <see cref="DbOptions.UnorderedWrite"/>. Port of MemTableInserter::MergeCF (db/write_batch.cc).
+    /// </summary>
     public ulong MaxSuccessiveMerges { get; set; }
     public uint MemtableProtectionBytesPerKey { get; set; }
     public double ExperimentalMempurgeThreshold { get; set; }
 
     /// <summary>
-    /// strict_max_successive_merges: with <see cref="MaxSuccessiveMerges"/>, merge even when the base value must be read
-    /// from SST files. Typed and persisted only: the managed port does not implement max_successive_merges (both are
-    /// listed under "Not ported yet"). Default false. Mutable.
+    /// strict_max_successive_merges: with <see cref="MaxSuccessiveMerges"/>, merge at write time even when the base value
+    /// must be read from table files (this can block the write path on file reads); otherwise only memtables and the block
+    /// cache are read. Default false. Mutable (applies from the next memtable).
     /// </summary>
     public bool StrictMaxSuccessiveMerges { get; set; }
 

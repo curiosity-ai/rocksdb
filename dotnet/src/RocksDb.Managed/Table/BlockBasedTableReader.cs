@@ -943,11 +943,15 @@ public sealed partial class BlockBasedTableReader : TableReader
         return udi.NewIterator(null) ?? throw RocksDbException.Corruption("Could not create UDI iterator");
     }
 
-    // Any built-in policy reads any built-in filter format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader).
+    /// <summary>
+    /// The reader of a filter block: the configured policy's own reader, like ParsedFullFilterBlock
+    /// (table/block_based/parsed_full_filter_block.cc: <c>filter_policy-&gt;GetFilterBitsReader(block_contents_.data)</c>).
+    /// Built-in policies return the built-in reader for any built-in format (BuiltinFilterPolicy::GetBuiltinFilterBitsReader,
+    /// <see cref="BloomLikeFilterPolicy.CreateReader"/> is sealed); a custom policy that reuses the built-in compatibility
+    /// name gets its own reader, as upstream (a wrapper that delegates to a built-in policy reads built-in filters).
+    /// </summary>
     internal static IFilterBitsReader CreateFilterReader(FilterPolicy policy, byte[] buffer, int length) =>
-        policy.CompatibilityName == BloomLikeFilterPolicy.BuiltinFilterMetadataName
-            ? BuiltinFilterBitsReader.Create(buffer.AsMemory(0, length))
-            : policy.CreateReader(buffer.AsMemory(0, length));
+        policy.CreateReader(buffer.AsMemory(0, length));
 
     private static CachePriority MetaPriority(TableReaderOptions options) =>
         options.CacheIndexAndFilterBlocksWithHighPriority ? CachePriority.High : CachePriority.Low;

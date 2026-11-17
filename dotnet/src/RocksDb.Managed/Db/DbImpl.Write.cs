@@ -2113,12 +2113,110 @@ internal sealed partial class DbImpl
                 return;
             }
             // MemTableInserter::MergeCF: a merge into a column family without a merge operator fails the write.
-            if (_db.CfForInsert(columnFamilyId, _logNumber, IgnoreMissingColumnFamilies) is { MergeOperator: null })
+            ColumnFamilyData? c = _db.CfForInsert(columnFamilyId, _logNumber, IgnoreMissingColumnFamilies);
+            if (c is { MergeOperator: null })
             {
                 throw new InsertRejectedException(StatusCode.InvalidArgument, "Merge requires `ColumnFamilyOptions::merge_operator != nullptr`");
             }
+            // max_successive_merges: "If we pass DB through and options.max_successive_merges is hit during recovery, Get()
+            // will be issued which will try to acquire DB mutex and cause deadlock, as DB mutex is already held. So we
+            // disable merge in recovery" (recovering_log_number_ == 0). Concurrent memtable writes never carry merges
+            // (write groups with merges are inserted serially), as upstream asserts.
+            if (c is not null && c.Mem.MaxSuccessiveMerges != 0 && _logNumber == 0 && !_concurrent && TryAddFoldedMerge(c, columnFamilyId, key, value))
+            {
+                _rebuilding?.Merge(columnFamilyId, key, value);
+                return;
+            }
             Add(columnFamilyId, EntryType.Merge, key, value);
             _rebuilding?.Merge(columnFamilyId, key, value);
+        }
+
+        /// <summary>
+        /// The perform_merge part of MemTableInserter::MergeCF (db/write_batch.cc): when the key already has
+        /// max_successive_merges merge entries at its head in the memtable (MemTable::CountSuccessiveMergeEntries), the
+        /// current value is read at the batch's sequence (<see cref="DbImpl.GetEntityForSuccessiveMerges"/>), this operand
+        /// is merged into it, and the result is added as a Put (or an entity) instead of the operand. Returns false, having
+        /// changed nothing, when the limit is not reached or the read or the merge fails ("Store the delta in memtable"):
+        /// the caller then adds the operand. A user merge operator that throws during this read or merge is treated like a
+        /// failed merge (the operand is stored; reads of the key then see the exception).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        [SkipLocalsInit]
+        private bool TryAddFoldedMerge(ColumnFamilyData c, uint columnFamilyId, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            MemTable mem = c.Mem;
+            ulong limit = mem.MaxSuccessiveMerges;
+            // Count the number of successive merges at the head of the key in the memtable. Limit the count to the
+            // threshold for triggering merge to prevent unnecessary counting overhead.
+            if (mem.CountSuccessiveMergeEntries(key, Sequence, limit) < limit) return false;
+            Util.PooledBufferWriter existing = Util.ObjectPools.RentWriter();
+            Util.PooledBufferWriter newValue = Util.ObjectPools.RentWriter();
+            Util.PooledBufferWriter newEntity = Util.ObjectPools.RentWriter();
+            try
+            {
+                EntryType newType;
+                try
+                {
+                    // 1) Get the existing value. Use the wide column APIs to make sure we don't lose any columns in the
+                    // process. Pass in the sequence number so that we also include previous merge operations in the same
+                    // batch.
+                    if (!_db.GetEntityForSuccessiveMerges(c, key, Sequence, mem.StrictMaxSuccessiveMerges, existing)) return false;
+                    // 2) Apply this merge: a plain base value when the entity has only the default column, else a wide
+                    // base value (update_num_ops_stats = false).
+                    ReadOnlySpan<byte> entity = existing.WrittenSpan;
+                    bool plain = Wide.WideColumnSerialization.HasDefaultColumnOnly(entity, out ReadOnlySpan<byte> plainValue);
+                    Span<int> offsets = stackalloc int[2];
+                    offsets[0] = 0;
+                    offsets[1] = value.Length;
+                    newType = MergeHelper.TimedFullMerge(c.MergeOperator!, key, plain ? MergeExistingValueKind.Plain : MergeExistingValueKind.WideColumns,
+                        plain ? plainValue : entity, new MergeOperands(value, offsets), newValue, newEntity);
+                }
+                catch (Exception)
+                {
+                    // Failed to read a key we know exists, or failed to merge: store the delta in memtable.
+                    return false;
+                }
+                // 3) Add value to memtable
+                AddMerged(c, columnFamilyId, newType, key, value, newType == EntryType.WideColumnEntity ? newEntity.WrittenSpan : newValue.WrittenSpan);
+                return true;
+            }
+            finally
+            {
+                Util.ObjectPools.ReturnWriter(newEntity);
+                Util.ObjectPools.ReturnWriter(newValue);
+                Util.ObjectPools.ReturnWriter(existing);
+            }
+        }
+
+        /// <summary>
+        /// MergeCF's insert of a merged value: mem->Add(sequence_, new_value_type, key, new_value) with the operand's
+        /// protection info updated to the new value and type (UpdateV / UpdateO), then the usual sequence advance and
+        /// flush check. Never an in-place update (upstream calls MemTable::Add here).
+        /// </summary>
+        private void AddMerged(ColumnFamilyData c, uint cf, EntryType type, ReadOnlySpan<byte> key, ReadOnlySpan<byte> operand, ReadOnlySpan<byte> value)
+        {
+            bool hasProt = false;
+            ulong kvo = 0;
+            if (_protBatch is not null && _protIdx < _protBatch.ProtectionInfo.Length)
+            {
+                kvo = KvChecksum.StripC(_protBatch.ProtectionInfo[_protIdx++], cf);
+                kvo = KvChecksum.UpdateO(KvChecksum.UpdateV(kvo, operand, value), EntryType.Merge, type);
+                hasProt = true;
+            }
+            MemTable mem = c.Mem;
+            while (!(hasProt ? mem.Add(Sequence, type, key, value, true, KvChecksum.ProtectS(kvo, Sequence)) : mem.Add(Sequence, type, key, value)))
+            {
+                // TryAgain: as in Add.
+                if (!_seqPerBatch)
+                {
+                    if (FailOnDuplicateKeySeq) throw new DuplicateKeySeqException();
+                    break;
+                }
+                MaybeAdvanceSeq(batchBoundary: true);
+            }
+            if (LogRef != 0) mem.RefLogContainingPrepSection(LogRef);
+            if (mem.ShouldScheduleFlush && mem.MarkFlushScheduled()) _db._flushScheduler.Add(c);
+            MaybeAdvanceSeq(batchBoundary: false);
         }
 
         /// <summary>MemTableInserter::PutBlobIndexCF: the blob index is stored as a kTypeBlobIndex entry.</summary>

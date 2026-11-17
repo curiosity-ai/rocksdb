@@ -408,6 +408,10 @@ Upstream's built-in operators are included under their native names, and an OPTI
 `Utilities.AggMerge.AggMergeOperator` (`AggMergeOperator.v1`, with `Aggregator`s registered through
 `AggMerge.AddAggregator`). `MergeOperator.CreateBuiltin(id)` resolves the same ids.
 
+As upstream, `MergeOperator.ShouldMerge` (operands passed newest first) lets point lookups stop collecting operands
+and merge without the base value, and `ColumnFamilyOptions.MaxSuccessiveMerges` (with `StrictMaxSuccessiveMerges`)
+folds a key's merge operands into a value at write time once that many are in the memtable.
+
 <!-- snippet:merge-operator-class -->
 ```csharp
 /// <summary>Keeps the maximum of little-endian int64 operands.</summary>
@@ -1367,8 +1371,7 @@ Not ported yet (tracked in [todo.md](todo.md)):
 - Options typed and persisted (round-tripped with native 11.12, accepted by SetOptions / SetDBOptions where upstream
   marks them mutable) but without behaviour yet: `paranoid_memory_checks`, `memtable_verify_per_key_checksum_on_seek`,
   `memtable_op_scan_flush_trigger` / `memtable_avg_op_scan_flush_trigger`, `memtable_batch_lookup_optimization`,
-  `min_tombstones_for_range_conversion`, `strict_max_successive_merges` (and `max_successive_merges` itself),
-  `blob_compression_opts` (blob files use the codec's default settings), `compression_opts.auto_skip` /
+  `min_tombstones_for_range_conversion`, `blob_compression_opts` (blob files use the codec's default settings), `compression_opts.auto_skip` /
   `auto_skip_min_sample_every`,
   `uncache_aggressiveness` (a cache hint; obsolete files' blocks are left to normal eviction), `compression_manager`
   (only `nullptr`; a named manager is NotSupported at open / SetOptions), `fast_sst_open`, `open_files_async`,
