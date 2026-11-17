@@ -272,7 +272,7 @@ internal sealed partial class DbImpl
                 {
                     PerfContext.Add(PerfMetric.GetFromMemtableCount, 1);
                     MemTableGetResult r = mem.Get(lkey, out ReadOnlySpan<byte> v, out EntryType t, out _, ctx.MergeContext, ref ctx.MaxCoveringTombstoneSeq,
-                        null, ctx.Callback, ctx.IgnoreRangeDeletions);
+                        null, ctx.Callback, ctx.IgnoreRangeDeletions, ctx.ShouldMergeOperator);
                     done = ctx.ApplyMemTableResult(r, v, t);
                 }
                 finally

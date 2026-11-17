@@ -70,9 +70,9 @@ public sealed class DebugUtilitiesTests
     }
 
     /// <summary>
-    /// Adapted from DBMergeOperatorTest.MaxSuccessiveMergesBaseValues: the port does not implement
-    /// max_successive_merges (merges are never converted to puts at write time), so every operand is reported as a
-    /// merge above its base value.
+    /// Adapted from DBMergeOperatorTest.MaxSuccessiveMergesBaseValues without max_successive_merges (0, the default:
+    /// merges are never converted to puts at write time), so every operand is reported as a merge above its base value.
+    /// The upstream test itself (max_successive_merges = 1) is Audit11MergeAndFilterTests.MaxSuccessiveMerges_BaseValues.
     /// </summary>
     [TestMethod]
     public void GetAllKeyVersions_MergeOperandsAndBaseValues()

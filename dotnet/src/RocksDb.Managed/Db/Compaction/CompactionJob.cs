@@ -751,7 +751,7 @@ internal sealed class CompactionJob
         int cpuThread = Environment.CurrentManagedThreadId;
         ulong startCpuMicros = Env.ThreadCpuClock.CpuMicros();
         // CompactionJob::SetupAndValidateCompactionFilter (compaction_job.cc): before any input is opened.
-        CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id);
+        CompactionFilter? filter = _c.CreateCompactionFilter(_cfd.Id, _cfd.TableCache, _db);
         if (filter is not null && !filter.IgnoreSnapshots) ThrowHelper.NotSupported(CompactionFilter.IgnoreSnapshotsFalseMessage);
         bool isPart = _subStart is not null || _subEnd is not null;
         Stats.NumInputFiles = isPart ? 0 : _c.TotalInputFiles;

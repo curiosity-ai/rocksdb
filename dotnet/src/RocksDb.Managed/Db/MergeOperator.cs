@@ -13,7 +13,7 @@ namespace RocksDb.Managed;
 public abstract class MergeOperator
 {
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, byte> s_overrides = new();
-    private const byte OverridesV3Flag = 1, OverridesScopedFlag = 2;
+    private const byte OverridesV3Flag = 1, OverridesScopedFlag = 2, OverridesShouldMergeFlag = 4;
     private readonly byte _overrides;
 
     protected MergeOperator()
@@ -32,6 +32,9 @@ public abstract class MergeOperator
                 [typeof(ReadOnlySpan<byte>), typeof(bool), typeof(ReadOnlySpan<byte>), typeof(MergeOperands).MakeByRefType(), typeof(IBufferWriter<byte>),
                     typeof(MergeOperationFailureScope).MakeByRefType()]);
             if (scoped is null || scoped.DeclaringType != typeof(MergeOperator)) f |= OverridesScopedFlag;
+            System.Reflection.MethodInfo? shouldMerge = t.GetMethod(nameof(ShouldMerge), System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
+                [typeof(MergeOperands).MakeByRefType()]);
+            if (shouldMerge is null || shouldMerge.DeclaringType != typeof(MergeOperator)) f |= OverridesShouldMergeFlag;
             _overrides = f;
             s_overrides.TryAdd(t, f);
         }
@@ -44,7 +47,13 @@ public abstract class MergeOperator
     internal bool OverridesScopedFullMerge => (_overrides & OverridesScopedFlag) != 0;
 
     /// <summary>Neither is overridden: every non-entity merge is the five-argument FullMerge.</summary>
-    internal bool IsPlainFullMergeV2 => _overrides == 0;
+    internal bool IsPlainFullMergeV2 => (_overrides & (OverridesV3Flag | OverridesScopedFlag)) == 0;
+
+    /// <summary>
+    /// True if the concrete type overrides <see cref="ShouldMerge"/>. Point lookups only call it then: the default
+    /// returns false, so skipping the call changes nothing.
+    /// </summary>
+    internal bool OverridesShouldMerge => (_overrides & OverridesShouldMergeFlag) != 0;
 
     public abstract string Name { get; }
 
@@ -120,6 +129,29 @@ public abstract class MergeOperator
 
     /// <summary>Port of AllowSingleOperand.</summary>
     public virtual bool AllowSingleOperand => false;
+
+    /// <summary>
+    /// Port of ShouldMerge (include/rocksdb/merge_operator.h): lets a point lookup stop early. A point lookup (Get,
+    /// MultiGet, GetEntity, KeyMayExist, and the DB part of a transaction or WriteBatchWithIndex read) calls this after
+    /// each merge operand it collects, with every operand collected so far for the key; returning true ends the lookup
+    /// there: the operands are merged with no base value, as if nothing older existed, and older memtables, table
+    /// files and the key's base value are not read. This can limit how many levels a lookup reads. The default returns
+    /// false (merge with the base value as usual).
+    /// <para>
+    /// The operands are passed NEWEST FIRST, the reverse of the order <see cref="FullMerge(ReadOnlySpan{byte}, bool, ReadOnlySpan{byte}, in MergeOperands, IBufferWriter{byte})"/>
+    /// receives them (upstream does the same, for performance). The view is valid only during the call.
+    /// </para>
+    /// <para>
+    /// Not used by iterators, flush or compaction (as upstream), nor by <c>GetMergeOperands</c>, which collects the
+    /// operands without merging. The result should be a function of the operands only: a lookup and a later lookup of
+    /// the same data must agree, or reads would depend on where the operands currently are (memtable or table files).
+    /// Must be thread-safe (called concurrently by reads) and should not throw: an exception propagates to the caller of
+    /// the read (the DB stays usable), and inside a write with <c>max_successive_merges</c> the write falls back to
+    /// storing the operand.
+    /// </para>
+    /// </summary>
+    /// <param name="operands">The merge operands collected so far for the key, newest first.</param>
+    public virtual bool ShouldMerge(in MergeOperands operands) => false;
 
     /// <summary>
     /// Port of Customizable::NickName: the short id a factory also accepts for this operator (e.g. "max" for

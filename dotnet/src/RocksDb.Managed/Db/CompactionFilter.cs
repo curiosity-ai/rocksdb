@@ -165,6 +165,26 @@ public readonly record struct CompactionFilterContext(bool IsFullCompaction, boo
     /// <see cref="UnknownStartLevel"/> for flushes.
     /// </summary>
     public int InputStartLevel { get; init; } = UnknownStartLevel;
+
+    private readonly IReadOnlyDictionary<string, Table.TableProperties>? _inputTableProperties;
+
+    /// <summary>
+    /// Context::input_table_properties: the table properties of every input file of the compaction, keyed by the file's
+    /// path (as <see cref="ColumnFamily.GetPropertiesOfAllTables"/> keys them), including the user properties written by
+    /// table properties collectors. Empty for flushes (no input files), and empty when the properties of an input file
+    /// could not be loaded (upstream logs the error and creates the filter anyway; the compaction itself then fails when
+    /// it reads that file).
+    /// <para>
+    /// Filled from the table readers the compaction opens for its inputs: no extra file read when the readers are
+    /// already open (table cache); otherwise the readers are opened a little earlier than the compaction would open them.
+    /// Only computed when a factory creates the filter. Read-only; shared by the filters of all subcompactions.
+    /// </para>
+    /// </summary>
+    public IReadOnlyDictionary<string, Table.TableProperties> InputTableProperties
+    {
+        get => _inputTableProperties ?? System.Collections.ObjectModel.ReadOnlyDictionary<string, Table.TableProperties>.Empty;
+        init => _inputTableProperties = value;
+    }
 }
 
 /// <summary>Port of rocksdb::CompactionFilterFactory: creates one (possibly stateful) filter per compaction.</summary>
