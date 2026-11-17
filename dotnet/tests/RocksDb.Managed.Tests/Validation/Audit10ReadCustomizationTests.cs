@@ -399,17 +399,38 @@ public sealed class Audit10ReadCustomizationTests
         MemoryFileSystem fs = NewFs();
         var cmp = new ThrowingComparator();
         var cfo = new ColumnFamilyOptions { Comparator = cmp, DisableAutoCompactions = !automatic, Level0FileNumCompactionTrigger = 2 };
-        using (RocksDatabase db = RocksDatabase.Open(DbPath, Opts(fs), cfo))
+        // Automatic case: the comparator throws only while the compaction job runs. Arming it from OnCompactionBegin
+        // (and disarming it at OnCompactionCompleted) makes the failure land inside the job deterministically; a count of
+        // comparisons could land in the flush or the picking instead, depending on timing.
+        var arm = new ArmDuringCompaction(cmp);
+        DbOptions OpenOpts()
+        {
+            DbOptions o = Opts(fs);
+            if (automatic) o.Listeners.Add(arm);
+            return o;
+        }
+        using (RocksDatabase db = RocksDatabase.Open(DbPath, OpenOpts(), cfo))
         {
             Fill(db, 100, "a");
             db.Flush();
             Fill(db, 100, "b");
             if (automatic)
             {
-                cmp.ThrowAfter = 600; // past the flush, inside the compaction it triggers
-                db.Flush();
+                arm.Armed = true;
+                try
+                {
+                    db.Flush(); // the second L0 file triggers the automatic compaction
+                }
+                catch (RocksDbException e) when (e.InnerException is RocksDbException { InnerException: HookException } || e.InnerException is HookException)
+                {
+                    // The flush wait can return the background error of the compaction it triggered when that compaction
+                    // fails first (WaitForFlushMemTables reports the background error, as upstream).
+                }
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 while (db.BackgroundError is null && sw.Elapsed < TimeSpan.FromSeconds(20)) Thread.Sleep(10);
+                arm.Armed = false;
+                cmp.Throw = false;
+                Assert.IsTrue(arm.Fired, "the compaction did not start");
             }
             else
             {
@@ -436,6 +457,22 @@ public sealed class Audit10ReadCustomizationTests
             AssertFilled(db, 100, "b");
             AssertOnlyLiveTableFiles(db, fs);
         }
+    }
+
+    /// <summary>Makes <see cref="ThrowingComparator"/> throw only while a compaction job runs (once armed).</summary>
+    private sealed class ArmDuringCompaction(ThrowingComparator cmp) : EventListener
+    {
+        public volatile bool Armed;
+        public volatile bool Fired;
+
+        public override void OnCompactionBegin(RocksDatabase? db, CompactionJobInfo info)
+        {
+            if (!Armed) return;
+            Fired = true;
+            cmp.Throw = true;
+        }
+
+        public override void OnCompactionCompleted(RocksDatabase? db, CompactionJobInfo info) => cmp.Throw = false;
     }
 
     /// <summary>
