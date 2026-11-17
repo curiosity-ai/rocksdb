@@ -197,6 +197,23 @@ public sealed partial class RocksDatabase
         }
     }
 
+    /// <summary>
+    /// The DB's last sequence number when the WAL now being written (<see cref="CurrentWalNumber"/>) became current:
+    /// every write logged to that WAL has a larger sequence number, also one that is not on disk yet
+    /// (<see cref="DbOptions.ManualWalFlush"/> keeps it buffered until <see cref="FlushWal"/>; until then the WAL holds
+    /// no record and <see cref="GetSortedWalFiles"/> does not list it). 0 when the instance writes no WAL. Managed (no
+    /// native counterpart); lets a replication source tell a start sequence that the current WAL can still deliver from
+    /// one whose WAL was purged.
+    /// </summary>
+    public ulong CurrentWalBaseSequence
+    {
+        get
+        {
+            _db.ThrowIfDisposed();
+            return _db.CurrentWalBaseSequence;
+        }
+    }
+
     /// <summary>The WAL currently being written (DB::GetCurrentWalFile).</summary>
     public WalFileInfo GetCurrentWalFile() => _db.GetCurrentWalFile();
 

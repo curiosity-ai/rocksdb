@@ -83,9 +83,12 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
   it, so only a single batch that is larger than the chunk size on its own makes a larger chunk. The bytes are a valid native `WriteBatch` (a test feeds them to a
   native rocksdb-sharp replica).
 * While the source is ahead of what its WAL can deliver (the iterator's `TryAgain`: `DisableWal` writes or ingested
-  files at the end of the log, `ManualWalFlush` data not flushed yet) the tailer waits. A damaged WAL record that nothing
-  readable follows throws `NotFound` once a fresh iterator finds the same damage (`TransactionLogIterator.
-  SkippedCorruptBytes`), and the hosts answer it with a resync, as they do for a gap.
+  files at the end of the log, `ManualWalFlush` data not flushed yet, a record being written) the tailer waits. A damaged
+  WAL record that nothing readable follows throws `NotFound` once a fresh iterator finds the same damage
+  (`TransactionLogIterator.SkippedCorruptBytes`: data the reader dropped, or complete records the WAL writer wrote that the
+  reader cannot get to - a damaged record of a recycled WAL, a record length past the end of the data), and the hosts
+  answer it with a resync, as they do for a gap. A start sequence above `RocksDatabase.CurrentWalBaseSequence` waits for
+  the current WAL even while it holds no record on disk; an older one whose WAL was purged is `NotFound` at once.
 * The replica inserts a chunk into its memtable with up to `ReplicationConsumer.ApplyParallelism` threads (default:
   processor count, at most 4; `WriteOptions.MemtableInsertParallelism`). A primary's concurrent writers insert their
   batches in parallel, so a replica inserting each merged chunk with one thread fell behind a primary writing 4 x

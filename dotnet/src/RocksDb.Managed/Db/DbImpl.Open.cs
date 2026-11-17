@@ -374,6 +374,7 @@ internal sealed partial class DbImpl
             // get recycled otherwise (min_wal_number_to_recycle_).
             _minWalNumberToRecycle = newLogNumber;
             _logNumber = newLogNumber;
+            _currentWalBaseSequence = Versions.LastSequence;
             _walTrackingStart = newLogNumber;
             _aliveWals.Add(newLogNumber);
         }

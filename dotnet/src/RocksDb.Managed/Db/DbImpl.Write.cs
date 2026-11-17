@@ -59,6 +59,14 @@ internal sealed partial class DbImpl
     private long _walsTotalSize;
     /// <summary>Sizes of alive WALs other than the current one (alive_wal_files_ entries). Guarded by the mutex.</summary>
     private readonly Dictionary<ulong, long> _aliveWalSizes = new();
+    /// <summary>
+    /// Alive WALs closed by this instance: the file offset of the end of the last complete record their writer pushed to
+    /// the file (<see cref="Wal.LogWriter.FlushedRecordEnd"/> at the switch). See <see cref="WalWrittenEnd"/>. Guarded by
+    /// the mutex.
+    /// </summary>
+    private readonly Dictionary<ulong, long> _closedWalWrittenEnds = new();
+    /// <summary>The last sequence number when the current WAL became current (see <see cref="CurrentWalBaseSequence"/>). Guarded by the mutex.</summary>
+    private ulong _currentWalBaseSequence;
     /// <summary>alive_wal_files_.begin()->getting_flushed: the oldest WAL a SwitchWAL already asked to flush. Leader-only.</summary>
     private ulong _walGettingFlushed;
     // Cached IsWriteStalled() (recomputed under the mutex whenever memtable counts change) so that the common,
@@ -1387,9 +1395,13 @@ internal sealed partial class DbImpl
             if (newLog is not null)
             {
                 if (_logNumber != 0) _aliveWalSizes[_logNumber] = _currentWalSize;
+                // The closed WAL's buffer was written out above: what WAL tailing may expect to read from it.
+                if (_logNumber != 0 && _log is not null) _closedWalWrittenEnds[_logNumber] = _log.FlushedRecordEnd;
                 _currentWalSize = 0;
                 _log = newLog;
                 _logNumber = newLogNumber;
+                // Every write logged to the new WAL gets a sequence number above this (the write thread is held).
+                _currentWalBaseSequence = Versions.LastSequence;
                 _logEmpty = true;
                 _walDirSynced = false;
                 _aliveWals.Add(newLogNumber);

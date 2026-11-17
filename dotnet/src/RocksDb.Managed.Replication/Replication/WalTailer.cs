@@ -302,11 +302,17 @@ public sealed class WalTailer : IDisposable
     /// <summary>
     /// Before the first batch: the database is at or past the requested sequence but the iterator found nothing. If no
     /// WAL can contain it any more (all purged, or the oldest starts later), report NotFound now instead of waiting for
-    /// a later write to reveal the gap.
+    /// a later write to reveal the gap. The current WAL can still deliver any sequence above
+    /// <see cref="RocksDatabase.CurrentWalBaseSequence"/>, also while it holds no record on disk (manual_wal_flush keeps
+    /// it buffered; the listing skips empty WALs, WalManager::GetSortedWalsOfType): such a start waits instead.
     /// </summary>
     private void ThrowIfStartPurged()
     {
         if (!HasUpdates) return;
+        // Read before the listing: a WAL switch in between writes the old WAL's buffer out before the base moves, so
+        // the listing then shows the old WAL with its first record.
+        ulong currentBase = _db.CurrentWalBaseSequence;
+        if (_db.CurrentWalNumber != 0 && _nextSequenceNumber > currentBase) return;
         IReadOnlyList<WalFileInfo> files = _db.GetSortedWalFiles();
         foreach (WalFileInfo f in files)
         {
