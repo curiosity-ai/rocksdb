@@ -606,18 +606,23 @@ internal sealed partial class DbImpl
         // FlushWAL only takes wal_write_mutex_). The WAL I/O lock excludes the other users of the WAL, and UnlockWAL
         // takes it too: the write stop is still held if the WAL is still locked once this call has the lock.
         WriteThread.Writer? w = null;
+        // The WAL I/O lock and the write queue are waited for by synchronous writers too: take them and do the I/O
+        // synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call moves to a write
+        // wake-up thread first.
+        bool exclusive = LeadsSynchronously(synchronous);
+        if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
         while (true)
         {
             if (IsWalLocked)
             {
-                await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+                await AcquireWalIoLockAsync(exclusive).ConfigureAwait(false);
                 if (IsWalLocked) break;
                 ReleaseWalIoLock(); // unlocked meanwhile: go through the write thread
             }
             else
             {
-                w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
-                await AcquireWalIoLockAsync(synchronous).ConfigureAwait(false);
+                w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+                await AcquireWalIoLockAsync(exclusive).ConfigureAwait(false);
                 break;
             }
         }
@@ -627,7 +632,7 @@ internal sealed partial class DbImpl
         {
             LogWriter? log = _log;
             if (log is null) return;
-            if (synchronous)
+            if (exclusive)
             {
                 log.WriteBuffer();
                 if (sync)
@@ -677,7 +682,9 @@ internal sealed partial class DbImpl
         finally
         {
             ReleaseWalIoLock();
-            if (w is not null) ExitUnbatched(w, synchronous);
+            if (w is not null) ExitUnbatched(w, exclusive);
+            // Back to the thread pool before the caller resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
         }
     }
 }

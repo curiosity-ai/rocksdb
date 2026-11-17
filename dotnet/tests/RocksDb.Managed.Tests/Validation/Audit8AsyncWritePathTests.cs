@@ -338,7 +338,9 @@ public sealed class Audit8AsyncWritePathTests
             await Task.WhenAll(asyncWriters).WaitAsync(TimeSpan.FromSeconds(40));
             foreach (Thread thread in syncWriters) Assert.IsTrue(thread.Join(TimeSpan.FromSeconds(40)), "a synchronous writer hangs");
             Assert.IsTrue(syncErrors.IsEmpty, syncErrors.TryPeek(out Exception? se) ? se.ToString() : null);
-            Assert.IsTrue(Volatile.Read(ref fs.AsyncCompletions) > 0, "the asynchronous writers never went asynchronous");
+            // Audit #12: once the DB has synchronous writers, asynchronous leaders do their WAL I/O synchronously too (see
+            // Audit12SyncAsyncWriteTests), so the asynchronous writers may never reach an asynchronous file member here.
+            Assert.IsFalse(acknowledged.IsEmpty, "no write was acknowledged");
             AssertNoViolations(fs);
         }
         finally

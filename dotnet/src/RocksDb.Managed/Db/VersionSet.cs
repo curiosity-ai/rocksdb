@@ -504,6 +504,10 @@ internal sealed class VersionSet : IAsyncDisposable
         // MANIFEST I/O below runs to completion: a record cancelled after it reached the file (and the closing writer
         // flushes it) would commit an edit the caller was told did not happen, e.g. a column family that only a reopen
         // finds. Native's LogAndApply cannot be interrupted either.
+        // The MANIFEST writer slot is waited for by synchronous writers too (background flushes and compactions, which
+        // write stalls wait for; memtable switches of a write leader): once the DB has synchronous writers, an async
+        // caller holds it synchronously, so that no such wait depends on a .NET thread-pool thread (DbImpl.LeadsSynchronously).
+        synchronous = _db.LeadsSynchronously(synchronous);
         if (synchronous) _manifestLock.Wait(cancellationToken);
         else await _manifestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try

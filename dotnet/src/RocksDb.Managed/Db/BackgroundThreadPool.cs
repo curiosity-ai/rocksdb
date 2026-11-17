@@ -36,6 +36,12 @@ internal sealed class BackgroundThreadPool
     /// <summary>Env::Priority::BOTTOM: compactions forwarded to the bottom-priority pool.</summary>
     public static readonly BackgroundThreadPool Bottom = new("rocksdb:bottom");
 
+    /// <summary>
+    /// Not an Env pool: the wake-ups of asynchronous write leaders in a DB that also has synchronous writers
+    /// (<see cref="WriteThread.WakeupThreads"/>), so that synchronous writers never wait for the .NET thread pool.
+    /// </summary>
+    public static readonly BackgroundThreadPool WriteWakeup = new("rocksdb:write", spinBeforeWait: true);
+
     /// <summary>How long a thread above the kept count waits for work before it exits.</summary>
     internal static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(30);
 
@@ -50,7 +56,21 @@ internal sealed class BackgroundThreadPool
     private int _keep;         // threads kept alive while idle, guarded by _lock
     private int _nextId;
 
-    private BackgroundThreadPool(string name) => _name = name;
+    private BackgroundThreadPool(string name, bool spinBeforeWait = false)
+    {
+        _name = name;
+        _spinBeforeWait = spinBeforeWait;
+    }
+
+    /// <summary>
+    /// An idle thread spins briefly (outside the lock) before it blocks: for work items on a latency-critical path
+    /// (<see cref="WriteWakeup"/>: the hand-off of a write group's leadership), where a blocked thread's wake-up would add
+    /// the latency of a futex wake-up and a reschedule to every hand-off.
+    /// </summary>
+    private readonly bool _spinBeforeWait;
+
+    /// <summary>Items in <see cref="_queue"/>, readable without the lock (a hint for spinning threads).</summary>
+    private int _queued;
 
     /// <summary>Live threads of the pool (tests and diagnostics).</summary>
     internal int ThreadCount
@@ -93,6 +113,7 @@ internal sealed class BackgroundThreadPool
         lock (_lock)
         {
             _queue.Enqueue(work);
+            Volatile.Write(ref _queued, _queue.Count);
             // Every idle thread takes one item when it wakes: start a thread for the items no idle thread will take.
             if (_idle >= _queue.Count)
             {
@@ -176,8 +197,14 @@ internal sealed class BackgroundThreadPool
         public void Execute() => continuation();
     }
 
+    [ThreadStatic] private static BackgroundThreadPool? t_current;
+
+    /// <summary>The pool whose thread runs the caller (null on any other thread).</summary>
+    internal static BackgroundThreadPool? Current => t_current;
+
     private void WorkerLoop()
     {
+        t_current = this;
         while (true)
         {
             IThreadPoolWorkItem? work;
@@ -186,6 +213,20 @@ internal sealed class BackgroundThreadPool
                 while (!_queue.TryDequeue(out work))
                 {
                     _idle++;
+                    if (_spinBeforeWait)
+                    {
+                        // Counted idle while spinning: an item scheduled meanwhile is taken by this thread (or by a
+                        // thread the pulse wakes), never left queued.
+                        Monitor.Exit(_lock);
+                        long spinEnd = System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency / 10_000; // 100 us
+                        while (Volatile.Read(ref _queued) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() < spinEnd) Thread.SpinWait(20);
+                        Monitor.Enter(_lock);
+                        if (_queue.Count > 0)
+                        {
+                            _idle--;
+                            continue;
+                        }
+                    }
                     bool signaled = Monitor.Wait(_lock, IdleTimeout);
                     _idle--;
                     if (!signaled && _queue.Count == 0 && _threads > _keep)
@@ -194,6 +235,7 @@ internal sealed class BackgroundThreadPool
                         return;
                     }
                 }
+                Volatile.Write(ref _queued, _queue.Count);
             }
             try
             {

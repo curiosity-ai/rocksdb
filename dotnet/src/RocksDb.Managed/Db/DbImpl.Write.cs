@@ -190,25 +190,31 @@ internal sealed partial class DbImpl
                 }
                 Debug.Assert(state == WriteThread.StateGroupLeader);
             }
-            ValueTask<int> lead = LeadWriteGroup(w, synchronous, cancellationToken);
             int leadState;
             if (synchronous)
             {
+                ValueTask<int> lead = LeadWriteGroup(w, synchronous: true, cancellationToken);
                 Debug.Assert(lead.IsCompleted);
                 leadState = SyncValueTask.GetResult(lead);
             }
             else
             {
-                leadState = await lead.ConfigureAwait(false);
+                bool leadSync = LeadsSynchronously(synchronous: false);
+                if (MovesToWakeupThreadToLead(w, leadSync)) await WriteThread.WakeupThreads.SwitchTo();
+                leadState = await LeadWriteGroup(w, leadSync, cancellationToken).ConfigureAwait(false);
             }
             if (leadState == WriteThread.StateParallelMemtableWriter)
             {
-                // The leader launched a parallel memtable group: insert its own batch, then wait for the others.
+                // The leader launched a parallel memtable group: insert its own batch, then wait for the others. (Not
+                // for an asynchronous leader that leads synchronously: its group is inserted serially, see
+                // CanInsertInParallel.)
                 ParallelMemTableInsert(w);
                 if (CompleteParallelMemTableWriter()) FinishParallelGroup(w);
                 else if (synchronous) w.WaitSync();
                 else await w.WaitAsync().ConfigureAwait(false);
             }
+            // Woken on a write wake-up thread to lead: back to the thread pool before the caller's code resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await w.ResumeOnThreadPool();
             if (w.Error is { } err) ThrowWriteError(err);
         }
         finally
@@ -279,15 +285,17 @@ internal sealed partial class DbImpl
             if (!_writeThread.JoinBatchGroup(w)) state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             if (state == WriteThread.StateGroupLeader)
             {
-                ValueTask<int> lead = LeadWriteGroup(w, synchronous, cancellationToken);
                 if (synchronous)
                 {
+                    ValueTask<int> lead = LeadWriteGroup(w, synchronous: true, cancellationToken);
                     Debug.Assert(lead.IsCompleted);
                     state = SyncValueTask.GetResult(lead);
                 }
                 else
                 {
-                    state = await lead.ConfigureAwait(false);
+                    bool leadSync = LeadsSynchronously(synchronous: false);
+                    if (MovesToWakeupThreadToLead(w, leadSync)) await WriteThread.WakeupThreads.SwitchTo();
+                    state = await LeadWriteGroup(w, leadSync, cancellationToken).ConfigureAwait(false);
                 }
                 // 0: linked behind earlier memtable writers; wait for our turn.
                 if (state == 0) TestHooks.Invoke("DBImpl::PipelinedWriteImpl:WaitForMemTableWriterLeader");
@@ -301,6 +309,9 @@ internal sealed partial class DbImpl
                 else state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             }
             Debug.Assert(state is WriteThread.StateCompleted or WriteThread.StateParallelMemtableWriter);
+            // Woken on a write wake-up thread to lead a WAL or memtable group: back to the thread pool before the caller's
+            // code resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await w.ResumeOnThreadPool();
             if (w.Error is { } err) ThrowWriteError(err);
         }
         finally
@@ -421,6 +432,9 @@ internal sealed partial class DbImpl
         {
             // The DB was closed while this operation waited for its turn: the WAL and MANIFEST are gone.
             ExitUnbatched(w, synchronous);
+            // An asynchronous operation that moved to a write wake-up thread to lead (it entered synchronously): its
+            // caller must not resume there.
+            if (WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
             ThrowDisposed();
         }
         return w;
@@ -439,12 +453,14 @@ internal sealed partial class DbImpl
             int state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
             Debug.Assert(state == WriteThread.StateGroupLeader);
         }
-        if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
-        if (_twoWriteQueues) await EnterNonMemUnbatchedAsync(synchronous).ConfigureAwait(false);
+        // The waits of a leader: synchronous once the DB has synchronous writers (see LeadsSynchronously).
+        bool exclusive = LeadsSynchronously(synchronous);
+        if (_pipelined) await WaitForMemTableWritersAsync(exclusive).ConfigureAwait(false);
+        if (_twoWriteQueues) await EnterNonMemUnbatchedAsync(exclusive).ConfigureAwait(false);
         // WaitForPendingWrites (unordered_write): the writers that already wrote the WAL finish their memtable inserts.
         // Upstream waits at the callers of EnterUnbatched that switch or inspect the memtables (flush, ingestion, column
         // family drop, error recovery); waiting for every unbatched operation is at least as strict.
-        ValueTask pending = WaitForPendingWritesAsync(synchronous);
+        ValueTask pending = WaitForPendingWritesAsync(exclusive);
         if (!pending.IsCompletedSuccessfully) await pending.ConfigureAwait(false);
         return w;
     }
@@ -456,6 +472,31 @@ internal sealed partial class DbImpl
     }
 
     // ---- leader -----------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Whether a writer leading a write group, a memtable group or an unbatched operation does that work synchronously
+    /// on its current thread (synchronous WAL / MANIFEST I/O, stall waits, lock waits): always a synchronous writer, and
+    /// an asynchronous one once the DB has synchronous writers (<see cref="WriteThread.SyncWriterJoined"/>). Other writers
+    /// queue behind a leader, and synchronous ones block their thread meanwhile: if the leader's work continued on the
+    /// .NET thread pool (an I/O or a stall wait that completes asynchronously), synchronous writers occupying the pool's
+    /// threads would wait for a thread that never comes (a capped pool deadlocks, the default pool stalls until it
+    /// injects threads). Only that part runs synchronously: asynchronous writers still wait for their turn without
+    /// blocking a thread, and a DB without synchronous writers is unchanged.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool LeadsSynchronously(bool synchronous) => synchronous || _writeThread.SyncWriterJoined;
+
+    /// <summary>
+    /// Whether an asynchronous writer about to lead synchronously (<paramref name="leadSync"/>, see
+    /// <see cref="LeadsSynchronously"/>) on its caller's thread first moves to a write wake-up thread (in the frame of
+    /// the write method, which then continues there): when the lead is likely to wait for a write stall (delayed or
+    /// stopped writes, a write buffer manager stall), so that an asynchronous call does not block its caller for a stall
+    /// whose end may depend on the caller (it may hold the WAL lock, or be about to close the DB). A stall that begins
+    /// between this check and the leader's PreprocessWrite blocks the caller's thread for that stall. Without synchronous
+    /// writers, an asynchronous leader awaits stalls without holding a thread.
+    /// </summary>
+    private bool MovesToWakeupThreadToLead(WriteThread.Writer w, bool leadSync) =>
+        leadSync && !w.NoSlowdown && (_maybeStalled || WriteBufferManager is { Enabled: true } wbm && wbm.ShouldStall()) && !WriteThread.OnWakeupThread;
 
     /// <summary><see cref="LeadWriteGroupAsync"/> with the leader's own reusable state machine box.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1009,15 +1050,21 @@ internal sealed partial class DbImpl
     /// Whether the group's memtable inserts run in parallel (DBImpl::WriteImpl: allow_concurrent_memtable_write, more
     /// than one writer, no merge operands; like upstream, for groups of any size). Transaction writes (callbacks, separate
     /// memtable batches, prepared sections, sequence-per-batch), excluded writers and blob direct write rewrites keep the
-    /// serial path.
+    /// serial path, and so does a group with an asynchronous writer once the DB has synchronous writers
+    /// (<see cref="WriteThread.SyncWriterJoined"/>; a deviation in who inserts, not in what is inserted or published).
     /// </summary>
     private bool CanInsertInParallel(List<WriteThread.Writer> group, int valid, ulong total)
     {
         if (!_allowConcurrentMemtableWrite || group.Count < 2 || valid != group.Count || _seqPerBatch || _bdwSwapped.Count > 0) return false;
+        bool syncWriters = _writeThread.SyncWriterJoined;
         for (int i = 0; i < group.Count; i++)
         {
             WriteThread.Writer w = group[i];
             if (w.Txn is not null || w.Batch!.HasMerge) return false;
+            // An asynchronous writer's own insert would be a thread-pool continuation that the group's exit, and the
+            // synchronous writers waiting for it, depend on (see WriteThread.SyncWriterJoined): its group is inserted
+            // serially by the leader instead.
+            if (syncWriters && !w.IsSyncWaiter) return false;
         }
         return true;
     }

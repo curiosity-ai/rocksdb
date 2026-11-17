@@ -29,7 +29,11 @@ internal sealed partial class DbImpl
         {
             // NOTE (upstream): this will "unnecessarily" wait for other non-LockWAL() write stalls to clear before
             // LockWAL returns.
-            WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+            // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+            // moves to a write wake-up thread first, so that it never blocks its caller.
+            bool exclusive = LeadsSynchronously(synchronous);
+            if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+            WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
             try
             {
                 lock (_mutex)
@@ -44,7 +48,9 @@ internal sealed partial class DbImpl
             }
             finally
             {
-                ExitUnbatched(w, synchronous);
+                ExitUnbatched(w, exclusive);
+                // Back to the thread pool before the caller resumes.
+                if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
             }
         }
         try

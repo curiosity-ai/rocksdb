@@ -143,13 +143,15 @@ Async calls complete synchronously when nothing has to wait (memtable and block-
 `preadv2(RWF_NOWAIT)` on Linux), so they cost about as much as the sync calls. A synchronous writer that becomes the
 write-group leader does the WAL I/O on its own thread.
 
-> **Use either the sync or the async API on a database, not both.** Writes are group-committed: one writer (the leader)
-> writes the WAL and memtable for every writer queued behind it. A sync writer (`Put`, `Write`, ...) waits for its
-> leader by blocking its thread. If that leader is an async writer (`PutAsync`, `WriteAsync`, ...) whose WAL write or
-> write-stall wait does not complete inline, the rest of the leader's work runs on the .NET thread pool, so blocked sync
-> writers that occupy pool threads (e.g. sync `Put` calls from ASP.NET request handlers) can starve it: the writes stall
-> until the pool injects threads, or deadlock under a capped pool. All-sync and all-async use are not affected. The sync
-> write methods may be deprecated and removed in a future version; new code should use the async API.
+Sync and async calls can be mixed freely on one database, also from thread-pool threads (e.g. sync `Put` calls from
+ASP.NET request handlers next to `PutAsync` callers). Writes are group-committed and a sync writer blocks its thread
+until the writers ahead of it are done, so once a database has had a sync writer, async writers do the work other
+writers wait for (leading a write group: WAL I/O, write-stall waits) synchronously, on their own thread or on a
+dedicated wake-up thread, and never leave it to the .NET thread pool. In that mode an async call that leads a write
+group may block its caller for the group's WAL write (including the fsync of `Sync = true`). A database that only ever
+sees async writers is unchanged. One window remains: async I/O that was already in flight when the first sync writer
+arrived still completes on the thread pool, so with a capped pool (`ThreadPool.SetMaxThreads`) issue one sync write
+right after opening if sync and async writers will start together.
 
 ## API tour
 

@@ -447,7 +447,7 @@ internal sealed partial class DbImpl
             {
                 while (wc.NeedsDelay && System.Diagnostics.Stopwatch.GetTimestamp() < stallEnd)
                 {
-                    if (synchronous) Thread.Sleep(1);
+                    if (synchronous) SleepForDelay(cancellationToken);
                     else await Task.Delay(1, cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -487,6 +487,22 @@ internal sealed partial class DbImpl
                 stallThread.EndWriteStall();
             }
         }
+    }
+
+    /// <summary>
+    /// One kDelayInterval step of a synchronous DelayWrite. Observes <paramref name="cancellationToken"/> like the
+    /// asynchronous step (Task.Delay): an asynchronous write that leads synchronously (<see cref="LeadsSynchronously"/>)
+    /// can still be canceled while it is delayed. Synchronous writes pass none.
+    /// </summary>
+    private static void SleepForDelay(CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+        {
+            Thread.Sleep(1);
+            return;
+        }
+        cancellationToken.WaitHandle.WaitOne(1);
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     // ---------------------------------------------------------------------------------------------------------

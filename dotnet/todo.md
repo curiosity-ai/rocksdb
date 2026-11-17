@@ -451,7 +451,7 @@ Still open from this round:
 - [x] Transactions: range lock granted during cancellation released; lock timeouts beyond 24.8 days
 - [x] Sync/async parity differential tests for writes, reads, iterators, transactions, backup, control APIs; public async surface inventory test
 - [x] A throwing `UserWriteCallback` (OnWriteEnqueued / OnWalWriteFinish) fails safely: hard background error, caller gets the exception, Resume() recovers (deliberate deviation; upstream: undefined behaviour)
-- [x] Sync writers behind an async leader depend on a thread-pool continuation: documented as a usage rule (never mix sync and async on one DB; sync write methods to be deprecated), repro stays ignored
+- [x] Sync writers behind an async leader depend on a thread-pool continuation: fixed in audit #12 (mixed sync/async writers supported; usage rule and deprecation notice removed)
 - [x] `AsyncPrefetchBuffer.TakePending` blocked on a pool continuation without `Prefetch` support: synchronous readahead (audit #11)
 
 ## Audit #9 (2026-11-16; docs/validation.md "Audit #9: opening and closing the DB")
@@ -471,8 +471,6 @@ Still open from this round:
 - [x] Custom filter policy reusing the built-in compatibility name gets its own reader, as upstream (audit #11)
 - [ ] Failed background compaction output possibly kept until the next open (unconfirmed)
 
-- [ ] Deprecate, then remove, the synchronous write methods (follows from the sync/async mixing rule, audit #8)
-
 ## Audit #11 (2026-11-17; docs/validation.md "Audit #11")
 
 - [x] ShouldMerge, max_successive_merges (+ strict), input_table_properties, custom filter readers, listener callbacks (subcompaction, pre-commit, creation started, manual flush scheduled, blob files, file I/O)
@@ -481,3 +479,8 @@ Still open from this round:
 - [x] Compaction / auto readahead without Prefetch support reads synchronously
 - [x] WAL tailer: fresh tailer at a manual_wal_flush-buffered start; recycled-WAL damage and a length past the written end escalate (writer flushed-record-end mark)
 - [ ] Future: listener `OnBackgroundJobPressureChanged` (experimental upstream); blob direct-write `OnBlobFileCreationStarted` / `OnBlobFileCreated`; file I/O notifications for `SstFileWriter` / `SstFileReader` (needs a listener list on their options)
+
+## Audit #12 (2026-11-17; docs/validation.md "Audit #12: mixed sync and async writers")
+
+- [x] Sync writers never wait for thread-pool work behind async writers once the DB has had a sync writer: synchronous leading, write wake-up threads, serial inserts for mixed groups, async unbatched operations on wake-up threads; every write mode tested with a dead pool
+- [ ] First-sync-writer window: async work in flight when the mode is entered still completes on the pool (capped pool can deadlock once per DB; workaround: one sync write after open)

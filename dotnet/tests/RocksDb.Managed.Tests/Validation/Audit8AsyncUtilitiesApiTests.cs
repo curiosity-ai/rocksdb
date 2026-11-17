@@ -980,8 +980,8 @@ public sealed class Audit8AsyncUtilitiesApiTests
 
     /// <summary>
     /// Pins (source inventory): every <c>await</c> in src/RocksDb.Managed configures the context (ConfigureAwait), except
-    /// the BackgroundThreadPool.SwitchTo awaitable, which moves to a pool thread by design. A missing one would make a
-    /// continuation post to the caller's SynchronizationContext.
+    /// the BackgroundThreadPool.SwitchTo awaitable and the WriteThread ResumeOnThreadPool awaitables (audit #12), which move to a
+    /// pool thread by design. A missing one would make a continuation post to the caller's SynchronizationContext.
     /// </summary>
     [TestMethod]
     public void Sources_EveryAwaitConfiguresTheContext()
@@ -1004,7 +1004,7 @@ public sealed class Audit8AsyncUtilitiesApiTests
                     else if (c is ';' or '{' or ',' && depth == 0) break;
                 }
                 string expr = code[(m.Index + m.Length)..j];
-                if (expr.Contains("ConfigureAwait", StringComparison.Ordinal) || expr.Trim() == "pool.SwitchTo()") continue;
+                if (expr.Contains("ConfigureAwait", StringComparison.Ordinal) || expr.Trim() is "pool.SwitchTo()" or "w.ResumeOnThreadPool()" or "WriteThread.ResumeOnThreadPoolAsync()" or "WriteThread.WakeupThreads.SwitchTo()") continue;
                 int line = 1 + text.AsSpan(0, m.Index).Count('\n');
                 missing.Add(Path.GetRelativePath(src, file) + ":" + line + ": await" + expr.Trim());
             }

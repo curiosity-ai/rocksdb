@@ -183,21 +183,45 @@ max_successive_merges (InvalidArgument at open); TransactionDB accepts it only f
 
 Followers wait in one of two ways:
 
-- **async writers** (`PutAsync`, `WriteAsync`) wait on a pooled `IValueTaskSource`
-  (`ManualResetValueTaskSourceCore`). Continuations run asynchronously, so they never run on the leader's thread.
+- **async writers** (`PutAsync`, `WriteAsync`) wait on the pooled writer itself, an `IValueTaskSource` with the
+  protocol of `ManualResetValueTaskSourceCore` whose completion decides where the continuation runs (the .NET thread
+  pool, or a write wake-up thread, see below). Continuations never run inline on the leader's thread.
 - **sync writers** (`Put`, `Write`) wait like upstream's `AwaitState`: a short busy spin, then (with
   `enable_write_thread_adaptive_yield`) `Thread.Yield` for up to `write_thread_max_yield_usec` while the yield credit
   says yielding pays off, then a blocking wait on a monitor that the waker only touches if the waiter registered as
   blocked (`STATE_LOCKED_WAITING`). A sync writer that becomes leader does the group's I/O on its own thread.
 
-**Do not mix sync and async writers on one database.** A sync follower blocks its thread until its leader completes the
-group. When the leader is an async writer whose WAL write (a truly asynchronous file system, `OffloadAsyncSync` with
-synced writes, very large batches) or stall wait (write controller, `WriteBufferManager`) does not complete inline, the
-leader's remaining work (memtable insert, waking the followers) is a thread-pool continuation. Sync followers that are
-themselves pool threads can then exhaust the pool: the group waits for the pool's thread injection, or deadlocks with a
-capped pool (`SyncWritersOnPoolThreadsBehindAnAsyncLeaderProgress`, ignored repro in `Audit8AsyncBackgroundIoTests`).
-Upstream has no such case: no async writers, no shared pool. Decision (2026-11-17): documented as a usage rule rather
-than fixed; the sync write methods are expected to be deprecated and removed, so new code should be async-only.
+**Mixed sync and async writers** (audit #12). A sync writer blocks its thread until the writers ahead of it are done,
+so nothing it waits for may need a .NET thread-pool thread: its own thread may be the pool's last one. Before audit #12
+an async leader's WAL write or stall wait that did not complete inline continued on the pool, and sync followers that
+were pool threads could exhaust it (stall until the pool injected threads, deadlock with a capped pool). Upstream has no
+such case: no async writers, no shared pool. Now `WriteThread.SyncWriterJoined` is set when the first sync writer
+(or sync unbatched operation) joins either write queue; it is shared by both queues of `two_write_queues` and never
+reset. From then on:
+
+- async writers that lead (a write group, a pipelined memtable group, an unbatched operation) do the leading work
+  synchronously (`DbImpl.LeadsSynchronously`): WAL I/O, stall waits, `WriteBufferManager` stalls, lock waits, the
+  memtable-writer and pending-write drains, the MANIFEST slot of `LogAndApply`;
+- an async writer woken to lead is woken on a write wake-up thread (`BackgroundThreadPool.WriteWakeup`, "rocksdb:write":
+  process-wide, starts a thread whenever none is idle, idle threads spin up to 100 us before blocking), and goes back to
+  the thread pool (`Writer.ResumeOnThreadPool`, no allocation) only after it released the leadership;
+- a group with an async writer is inserted serially by its leader instead of in parallel, and with `unordered_write`
+  the leader inserts its async followers' batches, so no insert another writer waits for is a pool continuation;
+- a leader likely to stall, and async operations that take the write queue (`FlushAsync`, column family create/drop,
+  ingestion, import, `LockWalAsync`, `FlushWalAsync`, `SyncWalAsync`, `ResumeAsync`, the `WriteBufferManager` flush
+  coordinator) move to a wake-up thread first, so the async caller is not blocked for the wait.
+
+Async writers still wait as followers without holding a thread. Thread changes happen in the frame of the method that
+holds the leadership: a continuation registered after the awaited task completed is queued to the pool by the runtime,
+which is only safe once the leadership is released. Group-commit semantics (order, sequence numbers, WAL records,
+callbacks) are unchanged; only who inserts and on which thread differ. A DB with only async writers is unchanged.
+Residuals: async I/O, stall waits or pool wake-ups already started when the first sync writer joins still finish on the
+pool (one window per DB; a capped pool can deadlock there, the default pool only slows down; one sync write after open
+avoids it); in mixed mode an async leader may block its caller for the group's synchronous WAL write; a stall that
+begins between the "likely to stall" check and `PreprocessWrite` blocks the async caller's thread for that stall; close
+(`DisposeAsync`) is unchanged, so sync writes racing it wait for the pool before failing with ObjectDisposed. Tests:
+`Audit12SyncAsyncWriteTests` (every write mode with every pool worker blocked, per-test deadlines, a seeded mixed
+program compared with the all-sync run).
 
 "Unbatched" writers (memtable switches and other exclusive operations) form a group of their own. Write stalls and
 delayed writes (`Db/Compaction/WriteController.cs`) delay the leader with a token bucket, as upstream does.

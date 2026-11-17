@@ -143,7 +143,11 @@ internal sealed partial class DbImpl
             await Versions.LogAndApplyAsync(cfd, dummy, synchronous, ct).ConfigureAwait(false);
 
             // Stop writes to the DB by entering the write thread(s).
-            WriteThread.Writer w = await EnterUnbatchedAsync(synchronous, ct).ConfigureAwait(false);
+            // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
+            // moves to a write wake-up thread first, so that it never blocks its caller.
+            bool exclusive = LeadsSynchronously(synchronous);
+            if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
+            WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
             BeginIngestion();
             try
             {
@@ -154,7 +158,7 @@ internal sealed partial class DbImpl
                 TestHooks.Invoke("DBImpl::CreateColumnFamilyWithImport:BeforeLogAndApply");
                 try
                 {
-                    await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
+                    await Versions.LogAndApplyAsync(cfd, edit, exclusive, ct).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -178,7 +182,9 @@ internal sealed partial class DbImpl
             finally
             {
                 EndIngestion();
-                ExitUnbatched(w, synchronous);
+                ExitUnbatched(w, exclusive);
+                // Back to the thread pool before the caller resumes.
+                if (!synchronous && WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
             }
         }
         finally

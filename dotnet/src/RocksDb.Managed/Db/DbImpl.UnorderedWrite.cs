@@ -57,30 +57,38 @@ internal sealed partial class DbImpl
         w.UserCallback = userCallback;
         try
         {
+            bool leads = true;
             if (!_writeThread.JoinBatchGroup(w))
             {
                 int state = synchronous ? w.WaitSync() : await w.WaitAsync().ConfigureAwait(false);
                 Debug.Assert(state is WriteThread.StateCompleted or WriteThread.StateGroupLeader);
-                if (state == WriteThread.StateGroupLeader)
+                leads = state == WriteThread.StateGroupLeader;
+            }
+            if (leads)
+            {
+                if (synchronous)
                 {
-                    ValueTask lead = LeadUnorderedWalGroupAsync(w, synchronous, cancellationToken);
-                    if (synchronous) SyncValueTask.GetResult(lead);
-                    else await lead.ConfigureAwait(false);
+                    ValueTask lead = LeadUnorderedWalGroupAsync(w, synchronous: true, cancellationToken);
+                    Debug.Assert(lead.IsCompleted);
+                    SyncValueTask.GetResult(lead);
+                }
+                else
+                {
+                    bool leadSync = LeadsSynchronously(synchronous: false);
+                    if (MovesToWakeupThreadToLead(w, leadSync)) await WriteThread.WakeupThreads.SwitchTo();
+                    await LeadUnorderedWalGroupAsync(w, leadSync, cancellationToken).ConfigureAwait(false);
                 }
             }
-            else
-            {
-                ValueTask lead = LeadUnorderedWalGroupAsync(w, synchronous, cancellationToken);
-                if (synchronous) SyncValueTask.GetResult(lead);
-                else await lead.ConfigureAwait(false);
-            }
-            // The group counted this writer in pending_memtable_writes_ iff it should write to the memtables; nothing
-            // touches the writer between the end of the group and here.
-            if (w.ShouldWriteToMemtable)
+            // The group counted this writer in pending_memtable_writes_ iff it should write to the memtables and its
+            // leader did not insert the batch on its behalf; nothing touches the writer between the end of the group and
+            // here.
+            if (w.ShouldWriteToMemtable && !w.InsertedByLeader)
             {
                 TestHooks.Invoke("DBImpl::WriteImpl:BeforeUnorderedWriteMemtable");
                 UnorderedWriteMemtable(w);
             }
+            // Woken on a write wake-up thread to lead: back to the thread pool before the caller's code resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await w.ResumeOnThreadPool();
             if (w.Error is { } err) ThrowWriteError(err);
         }
         finally
@@ -123,9 +131,24 @@ internal sealed partial class DbImpl
             }
             RecordWriteGroup(group, total, walRecordBytes, !leader.DisableWal, needSync);
             int memtableWriters = 0;
+            // Once the DB has synchronous writers, the leader inserts the batches of the group's other asynchronous
+            // writers itself (on its thread, after the publication, like their own inserts would): their own inserts
+            // would be thread-pool continuations that a later memtable switch or unbatched operation waits for
+            // (WaitForPendingWrites), possibly in a synchronous writer. A deviation in who inserts, not in what.
+            bool insertForAsyncWriters = _writeThread.SyncWriterJoined;
             for (int i = 0; i < group.Count; i++)
             {
-                if (group[i].ShouldWriteToMemtable) memtableWriters++;
+                WriteThread.Writer m = group[i];
+                if (!m.ShouldWriteToMemtable) continue;
+                if (insertForAsyncWriters && m != leader && !m.IsSyncWaiter)
+                {
+                    m.InsertedByLeader = true;
+                    UnorderedInsert(m);
+                }
+                else
+                {
+                    memtableWriters++;
+                }
             }
             // Counted before leadership is handed on: the next leader's WaitForPendingWrites sees them.
             if (memtableWriters > 0) Interlocked.Add(ref _pendingMemtableWrites, memtableWriters);
@@ -153,26 +176,7 @@ internal sealed partial class DbImpl
     {
         try
         {
-            TransactionWriteContext? t = w.Txn;
-            WriteBatch mb = w.MemtableBatch;
-            var inserter = MemTableInserter.ForConcurrentWriter(this, w.IgnoreMissingColumnFamilies);
-            inserter.Sequence = _seqPerBatch ? t!.SequenceUsed : mb.Sequence;
-            if (_seqPerBatch) mb.Sequence = inserter.Sequence;
-            inserter.LogRef = t?.LogRef ?? 0;
-            inserter.SetProtection(mb);
-            try
-            {
-                inserter.Run(mb.Data);
-            }
-            catch (Exception e)
-            {
-                w.Error = e;
-            }
-            finally
-            {
-                inserter.PostProcess();
-            }
-            if (w.DisableWal) Volatile.Write(ref _hasUnpersistedData, true);
+            UnorderedInsertBatch(w);
         }
         finally
         {
@@ -180,6 +184,41 @@ internal sealed partial class DbImpl
         }
         // WriteStatusCheck(w.status)
         if (w.Error is { } error) UnorderedWriteStatusCheck(error);
+    }
+
+    /// <summary>
+    /// <see cref="UnorderedWriteMemtable"/> run by the group's leader for <paramref name="w"/>, which was not counted in
+    /// pending_memtable_writes_ (the leader still holds the write queue, so nothing waits for the insert).
+    /// </summary>
+    private void UnorderedInsert(WriteThread.Writer w)
+    {
+        UnorderedInsertBatch(w);
+        if (w.Error is { } error) UnorderedWriteStatusCheck(error);
+    }
+
+    /// <summary>The insert of <see cref="UnorderedWriteMemtable"/>: a failure is recorded on the writer.</summary>
+    private void UnorderedInsertBatch(WriteThread.Writer w)
+    {
+        TransactionWriteContext? t = w.Txn;
+        WriteBatch mb = w.MemtableBatch;
+        var inserter = MemTableInserter.ForConcurrentWriter(this, w.IgnoreMissingColumnFamilies);
+        inserter.Sequence = _seqPerBatch ? t!.SequenceUsed : mb.Sequence;
+        if (_seqPerBatch) mb.Sequence = inserter.Sequence;
+        inserter.LogRef = t?.LogRef ?? 0;
+        inserter.SetProtection(mb);
+        try
+        {
+            inserter.Run(mb.Data);
+        }
+        catch (Exception e)
+        {
+            w.Error = e;
+        }
+        finally
+        {
+            inserter.PostProcess();
+        }
+        if (w.DisableWal) Volatile.Write(ref _hasUnpersistedData, true);
     }
 
     /// <summary>Port of DBImpl::WriteStatusCheck for a failed unordered memtable insert (failure path only).</summary>

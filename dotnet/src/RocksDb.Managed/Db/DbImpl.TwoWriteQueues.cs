@@ -132,16 +132,20 @@ internal sealed partial class DbImpl
                 }
                 Debug.Assert(state == WriteThread.StateGroupLeader);
             }
-            ValueTask lead = LeadWalOnlyGroupAsync(w, synchronous, cancellationToken);
             if (synchronous)
             {
+                ValueTask lead = LeadWalOnlyGroupAsync(w, synchronous: true, cancellationToken);
                 Debug.Assert(lead.IsCompleted);
                 SyncValueTask.GetResult(lead);
             }
             else
             {
-                await lead.ConfigureAwait(false);
+                bool leadSync = LeadsSynchronously(synchronous: false);
+                if (MovesToWakeupThreadToLead(w, leadSync)) await WriteThread.WakeupThreads.SwitchTo();
+                await LeadWalOnlyGroupAsync(w, leadSync, cancellationToken).ConfigureAwait(false);
             }
+            // Woken on a write wake-up thread to lead: back to the thread pool before the caller's code resumes.
+            if (!synchronous && WriteThread.OnWakeupThread) await w.ResumeOnThreadPool();
             if (w.Error is { } err) ThrowWriteError(err);
         }
         finally
