@@ -484,3 +484,17 @@ Still open from this round:
 
 - [x] Sync writers never wait for thread-pool work behind async writers once the DB has had a sync writer: synchronous leading, write wake-up threads, serial inserts for mixed groups, async unbatched operations on wake-up threads; every write mode tested with a dead pool
 - [ ] First-sync-writer window: async work in flight when the mode is entered still completes on the pool (capped pool can deadlock once per DB; workaround: one sync write after open)
+
+## Audit #13 (2026-11-23; docs/validation.md "Audit #13: multi-threading")
+
+- [x] unordered_write: stale "pending writes drained" wake-up released a memtable switch / close under an insert in flight
+- [x] Locks of a prepared expirable transaction could be stolen
+- [x] Point reads racing close read through disposed table readers (readers now close with the last super version)
+- [x] WriteUnprepared + two_write_queues: transaction did not read its own unprepared batches
+- [x] WAL tailers not woken when an unbatched operation publishes WAL-only sequence numbers
+- [x] `PrimaryWriteGate`: two concurrent holds lost a wake-up; obsolete super version left in a shared processor slot; second commit write of two-queue transactions cancellable; cancel under the DB mutex; persistent cache I/O error filters
+- [ ] Close does not wait for foreground purges or an SstFileManager / manual recovery (CloseHelper waits on both upstream)
+- [ ] Background job accounting on unexpected exception types; write wake-up thread start failure while leading
+- [ ] Thread-pool dependent sync waits left: `Dispose` on auto recovery, parallel backup, OCC parallel validation behind an async commit
+- [ ] HyperClock automatic table: eviction callbacks inside the mutator gate; `BlockCacheTier.Close` racing lookups
+- [ ] Replication: restarted pair primary admits writes before its role is settled; cluster host has no leader write gate; failed `ForcePromoteAsync` leaves no follower stream; election timer not re-armed after a failed campaign start

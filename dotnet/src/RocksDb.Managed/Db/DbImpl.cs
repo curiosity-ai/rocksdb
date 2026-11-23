@@ -306,7 +306,16 @@ internal sealed partial class DbImpl : IAsyncDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void ReturnAndCleanupSuperVersion(ColumnFamilyData cfd, SuperVersion sv, int slot)
     {
-        if (slot >= 0 && cfd.LocalSuperVersions.TryPut(slot, sv)) return;
+        if (slot >= 0 && cfd.LocalSuperVersions.TryPut(slot, sv))
+        {
+            // A processor slot can be shared: if an install (or the close) reset the slot while this reader held it and
+            // another reader then marked it in use, the put above succeeded against that reader's mark and stored an
+            // obsolete super version, which would pin its memtables and files (after a close: the table readers) until
+            // the next read on this slot. The install publishes the new super version (the close: Closed) before it
+            // resets the slots and the put is a full fence, so a put that came after the reset sees the change here.
+            if (ReferenceEquals(sv, cfd.SuperOrNull()) && !cfd.Closed) return;
+            if (!cfd.LocalSuperVersions.TryTakeBack(slot, sv)) return;
+        }
         ReleaseReaderSuperVersion(sv);
     }
 
@@ -407,9 +416,34 @@ internal sealed partial class DbImpl : IAsyncDisposable
             if (m.Unref()) m.Dispose();
         }
         Versions.UnrefVersion(sv.Current);
+        if (--_liveSuperVersions == 0 && _deferredTableRelease is { } deferred)
+        {
+            _deferredTableRelease = null;
+            ReleaseTableReaders(deferred);
+        }
     }
 
     private ulong _superVersionNumber;
+    // Super versions installed and not yet cleaned up, over all column families. Guarded by mutex.
+    private int _liveSuperVersions;
+    // Set by a close that found super versions still referenced (reads or iterators in flight): the column families
+    // whose table readers are closed when the last of them is released. Guarded by mutex.
+    private List<ColumnFamilyData>? _deferredTableRelease;
+
+    /// <summary>
+    /// Closes the table and blob readers of <paramref name="cfds"/> and the DB-wide reader store. REQUIRES: mutex, and
+    /// no super version left (a point read uses the readers of its version's files without a reference of its own:
+    /// the version pins them, so they must outlive every super version).
+    /// </summary>
+    private void ReleaseTableReaders(List<ColumnFamilyData> cfds)
+    {
+        foreach (ColumnFamilyData cfd in cfds)
+        {
+            cfd.TableCache.Dispose();
+            cfd.BlobSource.Dispose();
+        }
+        SharedTableCache.Dispose();
+    }
 
     /// <summary>Installs a new super version for the CF's current memtables and version (InstallSuperVersion). REQUIRES: mutex.</summary>
     internal void InstallSuperVersion(ColumnFamilyData cfd)
@@ -424,6 +458,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
         cfd.Mem.Ref();
         cfd.Current.Ref();
         var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber, cfd.OptionsSnapshot);
+        _liveSuperVersions++;
         SuperVersion? old = cfd.SuperOrNull();
         // ColumnFamilyData::InstallSuperVersion: the write stall is recalculated only if the version or the memtables
         // changed, since RecalculateWriteStallConditions treats a repeated delay as a signal to slow down further.
@@ -1166,6 +1201,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             return;
         }
         NotifySequenceWaiters(); // wake WAL tailers so they observe the close
+        bool tableReadersHandled = false;
         try
         {
             EndAllTraces();
@@ -1260,16 +1296,28 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
             lock (_mutex)
             {
-                foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) ReleaseColumnFamilyResources(cfd);
+                var cfds = new List<ColumnFamilyData>();
+                foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
+                {
+                    ReleaseColumnFamilyMemTables(cfd);
+                    cfd.BlobDirectWrite?.Dispose();
+                    cfds.Add(cfd);
+                }
                 // Dropped column families keep their table cache open until close: readers and background jobs that
                 // still hold one of their versions read through it (their files are evicted as they become obsolete).
                 foreach (ColumnFamilyData cfd in _droppedColumnFamilies)
                 {
-                    cfd.TableCache.Dispose();
-                    cfd.BlobSource.Dispose();
                     cfd.BlobDirectWrite?.Dispose();
+                    cfds.Add(cfd);
                 }
                 _droppedColumnFamilies.Clear();
+                // A read that passed the disposed check before the close set it still holds its super version and reads
+                // through table readers that only the version pins (upstream: closing under a read is undefined; here
+                // the read must finish or fail with ObjectDisposedException). The readers are closed with the last
+                // super version: now if none is referenced, else by whoever releases it (CleanupSuperVersion).
+                if (_liveSuperVersions == 0) ReleaseTableReaders(cfds);
+                else _deferredTableRelease = cfds;
+                tableReadersHandled = true;
             }
             if (closeError is not null) throw closeError;
         }
@@ -1282,7 +1330,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             try { ShutdownMonitoring(); } catch (Exception e) when (e is IOException or RocksDbException) { }
             DisposeOwnedSstFileManager();
             _writeControllerField?.Dispose();
-            SharedTableCache.Dispose();
+            if (!tableReadersHandled) SharedTableCache.Dispose();
             _dbLock?.Dispose();
             _dbLock = null;
             if (_secondary) DisposeSecondaryReaders();

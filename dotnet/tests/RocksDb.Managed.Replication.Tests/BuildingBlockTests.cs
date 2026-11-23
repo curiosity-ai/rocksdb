@@ -122,6 +122,24 @@ public sealed class BuildingBlockTests
     }
 
     [TestMethod]
+    public async Task WriteGateTwoConcurrentHoldsBothSeeTheDrain()
+    {
+        // Audit #13: the second HoldAsync (PairNodeHost.DisposeAsync racing SwitchoverNode.HandOffAsync) replaced the
+        // drain signal the first one was waiting on, and the last Exit completed only the new one: the first holder
+        // never returned.
+        var gate = new PrimaryWriteGate(open: true);
+        Assert.IsTrue(await gate.TryEnterAsync(TimeSpan.Zero, CancellationToken.None));
+        Task hold1 = gate.HoldAsync(CancellationToken.None);
+        Task hold2 = gate.HoldAsync(CancellationToken.None);
+        Assert.IsFalse(hold1.IsCompleted);
+        Assert.IsFalse(hold2.IsCompleted);
+        gate.Exit();
+        await hold2.WaitAsync(TimeSpan.FromSeconds(5));
+        await hold1.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.AreEqual(0, gate.InFlight);
+    }
+
+    [TestMethod]
     public void AdaptiveCommitDelayGrowsWithLagAndClamps()
     {
         var c = new AdaptiveCommitDelayController(2, new AdaptiveCommitDelayOptions { DelayPerLagUnitMs = 5, LagUnit = 1000, MaxDelayMs = 100 });

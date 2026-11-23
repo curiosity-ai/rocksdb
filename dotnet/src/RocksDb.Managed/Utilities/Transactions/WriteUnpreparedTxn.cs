@@ -246,7 +246,8 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         }
         // TODO(lth): We should optimize commit without prepare to not perform a prepare under the hood.
         await PrepareInternalAsync(synchronous, cancellationToken).ConfigureAwait(false);
-        await CommitInternalAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        // Not cancellable: past the prepare this is a commit without prepare that must not stay half done.
+        await CommitInternalAsync(synchronous, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>WriteUnpreparedTxn::CommitInternal: a commit marker that commits every unprepared batch.</summary>
@@ -329,7 +330,8 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
             _unprepSeqs[prepareSeq] = rollbackBatchCnt;
             TestHooks.Invoke("WriteUnpreparedTxn::RollbackInternal:BeforeCommit");
             _commitEntry.Set(_unprepSeqs, 0);
-            ValueTask c = WriteCommitOnlyAsync(_writeOptions, EmptyBatch(forWal: true), _commitEntry, synchronous, cancellationToken);
+            // Not cancellable: the rollback batch is written; abandoning its commit would leave it prepared forever.
+            ValueTask c = WriteCommitOnlyAsync(_writeOptions, EmptyBatch(forWal: true), _commitEntry, synchronous, CancellationToken.None);
             if (!c.IsCompletedSuccessfully) await c.ConfigureAwait(false);
         }
         foreach (KeyValuePair<ulong, int> seq in _unprepSeqs) _wpDb.RemovePrepared(seq.Key, seq.Value);

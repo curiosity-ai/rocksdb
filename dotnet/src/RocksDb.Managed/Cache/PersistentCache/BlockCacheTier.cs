@@ -158,7 +158,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 {
                     if (InsertImpl(op.Key, op.Data)) { ok = true; break; }
                 }
-                catch (IOException)
+                catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
                 {
                     break;
                 }
@@ -226,7 +226,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 ok = file.Read(lba, scratch) && ParseRecord(scratch.AsSpan(0, lba.Size), key, out int valOffset, out int valSize)
                     && CopyOut(scratch.AsSpan(valOffset, valSize), out data, out length);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
             {
                 ok = false;
                 data = [];
@@ -282,7 +282,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
             {
                 ok = file.TryReadBuffered(lba, scratch, out reader);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
             {
                 ok = false;
                 reader = null;
@@ -322,7 +322,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
             }
             ok = total == lba.Size;
         }
-        catch (Exception e) when (e is IOException or ObjectDisposedException)
+        catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)
         {
             ok = false;
         }
@@ -776,7 +776,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 {
                     _file?.Dispose();
                 }
-                catch (IOException)
+                catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
                 {
                 }
                 _file = null;
@@ -799,7 +799,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 size = fs.GetFileSize(_path);
                 fs.DeleteFile(_path);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
             {
             }
             return size;

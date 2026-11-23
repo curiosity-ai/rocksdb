@@ -180,7 +180,11 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            if (Interlocked.Decrement(ref _pendingMemtableWrites) == 0) SignalPendingWritesDrained();
+            if (Interlocked.Decrement(ref _pendingMemtableWrites) == 0)
+            {
+                TestHooks.Invoke("DBImpl::UnorderedWriteMemtable:BeforeSignalDrained");
+                SignalPendingWritesDrained();
+            }
         }
         // WriteStatusCheck(w.status)
         if (w.Error is { } error) UnorderedWriteStatusCheck(error);
@@ -232,13 +236,18 @@ internal sealed partial class DbImpl
 
     /// <summary>
     /// The notify half of switch_cv_: taking the lock orders this with a waiter that registered after it saw a non-zero
-    /// count, so the wake-up is never lost.
+    /// count, so the wake-up is never lost. The count is re-checked under the lock, which is the predicate of upstream's
+    /// switch_cv_.wait(guard, [&amp;] { return pending_memtable_writes_.load() == 0; }): a writer that counted down to 0
+    /// and was preempted before it got here must not wake a waiter that registered for the inserts of a later write
+    /// group (the count went 0 -> n again meanwhile). The writer that counts those down to 0 signals; the count cannot
+    /// rise while a waiter is registered, because the waiter leads the write queue.
     /// </summary>
     private void SignalPendingWritesDrained()
     {
         TaskCompletionSource? waiter;
         lock (_switchLock)
         {
+            if (Volatile.Read(ref _pendingMemtableWrites) != 0) return;
             waiter = _pendingDrained;
             _pendingDrained = null;
         }
@@ -262,6 +271,7 @@ internal sealed partial class DbImpl
             // switch (or whatever waits) inline.
             tcs = _pendingDrained ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
+        TestHooks.Invoke("DBImpl::WaitForPendingWrites:Registered");
         if (synchronous)
         {
             tcs.Task.GetAwaiter().GetResult();

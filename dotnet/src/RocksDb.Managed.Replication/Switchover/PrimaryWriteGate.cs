@@ -111,13 +111,17 @@ public sealed class PrimaryWriteGate
     private void Transition(int state)
     {
         TaskCompletionSource previous;
+        TaskCompletionSource? previousDrained = null;
         lock (_transition)
         {
-            if (state == Holding) Volatile.Write(ref _drained, NewSignal());
+            if (state == Holding) previousDrained = Interlocked.Exchange(ref _drained, NewSignal());
             Interlocked.Exchange(ref _state, state);
             previous = Interlocked.Exchange(ref _changed, NewSignal());
         }
         previous.TrySetResult();
+        // An earlier HoldAsync still waiting (two holders, e.g. a dispose racing a handoff) waits on the signal just
+        // replaced, which the last Exit no longer completes: wake it so that it re-checks and waits on the new one.
+        previousDrained?.TrySetResult();
     }
 
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);

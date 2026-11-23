@@ -890,6 +890,7 @@ internal sealed partial class DbImpl
                     // Publish the reservation so later writes cannot reuse an ambiguous sequence; the recovery flush
                     // edits below persist it (their last_sequence covers it).
                     Versions.SetLastSequence(Versions.LastAllocatedSequence);
+                    NotifySequenceWaiters();
                 }
                 // One switch for all column families: the recovery flush below picks exactly these memtables.
                 BeginAtomicSwitch();

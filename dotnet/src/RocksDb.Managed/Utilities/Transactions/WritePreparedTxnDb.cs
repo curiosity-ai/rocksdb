@@ -884,7 +884,8 @@ internal sealed class WritePreparedTxnDb : SeqPerBatchHooks
             context.BatchCount = 1;
             context.PreRelease = st.Commit;
             copy.Clear();
-            await _db.WriteAsync(s_commitOnlyNoWal, copy, validateColumnFamilies: false, context, synchronous, cancellationToken).ConfigureAwait(false);
+            // Not cancellable: the data is written; abandoning its commit would leave it invisible until a reopen.
+            await _db.WriteAsync(s_commitOnlyNoWal, copy, validateColumnFamilies: false, context, synchronous, CancellationToken.None).ConfigureAwait(false);
             // Note: RemovePrepared is called from within PreReleaseCallback
         }
         finally

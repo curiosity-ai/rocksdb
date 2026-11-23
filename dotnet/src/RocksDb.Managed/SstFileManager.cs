@@ -370,12 +370,15 @@ public sealed class SstFileManager : IDisposable
                     }
                 }
             }
-            bool empty;
-            lock (_lock) empty = _errorHandlers.Count == 0;
-            if (empty)
+            // One critical section, as in SstFileManagerImpl::ClearError: a StartErrorRecovery between the check and
+            // the reset would lose the error it just recorded.
+            lock (_lock)
             {
-                lock (_lock) _bgError = null;
-                return;
+                if (_errorHandlers.Count == 0)
+                {
+                    _bgError = null;
+                    return;
+                }
             }
             try
             {
