@@ -2013,3 +2013,66 @@ File bytes read per scan go from ~16 MiB (the whole window) to the range's block
 `ColdScanBenchmarks` unchanged within noise (min times equal or better, Allocated `-`). BenchmarkDotNet's default toolchain
 fails on net11 (`GetRuntimeVersion not implemented`); `--inProcess` works.
 
+
+## Profiling pass: restart-point search, merging heap, MultiGet sort, block eviction (2026-11-23)
+
+Method: `perf record` on warm dbbench processes (`DOTNET_PerfMapEnabled=1`, `DOTNET_EnableWriteXorExecute=0`; with W^X on,
+perf cannot symbolize JIT code) and on a loop over single BenchmarkDotNet methods, plus `perf inject --jit` for
+instruction-level annotation. New VM CPU ("Intel Xeon Processor @ 2.30GHz", 4 vCPUs, no hardware counters). Run-to-run
+noise on this host is high for memory-bound work (the same memtable Get measured 371-828 ns in back-to-back runs of one
+build), so every number below is base and new alternated in the same session; dbbench A/B runs were too noisy for
+few-percent effects (readrandom 1.6-3.5 us/op between identical runs) and only BenchmarkDotNet results are quoted.
+
+What the profiles show: with the default 8 MiB block cache, reads are dominated by the kernel's page-cache copy (25% of
+`readrandom` in `_copy_to_iter`), and cached reads, fills and flushes by cache and TLB misses (skiplist nodes, the
+`Block` object, a probe's restart entry). The engine-side CPU work that remained visible was fixed below.
+
+**1. Restart-point binary search** (`BlockIter.BinarySeekRestartPointIndexFast`). `GetRestartKey` + `CompareRestartKey`
+were ~10% of uncached Gets and MultiGets and ~25% of a cached table Get. Per probe the old code re-read the iterator's
+fields, spilled the decoded header to the stack, decoded through the generic varint path and compared through a call;
+the probe's key load waited for the restart-array load. For blocks whose restart keys are compared as stored (no common
+prefix, no global seqno / timestamp padding, no separated values: every default-format block) the new path keeps the
+block in locals, decodes single-byte headers inline, and while comparing a probe prefetches the keys of both possible
+next probes (windows of more than 8 restart points; x86 only). Same probe sequence and result; malformed entries take
+the old `GetRestartKey`, which reports the corruption. `TableBenchmarks` (job short):
+
+| | base | new |
+|---|---:|---:|
+| Index: Seek (~3k-entry index block) | 151.0 ns | 102.6 / 105.3 / 108.0 ns (inline decode alone: 118.3) |
+| Block: Seek (data block, 4 restarts) | 105.8 ns | 106-109 ns (prefetch only above 8 restarts; with it at >2: 118) |
+
+`IteratorBenchmarks` (DBIter over a memtable + 4 L0 files, 12 iterations, two alternated rounds): SeekForPrev + 100 x Prev
+22.3 / 17.4 -> 15.8 / 17.3 us (100 B values) and 48.7 / 37.0 -> 43.2 / 29.6 us (1 KiB); Seek + 100 x Next 34.1 / 27.0 ->
+25.7 / 20.2 us (1 KiB).
+
+**2. Merging-iterator heap** (`MergingIterator.SiftDown`): the sifted child's key is fetched once per sift and each
+level's two child keys once per level (upstream compares the keys cached in `IteratorWrapper`), instead of once per
+comparison. Same comparisons in the same order. `IteratorBenchmarks.ManagedFullScan`, 100 B, 20 iterations, alternated:
+76.3 / 77.1 ns -> 72.1 / 69.2 ns per entry (1 KiB rows bimodal at 129 / 220-254 ns in both variants).
+
+**3. MultiGet key sort** (`MultiGetBatch.BeginRun`). For batches answered by filters, sorting the 16 keys was the largest
+cost: insertion sort through the virtual `Comparator.Compare` -> `SequenceCompareTo` (38% of an absent-key MultiGet).
+With the built-in (reverse) bytewise comparators the keys are now ordered by their 8-byte big-endian prefixes and
+compared in full only on equal prefixes (proof of order agreement in `BytewiseKeyOrder`); other comparators keep the old
+path. New `MultiGetFilterBenchmarks` (one 2M-key SST, 16 random keys per batch): absent keys 1.40 / 1.48 -> 1.20 / 1.50
+(noisy) us per batch, in-process loop 1.36 -> 1.11 us (-18%); present keys 18.0 / 16.6 -> 16.1 / 12.7 us (includes 1.).
+New test `DbMultiGetTests.ShortAndPrefixRelatedKeysWithBuiltinComparators` (short keys, zero bytes, prefix-related keys,
+the empty key, both comparators, over many files); it and the existing randomized test fail when the prefix is read
+little-endian.
+
+**4. Block cache eviction**: `CacheEntry.FreeValue` disposed the cached object with `(obj as IDisposable)?.Dispose()`, an
+interface cast that goes through `CastHelpers.IsInstanceOfInterface` (2.7% of a warm `readseq`, inside the 3-5%
+`FreeValue` of the cache-miss read paths). Parsed blocks (sealed `Block`) are now tested by exact type first.
+
+Investigated and not kept:
+
+- MultiGet filter prefetch (upstream's two-pass `FastLocalBloomBitsReader::MayMatch(num_keys, ...)` with `PrepareHash`):
+  absent-key batches 1.40 / 1.36 -> 1.43 / 1.45 us. With a 2.4 MiB filter the lines come from L3 cheaply on this CPU;
+  the extra pass costs more than the overlap saves.
+- Transparent huge pages for memtable arenas: a C pointer chase over 64 / 128 MiB gains 10% / 30% with
+  `madvise(MADV_HUGEPAGE)` on this VM, but arena slabs are 1 MiB (`arena_block_size` = min(1 MiB, write_buffer_size / 8),
+  as upstream), and huge pages need 2 MiB-aligned ranges of at least 2 MiB. Carving slabs out of advised superblocks
+  changes memory retention; not done.
+- Prefetching the second and third cache line of the next memtable node in the skiplist iterator (flush scan, new
+  `MemTableFlushScanBenchmarks`: 84 ms per 500k-entry scan, ~168 ns per entry = one serial miss per node): no
+  measurable change; the level-0 pointer chase, not the value lines, is the bottleneck.

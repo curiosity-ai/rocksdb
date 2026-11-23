@@ -495,17 +495,39 @@ public sealed class MergingIterator : InternalIterator
         int[] heap = _heap;
         int n = _heapSize;
         int v = heap[index];
+        bool forward = _forward;
+        // The children do not move during the sift, so each key is fetched once (upstream compares the keys cached in
+        // IteratorWrapper): the sifted child's key for the whole loop, and per level the keys of the two children.
+        ReadOnlySpan<byte> vKey = ChildKey(v);
         while (true)
         {
             int left = 2 * index + 1;
             if (left >= n) break;
+            int best = left;
+            ReadOnlySpan<byte> bestKey = ChildKey(heap[left]);
             int right = left + 1;
-            int best = right < n && Before(heap[right], heap[left]) ? right : left;
-            if (!Before(heap[best], v)) break;
+            if (right < n)
+            {
+                ReadOnlySpan<byte> rightKey = ChildKey(heap[right]);
+                if (KeyBefore(rightKey, bestKey, forward))
+                {
+                    best = right;
+                    bestKey = rightKey;
+                }
+            }
+            if (!KeyBefore(bestKey, vKey, forward)) break;
             heap[index] = heap[best];
             index = best;
         }
         heap[index] = v;
+    }
+
+    /// <summary><see cref="Before"/> on keys already fetched.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool KeyBefore(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, bool forward)
+    {
+        int c = _icmp.Compare(a, b);
+        return forward ? c < 0 : c > 0;
     }
 
     protected override void Dispose(bool disposing)

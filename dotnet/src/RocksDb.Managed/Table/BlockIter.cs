@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Util;
 using EntryType = RocksDb.Managed.Db.EntryType;
@@ -101,6 +102,8 @@ public sealed class BlockIter : IDisposable
     private bool _globalSeqnoOnly;
     // Restart keys need rewriting before comparisons (global seqno or timestamp padding).
     private bool _restartKeyFixup;
+    // No common prefix, no restart key rewriting, no separated values: a restart key is the span after its entry header.
+    private bool _plainRestartKeys;
     // block_protection_bytes_per_key of the block (0: no per key-value verification) and the block itself.
     private int _kvProtectionBytes;
     private Block? _block;
@@ -180,6 +183,8 @@ public sealed class BlockIter : IDisposable
         _restartKeyFixup = _padTsSize != 0 || _applyGlobalSeqno;
         // With stripped timestamps the stored key is validated when it is padded (PadMinTimestampInternal).
         _minKeyLen = _keysAreInternal && _padTsSize == 0 ? DbFormat.InternalKeyFooterSize : 0;
+        // Restart keys are stored whole in the block and compared as stored (see BinarySeekRestartPointIndexFast).
+        _plainRestartKeys = _prefixLength == 0 && !_restartKeyFixup && _valuesSection < 0;
     }
 
     /// <summary>
@@ -231,6 +236,7 @@ public sealed class BlockIter : IDisposable
         _applyGlobalSeqno = false;
         _globalSeqnoOnly = false;
         _restartKeyFixup = false;
+        _plainRestartKeys = false;
         _minKeyLen = 0;
         _interpolationSearch = false;
         _handle = default;
@@ -1145,6 +1151,7 @@ public sealed class BlockIter : IDisposable
     /// </summary>
     private bool BinarySeekRestartPointIndex(ReadOnlySpan<byte> target, out int index, out bool skipLinearScan)
     {
+        if (_plainRestartKeys) return BinarySeekRestartPointIndexFast(target, out index, out skipLinearScan);
         index = 0;
         skipLinearScan = false;
         if (_keysEnd == 0)
@@ -1177,6 +1184,96 @@ public sealed class BlockIter : IDisposable
             index = (int)left;
         }
         return true;
+    }
+
+    /// <summary>
+    /// <see cref="BinarySeekRestartPointIndex"/> for blocks whose restart keys are compared as stored
+    /// (<see cref="_plainRestartKeys"/>): the same probe sequence and result, with the block fields in locals and the
+    /// entry header decoded inline. While a probe's key is compared, the restart entries of both possible next probes
+    /// are read and their keys prefetched, so the next probe's key load (an index block is larger than L1, and a probe
+    /// lands at an unpredictable offset) overlaps the current comparison instead of following it. Restart offsets are
+    /// validated by <see cref="Block.Parse"/> (strictly increasing, below the end of the keys), so the prefetched
+    /// addresses are inside the block. Entries that are not single-byte-header restart keys, and every malformed entry,
+    /// go through <see cref="GetRestartKey"/>, which reports the corruption.
+    /// </summary>
+    private unsafe bool BinarySeekRestartPointIndexFast(ReadOnlySpan<byte> target, out int index, out bool skipLinearScan)
+    {
+        index = 0;
+        skipLinearScan = false;
+        int keysEnd = _keysEnd;
+        // Blocks with no keys (e.g. index of a range-tombstone-only file) have num_restarts == 1.
+        if (keysEnd == 0) return false;
+        byte[] data = _data;
+        int restarts = _restarts;
+        int minKeyLen = _minKeyLen;
+        // Index blocks with delta-encoded values have two header varints (shared, non_shared), others three.
+        int headerBytes = _valueDeltaEncoded ? 2 : 3;
+        long left = -1;
+        long right = _numRestarts - 1;
+        fixed (byte* block = data)
+        {
+            // In bounds: Block.Parse checked restarts + 4 * num_restarts <= block size <= data.Length.
+            uint* restartArray = (uint*)(block + restarts);
+            while (left != right)
+            {
+                long mid = left + (right - left + 1) / 2;
+                if (Sse.IsSupported && right - left > 8)
+                {
+                    // Next probe if the key at mid is < target (left = mid) and if it is > target (right = mid - 1).
+                    long upper = mid + (right - mid + 1) / 2;
+                    long lower = left + (mid - left) / 2;
+                    if (upper > mid) Sse.Prefetch0(block + ReadRestart(restartArray, upper));
+                    if (lower > left) Sse.Prefetch0(block + ReadRestart(restartArray, lower));
+                }
+                int p = (int)ReadRestart(restartArray, mid);
+                ReadOnlySpan<byte> midKey;
+                // Restart offsets are < keysEnd, so p + 2 < data.Length whenever keysEnd - p >= 3.
+                if (keysEnd - p >= 3 && block[p] == 0)
+                {
+                    uint nonShared = block[p + 1];
+                    uint third = headerBytes == 3 ? block[p + 2] : 0u;
+                    int keyStart = p + headerBytes;
+                    if ((nonShared | third) < 128 && nonShared <= (uint)(keysEnd - keyStart) && nonShared >= (uint)minKeyLen)
+                    {
+                        midKey = new ReadOnlySpan<byte>(block + keyStart, (int)nonShared);
+                    }
+                    else
+                    {
+                        midKey = GetRestartKey((int)mid);
+                    }
+                }
+                else
+                {
+                    midKey = GetRestartKey((int)mid);
+                }
+                int cmp = CompareKey(midKey, target);
+                if (cmp == 0)
+                {
+                    skipLinearScan = true;
+                    left = right = mid;
+                    break;
+                }
+                if (cmp < 0) left = mid;
+                else right = mid - 1;
+            }
+        }
+        if (left == -1)
+        {
+            skipLinearScan = true;
+            index = 0;
+        }
+        else
+        {
+            index = (int)left;
+        }
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe uint ReadRestart(uint* restartArray, long index)
+    {
+        uint v = Unsafe.ReadUnaligned<uint>(restartArray + index);
+        return BitConverter.IsLittleEndian ? v : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v);
     }
 
     /// <summary>

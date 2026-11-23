@@ -484,3 +484,9 @@ Still open from this round:
 
 - [x] Sync writers never wait for thread-pool work behind async writers once the DB has had a sync writer: synchronous leading, write wake-up threads, serial inserts for mixed groups, async unbatched operations on wake-up threads; every write mode tested with a dead pool
 - [ ] First-sync-writer window: async work in flight when the mode is entered still completes on the pool (capped pool can deadlock once per DB; workaround: one sync write after open)
+
+## Profiling pass (2026-11-23; docs/perf.md "Profiling pass: restart-point search, merging heap, MultiGet sort, block eviction")
+
+- [x] Restart-point binary search fast path with next-probe prefetch (index seek 151 -> ~105 ns), merging-heap sift fetches each child key once, MultiGet sorts bytewise keys by 8-byte prefixes (absent-key batch -18%), exact-type dispose of evicted blocks
+- [x] New benchmarks: `MemTableFlushScanBenchmarks` (flush read pattern), `MultiGetFilterBenchmarks` (2M-key SST, absent / present batches)
+- [ ] Not kept / open: MultiGet filter prefetch (slower on this CPU), huge pages for memtable arenas (1 MiB slabs; needs advised superblocks), deeper skiplist-iterator prefetch (no change)
