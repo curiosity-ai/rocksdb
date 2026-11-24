@@ -425,7 +425,35 @@ internal sealed partial class DbImpl
     /// Becomes the write leader without a batch (WriteThread::EnterUnbatched): on return no other write is in progress
     /// until <see cref="WriteThread.ExitAsLeader"/> is called.
     /// </summary>
+    /// <remarks>
+    /// Also waits for any LockWAL to clear (the tail of DBImpl::WaitForPendingWrites, which upstream's flush, ingestion,
+    /// column family drop, error recovery and write buffer manager flush call after EnterUnbatched): none of them may
+    /// switch a memtable or the WAL, or change the logical state, while the WAL is locked. The operations upstream lets
+    /// through use <see cref="EnterUnbatchedIgnoringWalLockAsync"/>.
+    /// </remarks>
     internal async ValueTask<WriteThread.Writer> EnterUnbatchedAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        WriteThread.Writer w = await EnterUnbatchedIgnoringWalLockAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ValueTask unlocked = WaitForWalUnlockAsync(LeadsSynchronously(synchronous), cancellationToken);
+            if (!unlocked.IsCompletedSuccessfully) await unlocked.ConfigureAwait(false);
+        }
+        catch
+        {
+            ExitUnbatched(w, synchronous);
+            if (WriteThread.OnWakeupThread) await WriteThread.ResumeOnThreadPoolAsync();
+            throw;
+        }
+        return w;
+    }
+
+    /// <summary>
+    /// <see cref="EnterUnbatchedAsync"/> without the wait for LockWAL to clear: for LockWAL itself, FlushWAL / SyncWAL
+    /// (allowed while the WAL is locked) and the operations whose upstream counterpart enters the write thread without
+    /// WaitForPendingWrites (column family creation and import).
+    /// </summary>
+    internal async ValueTask<WriteThread.Writer> EnterUnbatchedIgnoringWalLockAsync(bool synchronous, CancellationToken cancellationToken)
     {
         WriteThread.Writer w = await EnterUnbatchedCoreAsync(synchronous).ConfigureAwait(false);
         if (IsDisposed)
@@ -1210,6 +1238,7 @@ internal sealed partial class DbImpl
             // WaitForPendingWrites: with pipelined writes the memtables are switched only once no insert is pending.
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
+            await WaitForWalUnlockAsLeaderAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
             await SwitchWalAsync(synchronous, cancellationToken).ConfigureAwait(false);
         }
         if (_flushScheduler.Count > 0)
@@ -1218,10 +1247,11 @@ internal sealed partial class DbImpl
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             // unordered_write: likewise for the memtable inserts of earlier write groups (WaitForPendingWrites).
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
+            await WaitForWalUnlockAsLeaderAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
             // ScheduleFlushes: with atomic_flush every column family with data is switched and one request flushes them.
             try
             {
-                await SwitchMemtablesForFlushAsync(_flushScheduler, FlushReason.WriteBufferFull, synchronous, cancellationToken).ConfigureAwait(false);
+                await SwitchMemtablesForFlushAsync(_flushScheduler, FlushReason.WriteBufferFull, includeEmpty: false, synchronous, cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -1532,6 +1562,10 @@ internal sealed partial class DbImpl
         if (wals.Count == 0) return;
         lock (_mutex)
         {
+            // FindObsoleteFiles returns at once while file deletions are disabled, so logs_ keeps these WALs and
+            // GetOpenWalSizes reports them: a checkpoint taken now copies and syncs them. Released here, a closed WAL
+            // that was never synced would be hard-linked by a checkpoint whose (earlier captured) MANIFEST still needs it.
+            if (FileDeletionsDisabled) return;
             ulong minLog = MinLogNumberToKeepLive();
             int n = 0;
             while (n < wals.Count && wals[n].LogNumber < minLog) _walsToFree.Add(wals[n++]);
@@ -1644,17 +1678,24 @@ internal sealed partial class DbImpl
             oldest = ulong.MaxValue;
             foreach (ulong n in _aliveWals) oldest = Math.Min(oldest, n);
             if (_walGettingFlushed == oldest) return;
-            _walGettingFlushed = oldest;
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
             {
                 if (cfd.Dropped) continue;
                 if (cfd.LogNumber <= oldest) cfds.Add(cfd);
             }
+            // "we only mark this log as getting flushed if we have successfully flushed all data in this log": not when
+            // there is nothing to switch for it (the next write looks again).
+            if (cfds.Count == 0 && !Options.AtomicFlush) return;
+            _walGettingFlushed = oldest;
         }
         LogInfo("Flushing all column families with data in WAL number " + oldest + ". Total log size is " + Volatile.Read(ref _walsTotalSize) +
                 " while max_total_wal_size is " + GetMaxTotalWalSize());
-        // An empty memtable is not switched: its log number advances with the next WAL switch (SwitchMemtable).
-        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WalFull, synchronous, cancellationToken).ConfigureAwait(false);
+        // DBImpl::SwitchWAL switches every such column family, empty or not: the switch starts a new WAL (unless the
+        // current one is empty) and the flush of the empty memtable persists the column family's new log number, which
+        // is what releases the oldest WAL. Skipping an idle, empty column family whose log number still named the oldest
+        // WAL left that WAL alive (and marked as getting flushed) until some other memtable filled up on its own, so
+        // max_total_wal_size did not bound the WALs.
+        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WalFull, includeEmpty: true, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Test helper (TEST_SwitchMemtable): switches the default column family's memtable and WAL.</summary>
@@ -1737,7 +1778,10 @@ internal sealed partial class DbImpl
         ColumnFamilyData? c = id < (uint)map.Length ? map[id] : null;
         if (c is null || c.Dropped)
         {
-            // Writes to dropped column families are ignored (like upstream); unknown ids are an error unless ignored.
+            // A column family dropped before this write: its entry is gone from the map (c is null), which is an error
+            // unless ignore_missing_column_families, as upstream (ColumnFamilyMemTablesImpl::Seek fails for a column
+            // family removed from the set; the group then fails and the failure is a MemTable background error). The
+            // Dropped branch covers recovery and a drop that has not left the map yet: those entries are skipped.
             if (c is null && !ignoreMissing && logNumber == 0) ThrowHelper.InvalidArgument("Invalid column family specified in write batch");
             return null;
         }

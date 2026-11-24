@@ -147,7 +147,7 @@ internal sealed partial class DbImpl
             // moves to a write wake-up thread first, so that it never blocks its caller.
             bool exclusive = LeadsSynchronously(synchronous);
             if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
-            WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+            WriteThread.Writer w = await EnterUnbatchedIgnoringWalLockAsync(exclusive, ct).ConfigureAwait(false);
             BeginIngestion();
             try
             {

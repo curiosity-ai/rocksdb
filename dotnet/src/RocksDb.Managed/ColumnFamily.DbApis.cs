@@ -95,10 +95,16 @@ public sealed class WalLock : IDisposable
 {
     private Db.DbImpl? _db;
 
-    internal WalLock(Db.DbImpl db) => _db = db;
+    private readonly int _ownerThreadId; // the thread of a synchronous LockWal (0 for LockWalAsync)
+
+    internal WalLock(Db.DbImpl db, int ownerThreadId)
+    {
+        _db = db;
+        _ownerThreadId = ownerThreadId;
+    }
 
     /// <summary>Releases this lock (DB::UnlockWAL); writes resume when every lock was released. Idempotent.</summary>
-    public void Dispose() => Interlocked.Exchange(ref _db, null)?.UnlockWal();
+    public void Dispose() => Interlocked.Exchange(ref _db, null)?.UnlockWal(_ownerThreadId);
 }
 
 public sealed partial class ColumnFamily
@@ -259,14 +265,14 @@ public sealed partial class RocksDatabase
     public WalLock LockWal()
     {
         SyncValueTask.GetResult(_db.LockWalAsync(synchronous: true, CancellationToken.None));
-        return new WalLock(_db);
+        return new WalLock(_db, Environment.CurrentManagedThreadId);
     }
 
     /// <summary>Async <see cref="LockWal"/>.</summary>
     public async ValueTask<WalLock> LockWalAsync(CancellationToken cancellationToken = default)
     {
         await _db.LockWalAsync(synchronous: false, cancellationToken).ConfigureAwait(false);
-        return new WalLock(_db);
+        return new WalLock(_db, 0);
     }
 
     /// <summary>

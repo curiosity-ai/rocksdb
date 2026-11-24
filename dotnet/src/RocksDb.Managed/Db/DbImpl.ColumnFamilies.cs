@@ -35,7 +35,8 @@ internal sealed partial class DbImpl
         // moves to a write wake-up thread first, so that it never blocks its caller.
         bool exclusive = LeadsSynchronously(synchronous);
         if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
-        WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+        // CreateColumnFamilyImpl enters the write thread without WaitForPendingWrites: allowed while the WAL is locked.
+        WriteThread.Writer w = await EnterUnbatchedIgnoringWalLockAsync(exclusive, ct).ConfigureAwait(false);
         ColumnFamilyData cfd;
         try
         {

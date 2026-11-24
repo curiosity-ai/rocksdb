@@ -617,6 +617,7 @@ internal sealed class WriteThread
         lock (_lock)
         {
             _writeStalled = true;
+            _stallBegunCount++;
             Writer? prev = null;
             Writer? w = _head;
             while (w is not null)
@@ -653,7 +654,35 @@ internal sealed class WriteThread
     /// <summary>Port of WriteThread::EndWriteStall: removes the barrier.</summary>
     public void EndWriteStall()
     {
-        lock (_lock) _writeStalled = false;
+        lock (_lock)
+        {
+            _writeStalled = false;
+            Volatile.Write(ref _stallEndedCount, _stallBegunCount);
+        }
+        lock (_stallEnded) Monitor.PulseAll(_stallEnded);
+    }
+
+    // stall_begun_count_ / stall_ended_count_: written under _lock; the ended count is read by WaitForStallEndedCount.
+    private long _stallBegunCount;
+    private long _stallEndedCount;
+    private readonly object _stallEnded = new();
+
+    /// <summary>
+    /// Port of WriteThread::GetBegunCountOfOutstandingStall: the number of stalls begun so far when one is outstanding
+    /// (a leader is between <see cref="BeginWriteStall"/> and <see cref="EndWriteStall"/>), else 0.
+    /// </summary>
+    public long GetBegunCountOfOutstandingStall()
+    {
+        lock (_lock) return _stallBegunCount > _stallEndedCount ? _stallBegunCount : 0;
+    }
+
+    /// <summary>Port of WriteThread::WaitForStallEndedCount: blocks until the stall numbered <paramref name="stallCount"/> has ended.</summary>
+    public void WaitForStallEndedCount(long stallCount)
+    {
+        lock (_stallEnded)
+        {
+            while (Volatile.Read(ref _stallEndedCount) < stallCount) Monitor.Wait(_stallEnded);
+        }
     }
 
     /// <summary>

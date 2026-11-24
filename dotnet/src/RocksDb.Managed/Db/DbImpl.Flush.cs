@@ -94,9 +94,11 @@ internal sealed partial class DbImpl
     /// atomic_flush the memtables of every column family holding data are switched instead
     /// (DBImpl::SelectColumnFamiliesForAtomicFlush) and flushed as one atomic flush. REQUIRES: write leader.
     /// </summary>
-    private async ValueTask SwitchMemtablesForFlushAsync(IReadOnlyList<ColumnFamilyData> cfds, FlushReason reason, bool synchronous,
+    /// <param name="includeEmpty">Also switch empty memtables (DBImpl::SwitchWAL; not with atomic_flush).</param>
+    private async ValueTask SwitchMemtablesForFlushAsync(IReadOnlyList<ColumnFamilyData> cfds, FlushReason reason, bool includeEmpty, bool synchronous,
         CancellationToken cancellationToken)
     {
+        if (Options.AtomicFlush) includeEmpty = false;
         if (Options.AtomicFlush)
         {
             var all = new List<ColumnFamilyData>();
@@ -117,7 +119,7 @@ internal sealed partial class DbImpl
             for (int i = 0; i < cfds.Count; i++)
             {
                 ColumnFamilyData cfd = cfds[i];
-                if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
+                if (cfd.Dropped || (cfd.Mem.IsEmpty && !includeEmpty)) continue;
                 await SwitchMemtableAsync(cfd, reason, synchronous, cancellationToken).ConfigureAwait(false);
                 switched = true;
             }
@@ -783,6 +785,18 @@ internal sealed partial class DbImpl
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
+        // DBImpl::FlushMemTable / AtomicFlushMemTables (not for the recovery flushes, which do not come through here).
+        if (!wait && WriteControllerInstance.IsStopped)
+        {
+            throw new RocksDbException(StatusCode.TryAgain,
+                "Writes have been stopped, thus unable to perform manual flush. Please try again later after writes are resumed");
+        }
+        // "if (lock_wal_owner_thread_id_counts_.count(env_->GetThreadID()) > 0) return Status::Aborted(...)": the flush
+        // below waits for LockWAL to clear, which this thread would never do. Only a lock taken through the
+        // synchronous API has an owner thread, and only a synchronous flush blocks it; an asynchronous flush awaited by
+        // the holder of the lock stays pending until the lock is released.
+        if (wait && synchronous && CurrentThreadHoldsWalLock())
+            throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Likely deadlock as the same thread called LockWAL()");
         // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
         // moves to a write wake-up thread first, so that it never blocks its caller.
         bool exclusive = LeadsSynchronously(synchronous);
@@ -796,7 +810,7 @@ internal sealed partial class DbImpl
             // DBImpl::FlushMemTable does not look at the background error before SwitchMemtable: the memtable is sealed
             // and the flush requested; WaitForFlushMemTables reports the error (only with FlushOptions::wait).
             if (cfd.Dropped) ThrowDropped(cfd);
-            await SwitchMemtablesForFlushAsync([cfd], reason, exclusive, cancellationToken).ConfigureAwait(false);
+            await SwitchMemtablesForFlushAsync([cfd], reason, includeEmpty: false, exclusive, cancellationToken).ConfigureAwait(false);
             lock (_mutex)
             {
                 // DBImpl::FlushMemTable: the column families with sealed memtables get FlushRequested, also when nothing
