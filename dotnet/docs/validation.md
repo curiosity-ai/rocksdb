@@ -2739,41 +2739,46 @@ for purges in flight before it lists the WALs (GetSortedWalFilesImpl); old OPTIO
 deletions are disabled; the remote-compaction manifest floor is read under the mutex; SetDBOptions cannot start the
 stats-dump timer after close.
 
-### Open (found by reading, not fixed)
+### Follow-up fixes (the items first left open)
 
-Engine:
-- LockWAL does not stop memtable / WAL switches: upstream's WaitForPendingWrites waits for LockWAL to clear before
-  every switch, and a manual flush under the lock fails (TryAgain / Aborted "likely deadlock"). Here a write that
-  finds a full memtable switches WALs under the lock and the old WAL can be purged; `Flush()` from the lock holder
-  with a stalled writer deadlocks. The port's own checkpoint under LockWAL is not affected.
-- UnlockWAL returns before stalled leaders removed their stall barrier (upstream waits for the stall-ended count), so
-  a `NoSlowdown` write right after it can fail with Incomplete.
-- SwitchWAL skips empty column families: an idle empty one with a stale log number can keep the oldest WAL and defeat
-  max_total_wal_size until the busy column family's memtable fills.
-- A closed, never-synced WAL released while deletions are disabled can be hard-linked by a no-flush checkpoint instead
-  of copied and synced (durability of the checkpoint only).
-- A drop racing an atomic flush fails the whole group (upstream skips the dropped column family's edits): the other
-  column families are flushed again after the back-off, and an error-recovery flush reports success without installing.
-- SetOptions edits the live options object in place: jobs and the write path can read a half-applied set (item 6 above
-  was the only hard failure found). Flush re-reads `paranoid_file_checks` across functions (small window).
-- Manual compactions skip the SstFileManager room check (upstream: CompactionTooLarge); "max allowed space reached" is
-  checked after the compaction is installed, not per output file.
-- A failed open has already set the shared SstFileManager's statistics pointer; thread-static native ZSTD dictionary
-  contexts are not freed when a thread ends; a secondary-cache lookup abandoned on cancellation drops its result
-  without disposing it; the row cache can store a truncated replay log for a key covered by an ingested range tombstone
-  (inherited from upstream); ingestion and import install the super version one critical section after the version.
+| Area | Finding | Fix | Test (fails without the fix unless noted) |
+|---|---|---|---|
+| WAL | LockWAL did not stop memtable / WAL switches (upstream: WaitForPendingWrites waits for LockWAL to clear) | every switch waits for the unlock; manual flush returns TryAgain (`Wait = false`, writes stopped) or Aborted "Likely deadlock" (synchronous flush from the thread holding a synchronous LockWal); LockWAL itself, FlushWAL / SyncWAL, column family creation and import pass | `Audit14WalTests.WriteDoesNotSwitchTheWalWhileItIsLocked`, `ManualFlushRespectsTheWalLock` |
+| WAL | UnlockWAL returned before stalled leaders ended their stall | begun / ended stall counters in WriteThread; UnlockWal waits on both queues | `NoSlowdownWriteSucceedsRightAfterUnlockWal` |
+| WAL | SwitchWAL skipped empty column families; a closed, unsynced WAL was released while file deletions were disabled | empty column families are switched too; the release waits for deletions to be enabled | `SwitchWalReleasesAWalHeldOnlyByAnEmptyColumnFamily`, `ClosedWalStaysOpenForCheckpointsWhileFileDeletionsAreDisabled` |
+| Options | SetOptions edited the options object running jobs read | the pickers (and so every Compaction) hold `OptionsSnapshot`, replaced by SetOptions; a flush reads `paranoid_file_checks` once | `Audit14ReviewTests.CompactionsKeepTheOptionsSnapshotTheyWerePickedWith` |
+| Flush | A drop racing an atomic flush failed the whole group | the dropped column family's edits are left out of the group (ProcessManifestWrites) | `AtomicFlushRacingADropStillInstallsTheOtherColumnFamilies` |
+| Compaction | Manual compactions skipped the SstFileManager room check; the space limit was checked after the install | CompactionTooLarge for a manual compaction without room; outputs are reported to the manager as they finish and the limit fails the job before the install | `ManualCompactionChecksTheSstFileManagerForRoom`; the per-output limit has no test |
+| Misc (no test) | statistics pointer of a shared SstFileManager set by a failed open; per-thread native zstd contexts never freed; ready secondary-cache lookups dropped when a wait is abandoned; truncated row cache entry under a range tombstone; ingestion / import super version installed a critical section late | set after the open has the DB; freed by a finalizable per-thread owner; completed before the exception leaves; not cached; installed in the LogAndApply callback | none |
+| Replication | A chunk whose WAL write failed on a replica was skipped after the engine's recovery | replicas veto automatic recovery (`ReplicaRecoveryVeto`); a failed apply records the last applied sequence (memory and `REPLICA_APPLY_FAILED`), and a replica whose log no longer ends there is rebuilt | `Audit14ReplicationTests` (cluster, pair, plain with restart, veto) |
+| Replication | Plain replication had no lineage check | `ReplicationLineage`: an incarnation per `ReplicationPrimary` open, stamped on the stream, shipped with snapshots, checked at attach (`CheckReplicaLog`; old peers fall back to sequence numbers) | yes |
+| Replication | stale replica lag pinned the commit delay; leftover checkpoint directories; a failing apply retried forever; restore without CURRENT accepted; deletion pin ended with the snapshot stream; abandoned gRPC stream writes; unbounded fragmented uploads; lenient term-map parsing; throwing Log delegate; term map after a snapshot from a separate RPC | lag ages out (`ReplicaLagStaleAfter`), `ForgetReplica`; cleaned at start; second failure at a position rebuilds; refused; `SnapshotAttachTimeout`; call aborted and write awaited; `MaxUploadDuration`; strict; swallowed; shipped in the snapshot plan and persisted before CURRENT | partly (see the fork's tests); the attach pin and the aborted gRPC write have none |
 
-Replication:
-- A chunk whose WAL write fails on a replica can be skipped for good: the engine's recovery publishes the failed
-  sequence range (as upstream's ResumeImpl), the follower then re-attaches past it and reports it as held.
-- Plain replication (`ReplicationPrimary` / `ReplicaFollower`) has no lineage check: a primary that lost its unsynced
-  tail and wrote on streams over the replica's stale tail (the pair and cluster hosts have epochs / terms for this).
-- `AdaptiveCommitDelayController`: a replica that stops reporting pins the lag (and the delay at its maximum) for good.
-- Checkpoint directories of interrupted snapshot streams are never cleaned up; a restore whose stream never sent
-  CURRENT is accepted; the file-deletion pin ends with the snapshot stream instead of at attach; a follower whose apply
-  fails for a non-transient reason retries the same position forever; the term map after a snapshot comes from a
-  separate RPC; no per-node identities behind the shared secret.
+Behaviour changes: under LockWAL, `Flush`, ingestion, column family drop, `CompactRange` with a flush and
+`GetLiveFiles` with a flush block until the unlock (or fail as above); an operation waiting for the unlock holds the
+write queue, as upstream. `UnlockWal` can block briefly until stalled writers have run. SwitchWAL flushes an empty
+memtable of an idle column family. A manual compaction can fail with CompactionTooLarge. A replica or follower with a
+background error is rebuilt from a snapshot instead of recovering in place (the veto applies to every background error
+while the node is a replica). `ReplicationPrimary` writes `<db>/replication/lineage` and removes `checkpoint-*` under
+its checkpoint root when constructed. New replication API and one new RPC (`IReplicationService.CheckReplicaLog`);
+see `src/RocksDb.Managed.Replication/README.md`.
+
+### Still open
+
+- Per-node identities behind the replication shared secret, and "a resync destroys the old copy before the new one
+  arrived": both need a product decision.
+- Lineage: a replica with no lineage file is accepted on sequence numbers alone and then adopts the primary's map; if
+  the disk that failed a replica's WAL write also fails the marker write and the process restarts, only the recovery
+  veto protects it.
+- With an asynchronous stalled leader and no synchronous writer yet, `UnlockWal`'s wait depends on a thread-pool thread;
+  a lock taken with `LockWalAsync` has no owner thread, so a flush awaited by its holder waits for the unlock instead of
+  failing with Aborted.
+- Transactions, minor (recorded by the review, not changed): rollback reads use the published sequence instead of the
+  max snapshot (differs only for lock-free keys with two write queues); failed pre-write checks of a commit without
+  prepare leave the transaction usable; a WriteUnprepared rollback from STARTED does not reset its log number
+  (inherited from upstream).
 
 Test note: `Audit8AsyncWritePathTests.FailedInsertOfMixedGroupFailsEveryWriterOnce (Pipelined, "async,async,sync", 2)`
-is timing sensitive (the held leader sometimes receives the injected insert failure): it failed in 2 of 25 runs before
-this audit's changes and 1 of 25 after. Not addressed here.
+was timing sensitive (in pipelined mode the held writer's memtable group may or may not include the writers behind
+it; the insert failure is the status of that whole group): it failed in 2 of 25 runs. The test now accepts both
+groupings (40 of 40 runs pass).

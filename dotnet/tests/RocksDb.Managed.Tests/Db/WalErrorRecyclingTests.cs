@@ -669,7 +669,9 @@ public sealed class WalErrorRecyclingTests
                 Assert.IsTrue(h.Listener.Ended.Wait(Timeout), "recovery did not end");
                 Assert.IsNull(h.Listener.Info!.NewBackgroundError);
                 failedWals.Add(h.Impl.FailedWalNumberForTest);
-                Assert.IsTrue(failed.Count > 0);
+                // The failed writer records its key after the exception reached it; the recovery (on its own thread)
+                // can end before that thread got there.
+                Assert.IsTrue(SpinWait.SpinUntil(() => failed.Count > 0, Timeout), "no writer saw the WAL error");
             }
             int end = acked.Count + 300;
             Assert.IsTrue(SpinWait.SpinUntil(() => acked.Count >= end, Timeout), "writers stalled after recovery");

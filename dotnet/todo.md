@@ -513,6 +513,8 @@ Still open from this round:
 
 - [x] Concurrent SetOptions / SetDBOptions lost updates; rolled-back expirable transaction left the expirable map; nested merge clobbered the per-thread operand buffer; in-place memtable values reported pinned; transaction MultiGet torn across keys (WritePrepared / WriteUnprepared); compaction re-read verify flags; new column family visible before its super version; OnBackgroundError for non-stopping errors
 - [x] No flush before a successful open + failed open waits for jobs; SstFileManager reservation leak; LOG roll failure; sequential file refill; checkpoint waits for purges; OPTIONS files vs disabled deletions
-- [ ] LockWAL does not stop memtable / WAL switches; UnlockWAL does not wait for stalls to end; SwitchWAL skips empty column families
-- [ ] Atomic flush vs drop fails the group; SetOptions edits live options in place (jobs need an immutable snapshot); manual compaction room check; max-allowed-space check per output file
-- [ ] Replication: failed chunk write skipped after recovery; plain replication lineage check; commit delay controller stale lag; leftover checkpoint directories; restore without CURRENT
+- [x] LockWAL stops memtable / WAL switches; UnlockWAL waits for stalls to end; SwitchWAL switches empty column families; closed WALs kept while deletions are disabled
+- [x] Atomic flush vs drop; compactions hold an options snapshot; manual compaction room check; max-allowed-space check per output file; ingestion / import install callback; zstd thread contexts; abandoned secondary lookups; truncated row cache entry
+- [x] Replication: failed chunk write no longer skipped (recovery veto + apply marker); plain replication lineage; commit delay controller stale lag; leftover checkpoint directories; restore without CURRENT; attach pin; strict term map; upload duration bound
+- [ ] Product decisions: per-node identities behind the shared secret; resync destroys the old copy first
+- [ ] Minor: transaction rollback reads at the published sequence; `LockWalAsync` holder has no owner thread for the deadlock check
