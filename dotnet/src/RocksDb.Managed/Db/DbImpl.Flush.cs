@@ -792,10 +792,11 @@ internal sealed partial class DbImpl
                 "Writes have been stopped, thus unable to perform manual flush. Please try again later after writes are resumed");
         }
         // "if (lock_wal_owner_thread_id_counts_.count(env_->GetThreadID()) > 0) return Status::Aborted(...)": the flush
-        // below waits for LockWAL to clear, which this thread would never do. Only a lock taken through the
-        // synchronous API has an owner thread, and only a synchronous flush blocks it; an asynchronous flush awaited by
-        // the holder of the lock stays pending until the lock is released.
-        if (wait && synchronous && CurrentThreadHoldsWalLock())
+        // below waits for LockWAL to clear, which this caller would never do. A lock taken through the synchronous API
+        // has an owner thread (a synchronous flush blocks it); a lock taken through the asynchronous API is known to
+        // the asynchronous flow that took it (and to the flows it started while holding it), whose flush - awaited or
+        // blocking - would wait for an unlock that comes after it.
+        if (wait && ((synchronous && CurrentThreadHoldsWalLock()) || CurrentFlowHoldsWalLock()))
             throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Likely deadlock as the same thread called LockWAL()");
         // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
         // moves to a write wake-up thread first, so that it never blocks its caller.

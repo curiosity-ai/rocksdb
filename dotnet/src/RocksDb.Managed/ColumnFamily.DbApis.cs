@@ -96,15 +96,23 @@ public sealed class WalLock : IDisposable
     private Db.DbImpl? _db;
 
     private readonly int _ownerThreadId; // the thread of a synchronous LockWal (0 for LockWalAsync)
+    private readonly Db.DbImpl.WalLockFlow? _flow; // the asynchronous flow of a LockWalAsync
 
-    internal WalLock(Db.DbImpl db, int ownerThreadId)
+    internal WalLock(Db.DbImpl db, int ownerThreadId, Db.DbImpl.WalLockFlow? flow)
     {
         _db = db;
         _ownerThreadId = ownerThreadId;
+        _flow = flow;
     }
 
     /// <summary>Releases this lock (DB::UnlockWAL); writes resume when every lock was released. Idempotent.</summary>
-    public void Dispose() => Interlocked.Exchange(ref _db, null)?.UnlockWal(_ownerThreadId);
+    public void Dispose()
+    {
+        Db.DbImpl? db = Interlocked.Exchange(ref _db, null);
+        if (db is null) return;
+        if (_flow is not null) _flow.Held = false;
+        db.UnlockWal(_ownerThreadId);
+    }
 }
 
 public sealed partial class ColumnFamily
@@ -265,14 +273,26 @@ public sealed partial class RocksDatabase
     public WalLock LockWal()
     {
         SyncValueTask.GetResult(_db.LockWalAsync(synchronous: true, CancellationToken.None));
-        return new WalLock(_db, Environment.CurrentManagedThreadId);
+        return new WalLock(_db, Environment.CurrentManagedThreadId, null);
     }
 
-    /// <summary>Async <see cref="LockWal"/>.</summary>
-    public async ValueTask<WalLock> LockWalAsync(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Async <see cref="LockWal"/>. The asynchronous flow that calls this (and flows it starts while it holds the lock)
+    /// is remembered as the holder: a waiting flush from it fails with Aborted ("likely deadlock") instead of waiting
+    /// for an unlock that would come after the flush, like a flush from the thread that holds a synchronous lock.
+    /// </summary>
+    public ValueTask<WalLock> LockWalAsync(CancellationToken cancellationToken = default)
+    {
+        // Not an async method: the holder mark must be set in the caller's flow.
+        Db.DbImpl.WalLockFlow flow = _db.BeginWalLockFlow();
+        return LockWalCoreAsync(flow, cancellationToken);
+    }
+
+    private async ValueTask<WalLock> LockWalCoreAsync(Db.DbImpl.WalLockFlow flow, CancellationToken cancellationToken)
     {
         await _db.LockWalAsync(synchronous: false, cancellationToken).ConfigureAwait(false);
-        return new WalLock(_db, 0);
+        flow.Held = true;
+        return new WalLock(_db, 0, flow);
     }
 
     /// <summary>

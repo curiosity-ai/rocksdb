@@ -317,4 +317,54 @@ public sealed class Audit14ReviewTests
         db.CompactRange(null, null);
         Assert.AreEqual("ccc", GetString(db, "key0007")![..3]);
     }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task FlushFromTheFlowHoldingAnAsyncWalLockFailsInsteadOfWaitingForever()
+    {
+        // FlushMemTable: "if (lock_wal_owner_thread_id_counts_.count(env_->GetThreadID()) > 0) return Status::Aborted(
+        // Likely deadlock as the same thread called LockWAL())". A lock taken with LockWalAsync has no owner thread;
+        // the asynchronous flow that took it is the holder. Its flush would wait for an unlock that comes after it.
+        using RocksDatabase db = RocksDatabase.Open("/audit15lockflow", NewOptions(NewFs()));
+        db.Put(B("a"), B("1"));
+        WalLock held = await db.LockWalAsync();
+        try
+        {
+            var e = await Assert.ThrowsExactlyAsync<RocksDbException>(async () => await db.FlushAsync());
+            Assert.AreEqual(StatusCode.Aborted, e.Code, e.Message);
+            e = Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+            Assert.AreEqual(StatusCode.Aborted, e.Code, e.Message);
+        }
+        finally
+        {
+            held.Dispose();
+        }
+        await db.FlushAsync(); // released: the same flow flushes again
+        Assert.AreEqual("1", GetString(db, "a"));
+    }
+
+    [TestMethod]
+    public void WriteUnpreparedRollbackForgetsTheWalOfItsUnpreparedBatches()
+    {
+        // After a Rollback from STARTED the transaction is usable again and its unprepared batches are gone. Upstream
+        // keeps log_number_ (reset only in Reinitialize): the next unprepared batch is then not marked as a prepared
+        // section of its WAL, and the final commit releases the old WAL a second time. The port resets it.
+        DbOptions o = NewOptions(NewFs());
+        using TransactionDatabase db = TransactionDatabase.Open("/audit15wuplog", o, new TransactionDbOptions { WritePolicy = TransactionWritePolicy.WriteUnprepared });
+        DbImpl impl = db.Database.Impl;
+        using Transaction txn = db.BeginTransaction(s_wo, new TransactionOptions { WriteBatchFlushThreshold = 1 });
+        txn.SetName("xid");
+        txn.Put(B("a"), B("1"));
+        txn.Put(B("b"), B("1")); // the first batch is in the WAL as an unprepared batch
+        Assert.AreNotEqual(0UL, impl.FindMinLogContainingOutstandingPrep());
+        txn.Rollback();
+        Assert.AreEqual(0UL, impl.FindMinLogContainingOutstandingPrep(), "the rolled back batches no longer hold their WAL");
+        txn.Put(B("c"), B("2"));
+        txn.Put(B("d"), B("2")); // unprepared again
+        Assert.AreNotEqual(0UL, impl.FindMinLogContainingOutstandingPrep(), "the new unprepared batch was not marked in its WAL");
+        txn.Commit();
+        Assert.AreEqual(0UL, impl.FindMinLogContainingOutstandingPrep());
+        Assert.AreEqual("2", GetString(db.Database, "c"));
+        Assert.IsNull(GetString(db.Database, "a"));
+    }
 }

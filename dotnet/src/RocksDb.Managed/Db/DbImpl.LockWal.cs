@@ -85,6 +85,42 @@ internal sealed partial class DbImpl
         }
     }
 
+    /// <summary>
+    /// A LockWAL taken through the asynchronous API, as seen from the asynchronous flow that took it: the flow (and the
+    /// flows it starts while it holds the lock) carries this token in an AsyncLocal, the way the thread id identifies
+    /// the holder of a synchronous lock. <see cref="Held"/> is set once the lock is acquired and cleared by the
+    /// unlock, whichever flow or thread releases it.
+    /// </summary>
+    internal sealed class WalLockFlow(DbImpl db, WalLockFlow? outer)
+    {
+        public readonly DbImpl Db = db;
+        public readonly WalLockFlow? Outer = outer;
+        public volatile bool Held;
+    }
+
+    private static readonly AsyncLocal<WalLockFlow?> s_walLockFlow = new();
+
+    /// <summary>
+    /// Marks the calling asynchronous flow as about to take a LockWAL. Must be called synchronously by the method the
+    /// user awaits (an AsyncLocal set inside an async method does not flow back to its caller).
+    /// </summary>
+    internal WalLockFlow BeginWalLockFlow()
+    {
+        var flow = new WalLockFlow(this, s_walLockFlow.Value);
+        s_walLockFlow.Value = flow;
+        return flow;
+    }
+
+    /// <summary>True when the calling asynchronous flow took a LockWAL of this DB through the asynchronous API and it is still held.</summary>
+    private bool CurrentFlowHoldsWalLock()
+    {
+        for (WalLockFlow? f = s_walLockFlow.Value; f is not null; f = f.Outer)
+        {
+            if (f.Held && ReferenceEquals(f.Db, this)) return true;
+        }
+        return false;
+    }
+
     /// <summary>True when the calling thread took a LockWAL through the synchronous API and still holds it.</summary>
     private bool CurrentThreadHoldsWalLock()
     {

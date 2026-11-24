@@ -287,7 +287,8 @@ internal sealed class WriteUnpreparedTxn : WritePreparedTxn
         using var rollbackBatch = new WriteBatchWithIndex(0, withNoop: false);
         var callback = new WritePreparedTxnReadCallback();
         callback.Init(_wpDb, DbFormat.MaxSequenceNumber, ReadCallback.MinUnCommittedSeq, SnapshotBackup.BackedByDbSnapshot);
-        WriteRollbackKeys(_tracked, rollbackBatch, callback, null);
+        // roptions.snapshot = wpt_db_->GetMaxSnapshot() (see WritePreparedTxn's rollback).
+        WriteRollbackKeys(_tracked, rollbackBatch, callback, _db.MaxSnapshotReadOptions);
         // The Rollback marker will be used as a batch separator
         rollbackBatch.WriteBatch.MarkRollback(NameBytes);
         bool doOneWrite = !TwoWriteQueues;

@@ -591,22 +591,22 @@ internal class PessimisticTransaction : Transaction
 
         if (commitWithoutPrepare)
         {
-            // CommitWithoutPrepareInternal: the commit timestamp is checked (and assigned) before anything is written.
-            try
-            {
-                if (_commitTimeBatch is { Count: > 0 }) throw Invalid("Commit-time batch contains values that will not be committed.");
-                AssignCommitTimestamp();
-                CheckPendingSnapshotRequest();
-            }
-            catch
+            // PessimisticTransaction::Commit: a non-empty commit-time batch is refused before anything changes (the
+            // transaction stays as it was).
+            if (_commitTimeBatch is { Count: > 0 })
             {
                 SetState(TransactionState.Started);
-                throw;
+                throw Invalid("Commit-time batch contains values that will not be committed.");
             }
             SetState(TransactionState.AwaitingCommit);
             if (_logNumber > 0) _db.MarkLogAsHavingPrepSectionFlushed(_logNumber);
             try
             {
+                // WriteCommittedTxn::CommitWithoutPrepareInternal checks the commit timestamp first: like any failure of
+                // the commit write, a missing timestamp ends the attempt with the transaction cleared and left in
+                // AWAITING_COMMIT (upstream: "s = CommitWithoutPrepareInternal(); ... Clear();").
+                AssignCommitTimestamp();
+                CheckPendingSnapshotRequest();
                 ValueTask w = CommitWithoutPrepareInternalAsync(synchronous, cancellationToken);
                 if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
             }
@@ -749,6 +749,12 @@ internal class PessimisticTransaction : Transaction
                 ValueTask w = RollbackInternalAsync(synchronous, cancellationToken);
                 if (!w.IsCompletedSuccessfully) await w.ConfigureAwait(false);
                 _db.MarkLogAsHavingPrepSectionFlushed(_logNumber);
+                // The transaction stays usable and its unprepared batches are gone: forget their WAL. Upstream keeps
+                // log_number_ (it is reset only in Reinitialize), so the next unprepared batch is not marked as a prepared
+                // section of its WAL and the eventual commit or rollback releases the old WAL a second time, which can
+                // drop another transaction's reference on it. Fixed here (deviation).
+                _logNumber = 0;
+                ResetPrepareSequenceAfterRollback();
             }
             // prepare couldn't have taken place
             Clear();
@@ -767,6 +773,11 @@ internal class PessimisticTransaction : Transaction
     {
         if (State != TransactionState.Started) throw Invalid("Transaction is beyond state for rollback.");
         return base.RollbackToSavePoint();
+    }
+
+    /// <summary>WritePrepared / WriteUnprepared: the id of the rolled back unprepared data no longer names anything.</summary>
+    private protected virtual void ResetPrepareSequenceAfterRollback()
+    {
     }
 
     /// <summary>Write-policy cleanup when the transaction is disposed (WriteUnprepared rolls back unprepared data).</summary>
