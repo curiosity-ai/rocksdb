@@ -205,32 +205,78 @@ and no RPC takes a whole `WriteBatch`.
 Limits of both: the receiver holds one whole batch / write in memory (the reassembly buffer, plus the engine's copy
 while it is applied) - fragments bound the size of a message, not of a write; the caps above bound the write.
 
-### Encryption and authentication over gRPC (`SharedSecretTls`)
+### Security over gRPC: identities from a shared secret (`GrpcSecurity`, `SharedSecretTls`)
 
-By default the gRPC transport is plaintext and a server accepts every caller: use that on a trusted network only.
-`SharedSecretTls` turns on TLS with authentication in both directions from one secret (a byte array of at least 16
-random bytes) that every node and client of the deployment holds:
+Every gRPC server and client states how it is secured; there is no default. `GrpcNodeServerOptions.Security` is a
+required property and the clients take a `GrpcSecurity` argument:
+
+* `GrpcSecurity.SharedSecret(tls)`: TLS with authentication in both directions. Endpoints must be `https://`.
+* `GrpcSecurity.InsecureNoAuthentication`: plaintext HTTP/2, every caller that reaches the port may make every call as
+  any node. Endpoints must be `http://`. For tests, benchmarks and networks where every reachable process is trusted
+  (the samples and the soak tool use it).
+
+A mismatch (a secret with `http://`, no authentication with `https://`) throws ArgumentException when the client or
+server is created.
 
 ```csharp
-using var tls = new SharedSecretTls(secret);                       // one per process
+// One per process: the deployment's secret (at least 16 random bytes) and who this process is.
+using var tls = new SharedSecretTls(secret, ReplicationCaller.Node("A"));
+GrpcSecurity security = GrpcSecurity.SharedSecret(tls);
 await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(
-    host, address, port, new GrpcNodeServerOptions { Tls = tls }, ct);
-using var peer = new GrpcPairClient("B", "https://10.0.0.2:5000", timeout, tls.CreateChannelOptions());
+    host, address, port, new GrpcNodeServerOptions { Security = security }, ct);
+using var peer = new GrpcPairClient("B", "https://10.0.0.2:5000", timeout, security);   // accepts only node B there
 ```
 
-Each `SharedSecretTls` creates a random key pair and a self-signed certificate with an extension holding an HMAC of its
-public key, keyed with a key derived from the secret. Server and client both present their certificate and accept the
-other side only when that HMAC matches. Only a holder of the secret can make an accepted certificate; a copied
-certificate is useless without its private key; the secret itself is never sent.
+**Handshake.** Each `SharedSecretTls` creates a random key pair and a self-signed certificate that states an identity
+(a kind and a name) in an extension, and a proof: an HMAC over the certificate's public key and that identity, keyed
+with a key derived from the secret. Both sides present their certificate and verify the other's proof during the TLS
+handshake. Only a holder of the secret can make an accepted certificate, a copied certificate is useless without its
+private key, an identity cannot be changed without invalidating the proof, and the secret is never sent. The server
+hands the proven identity to the services (`GrpcCallerResolver`, checked once per connection). A client created for a
+node (`GrpcPairClient`, `GrpcClusterClient`) accepts only a server that proves to be that node; `GrpcReplicationClient`
+accepts any node.
 
-* Host names, validity dates, chains and revocation are not checked: the secret is the only identity, and every holder
-  is trusted as any node and any client (there are no roles).
-* All nodes and clients need the secret, including clients that only write.
-* To change the secret, restart the nodes with the new one; a node accepts one secret at a time.
-* A caller without the secret fails in the TLS handshake. `GrpcPairClient` and `GrpcClusterClient` wait for a
-  connection, so there a wrong secret looks like an unreachable peer (calls end at their deadline).
-* A host that runs the services in its own ASP.NET Core application uses `tls.ConfigureServer` in Kestrel's `UseHttps`
-  and `tls.ConfigureClient` on its own `SocketsHttpHandler`.
+**Identities** (`ReplicationCaller`):
+
+| Kind | Who | May call |
+|---|---|---|
+| `Node(id)` | a member of the deployment, under the node id of its host options | everything below, plus the node-to-node calls of the nodes that list it as a peer |
+| `Operator(name)` | tooling that changes roles | client calls and `IPairService.HandOffAsync` |
+| `Client(name)` | applications | status, writes (`WriteAsync`, `WriteFragmentsAsync`), checksums |
+
+Node-to-node calls are: votes, heartbeats, log checks, the WAL stream, snapshots and file hashes, progress reports,
+epoch/term queries, `PromoteAsync` and `RejectEpochAsync`. A node accepts them only from a `Node` whose id is one of
+its configured peers (`ClusterNodeHostOptions.Members`, `PairNodeHostOptions.PeerId`), and where the request names a
+node (the candidate of a vote, the leader of a heartbeat, the follower of a log check, a stream or a progress report,
+the old primary of a promotion) that name must be the caller's. A plain `ReplicationPrimary` server lists its replicas
+in `GrpcNodeServerOptions.ReplicaNodeIds`, in the order of their replica index: only they read the snapshot and the
+stream, and a replica reports progress only under its own index. Refusals are gRPC `PermissionDenied`
+(`ReplicationUnauthorizedException` from `ReplicationAuthorizer`, which each host exposes as `Authorization`); the
+node clients treat them like any failed call. `GrpcNodeServer.StartAsync` refuses a certificate that is not a `Node`
+or names another node than its host.
+
+**One secret or two.** With one secret every holder can make a certificate of any kind and name: identities then
+protect against misconfiguration and misdirected calls, not against a holder that lies. To keep applications from
+acting as nodes or operators, give them their own secret:
+
+```csharp
+using var nodeTls = new SharedSecretTls(nodeSecret, clientSecret, ReplicationCaller.Node("A"));  // nodes, operators
+using var appTls = SharedSecretTls.ForClient(clientSecret, "billing");                            // applications
+```
+
+A holder of only the client secret is accepted as a `Client` and as nothing else. It can check that a server holds the
+client secret, not that it holds the nodes' secret.
+
+* Host names, validity dates, chains and revocation are not checked.
+* To change a secret, restart the nodes with the new one; a node accepts one secret of each kind at a time.
+* A caller with a wrong secret fails in the TLS handshake. `GrpcPairClient` and `GrpcClusterClient` wait for a
+  connection, so there a wrong secret or a wrong node behind the endpoint looks like an unreachable peer (calls end at
+  their deadline).
+* The checks sit at the transport: the gRPC services (and the tests' in-memory transport) ask the authorizer, the
+  hosts' `Handle...` methods are the trusted in-process API. A host that maps the services in its own ASP.NET Core
+  application registers a `GrpcCallerResolver` (and for `ReplicationService` a `ReplicationAuthorizer.ForReplicas`)
+  as singletons, uses `tls.ConfigureServer` in Kestrel's `UseHttps`, and `tls.ConfigureClient` on its own
+  `SocketsHttpHandler`.
 * Dispose the `SharedSecretTls` after the servers and channels that use it.
 
 ### Message sizes over gRPC

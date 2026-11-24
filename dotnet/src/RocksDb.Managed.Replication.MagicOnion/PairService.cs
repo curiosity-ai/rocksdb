@@ -40,28 +40,50 @@ public interface IPairService : IService<IPairService>
     Task<ClientStreamingResult<WriteFragmentDto, PairWriteResultDto>> WriteFragmentsAsync();
 }
 
-/// <summary>Server side of <see cref="IPairService"/>: delegates to the process's <see cref="PairNodeHost"/>.</summary>
-public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, IPairService
+/// <summary>
+/// Server side of <see cref="IPairService"/>: delegates to the process's <see cref="PairNodeHost"/>, after the host's
+/// <see cref="ReplicationAuthorizer"/> accepted the caller. Promotion requests, epoch rejections, attach checks, the WAL
+/// and snapshot streams, the epoch map and progress reports are for the other node of the pair (a promotion request
+/// must name the caller as the old primary); a handoff is for an operator or the other node; status, writes and
+/// checksums are for any authenticated caller. A refused call fails with PermissionDenied.
+/// </summary>
+public sealed class PairService(PairNodeHost host, GrpcCallerResolver callers) : ServiceBase<IPairService>, IPairService
 {
-    public UnaryResult<PairStatusDto> GetStatusAsync() => UnaryResult.FromResult(PairStatusDto.From(host.HandleGetStatus()));
+    private void Peer(string? claimedNodeId, string operation) =>
+        GrpcAuthorization.Peer(callers, Context.CallContext, host.Authorization, claimedNodeId, operation);
+
+    private void Authenticated(string operation) => GrpcAuthorization.Authenticated(callers, Context.CallContext, host.Authorization, operation);
+
+    public UnaryResult<PairStatusDto> GetStatusAsync()
+    {
+        Authenticated(nameof(GetStatusAsync));
+        return UnaryResult.FromResult(PairStatusDto.From(host.HandleGetStatus()));
+    }
 
     public async UnaryResult<PromoteResultDto> PromoteAsync(PromoteDto request)
     {
+        Peer(request.FromPrimaryId, nameof(PromoteAsync));
         PromoteResult r = await host.HandlePromoteAsync(new PromoteRequest(request.Epoch, request.FromPrimaryId, request.HandoffSeq, request.CatchUpTimeoutMs))
             .ConfigureAwait(false);
         return new PromoteResultDto { Promoted = r.Promoted, Epoch = r.Epoch, Role = (int)r.Role, Reason = r.Reason };
     }
 
-    public async UnaryResult<PairStatusDto> RejectEpochAsync(long epoch) => PairStatusDto.From(await host.HandleRejectEpochAsync(epoch).ConfigureAwait(false));
+    public async UnaryResult<PairStatusDto> RejectEpochAsync(long epoch)
+    {
+        Peer(null, nameof(RejectEpochAsync));
+        return PairStatusDto.From(await host.HandleRejectEpochAsync(epoch).ConfigureAwait(false));
+    }
 
     public UnaryResult<ReplicaLogCheckDto> CheckReplicaLogAsync(ulong replicaLatestSeq, long replicaEpochAtLatest)
     {
+        Peer(null, nameof(CheckReplicaLogAsync));
         ReplicaLogCheck r = host.HandleCheckReplicaLog(replicaLatestSeq, replicaEpochAtLatest);
         return UnaryResult.FromResult(new ReplicaLogCheckDto { IsPrimary = r.IsPrimary, Consistent = r.Consistent, Epoch = r.Epoch, Epochs = r.Epochs });
     }
 
     public async Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(ulong startSeq)
     {
+        Peer(null, nameof(SyncUpdatesAsync));
         ServerStreamingContext<WalChunkDto> stream = GetServerStreamingContext<WalChunkDto>();
         // The call's token (client gone, deadline, server stopping) or the host shutting down ends a write that a
         // stalled client would otherwise block forever - with the host's database still in use by this handler.
@@ -80,10 +102,15 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         return stream.Result();
     }
 
-    public UnaryResult<string> GetEpochsAsync() => UnaryResult.FromResult(host.HandleGetEpochs());
+    public UnaryResult<string> GetEpochsAsync()
+    {
+        Peer(null, nameof(GetEpochsAsync));
+        return UnaryResult.FromResult(host.HandleGetEpochs());
+    }
 
     public async Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync()
     {
+        Peer(null, nameof(SyncInitialStateAsync));
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
         CancellationToken ct = linked.Token;
@@ -94,11 +121,15 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         return stream.Result();
     }
 
-    public async UnaryResult<PairWriteResultDto> WriteAsync(string key, string value) =>
-        await ApplyAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), Context.CallContext.CancellationToken).ConfigureAwait(false);
+    public async UnaryResult<PairWriteResultDto> WriteAsync(string key, string value)
+    {
+        Authenticated(nameof(WriteAsync));
+        return await ApplyAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), Context.CallContext.CancellationToken).ConfigureAwait(false);
+    }
 
     public async Task<ClientStreamingResult<WriteFragmentDto, PairWriteResultDto>> WriteFragmentsAsync()
     {
+        Authenticated(nameof(WriteFragmentsAsync));
         ClientStreamingContext<WriteFragmentDto, PairWriteResultDto> stream = GetClientStreamingContext<WriteFragmentDto, PairWriteResultDto>();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
         CancellationToken ct = Context.CallContext.CancellationToken;
@@ -117,14 +148,22 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
 
     public UnaryResult<bool> ReportProgressAsync(ulong appliedThrough, long epochAtApplied)
     {
+        Peer(null, nameof(ReportProgressAsync));
         host.HandleReportProgress(appliedThrough, epochAtApplied);
         return UnaryResult.FromResult(true);
     }
 
-    public async UnaryResult<SwitchoverResultDto> HandOffAsync() =>
-        SwitchoverResultDto.From(await host.HandOffAsync(CancellationToken.None).ConfigureAwait(false));
+    public async UnaryResult<SwitchoverResultDto> HandOffAsync()
+    {
+        GrpcAuthorization.OperatorOrPeer(callers, Context.CallContext, host.Authorization, nameof(HandOffAsync));
+        return SwitchoverResultDto.From(await host.HandOffAsync(CancellationToken.None).ConfigureAwait(false));
+    }
 
-    public UnaryResult<DigestDto> ChecksumAsync() => UnaryResult.FromResult(DigestDto.From(host.Checksum()));
+    public UnaryResult<DigestDto> ChecksumAsync()
+    {
+        Authenticated(nameof(ChecksumAsync));
+        return UnaryResult.FromResult(DigestDto.From(host.Checksum()));
+    }
 }
 
 /// <summary><see cref="IPairNodeClient"/> over gRPC (rocksdb-sharp SwitchoverTest's PairPeer).</summary>
@@ -134,16 +173,24 @@ public sealed class GrpcPairClient : IPairNodeClient, IDisposable
     private readonly IPairService _client;
     private readonly TimeSpan _statusTimeout;
 
-    public GrpcPairClient(string nodeId, string endpoint, TimeSpan statusTimeout) : this(nodeId, endpoint, statusTimeout, new GrpcChannelOptions())
+    /// <summary>
+    /// A client of the pair node <paramref name="nodeId"/> at <paramref name="endpoint"/>. <paramref name="security"/>:
+    /// with a shared secret the channel presents this process's identity and accepts only a server that proves to be
+    /// that node.
+    /// </summary>
+    public GrpcPairClient(string nodeId, string endpoint, TimeSpan statusTimeout, GrpcSecurity security)
+        : this(nodeId, endpoint, statusTimeout, security, new GrpcChannelOptions())
     {
     }
 
     /// <summary>A client whose channel uses <paramref name="channelOptions"/>, completed with <see cref="GrpcTransportDefaults.Apply"/>.</summary>
-    public GrpcPairClient(string nodeId, string endpoint, TimeSpan statusTimeout, GrpcChannelOptions channelOptions)
+    public GrpcPairClient(string nodeId, string endpoint, TimeSpan statusTimeout, GrpcSecurity security, GrpcChannelOptions channelOptions)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(nodeId);
+        ArgumentNullException.ThrowIfNull(security);
         ArgumentNullException.ThrowIfNull(channelOptions);
         NodeId = nodeId;
-        _channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.Apply(channelOptions));
+        _channel = GrpcChannel.ForAddress(endpoint, security.ApplyToChannel(channelOptions, endpoint, nodeId));
         _client = MagicOnionClient.Create<IPairService>(_channel);
         _statusTimeout = statusTimeout;
     }

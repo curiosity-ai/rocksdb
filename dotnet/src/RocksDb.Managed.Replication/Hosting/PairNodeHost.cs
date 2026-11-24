@@ -214,10 +214,16 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         WalTailer.ValidateChunkSizes(options.MaxChunkBytes, options.SnapshotChunkBytes);
         _cfg = options;
         _peer = peer;
+        Authorization = new ReplicationAuthorizer(options.NodeId, [options.PeerId]);
         _fs = options.DbOptionsFactory().FileSystem;
     }
 
     public string NodeId => _cfg.NodeId;
+    /// <summary>
+    /// Who may call this node's endpoints: its node-to-node endpoints are for the other node of the pair. A transport
+    /// asks it before it hands a call to this host (see <see cref="ReplicationAuthorizer"/>).
+    /// </summary>
+    public ReplicationAuthorizer Authorization { get; }
     public int MaxChunkBytes => _cfg.MaxChunkBytes;
     public int SnapshotChunkBytes => _cfg.SnapshotChunkBytes;
     public RocksDatabase Db => _db;

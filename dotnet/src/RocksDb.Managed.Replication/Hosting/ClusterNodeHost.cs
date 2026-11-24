@@ -164,10 +164,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         WalTailer.ValidateChunkSizes(options.MaxChunkBytes, options.SnapshotChunkBytes);
         _cfg = options;
         _clients = clientFactory;
+        var memberIds = new List<string>();
+        foreach (ClusterMember m in options.Members) memberIds.Add(m.NodeId);
+        Authorization = new ReplicationAuthorizer(options.NodeId, memberIds);
         _fs = options.DbOptionsFactory().FileSystem;
     }
 
     public string NodeId => _cfg.NodeId;
+    /// <summary>
+    /// Who may call this node's endpoints: its node-to-node endpoints are for the other members, under their own node
+    /// id. A transport asks it before it hands a call to this host (see <see cref="ReplicationAuthorizer"/>).
+    /// </summary>
+    public ReplicationAuthorizer Authorization { get; }
     public int MaxChunkBytes => _cfg.MaxChunkBytes;
     public int SnapshotChunkBytes => _cfg.SnapshotChunkBytes;
     public RocksDatabase Db => _db;

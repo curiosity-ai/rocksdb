@@ -26,7 +26,7 @@ return await RunCoordinatorAsync();
 
 static async Task<int> RunNodeAsync(string id, int port, string dbPath, ReplicationRole initialRole, string peerId, int peerPort)
 {
-    using var peer = new GrpcPairClient(peerId, "http://127.0.0.1:" + peerPort, TimeSpan.FromSeconds(2));
+    using var peer = new GrpcPairClient(peerId, "http://127.0.0.1:" + peerPort, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
     await using var host = new PairNodeHost(new PairNodeHostOptions
     {
         NodeId = id,
@@ -37,7 +37,7 @@ static async Task<int> RunNodeAsync(string id, int port, string dbPath, Replicat
         DbOptionsFactory = static () => new DbOptions { WalTtlSeconds = 600 },
         Log = static m => Console.WriteLine(DateTime.UtcNow.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + " " + m),
     }, peer);
-    await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(host, System.Net.IPAddress.Loopback, port, CancellationToken.None);
+    await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(host, System.Net.IPAddress.Loopback, port, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
     await host.StartAsync(CancellationToken.None);
     Console.WriteLine("READY " + id);
     // Run until the coordinator kills us (or closes stdin).

@@ -173,34 +173,64 @@ public sealed class InMemoryClusterClient(InMemoryNetwork network, string from, 
 {
     public string NodeId => to;
 
+    /// <summary>
+    /// Who this client is to the target, as a real transport would have authenticated it: the node it calls from. The
+    /// target's <see cref="ReplicationAuthorizer"/> is asked before every call, like the gRPC services do (a refusal
+    /// throws <see cref="ReplicationUnauthorizedException"/>). Tests set another identity to play an impostor.
+    /// </summary>
+    public ReplicationCaller Caller { get; set; } = ReplicationCaller.Node(from);
+
     private ClusterNodeHost? Target => network.Resolve<ClusterNodeHost>(from, to);
 
+    /// <summary>The target if it is reachable, after it accepted this caller for a node-to-node call.</summary>
+    private ClusterNodeHost? Peer(string? claimedNodeId, string operation)
+    {
+        ClusterNodeHost? t = Target;
+        t?.Authorization.RequirePeer(Caller, claimedNodeId, operation);
+        return t;
+    }
+
+    private ClusterNodeHost RequirePeer(string? claimedNodeId, string operation)
+    {
+        ClusterNodeHost t = network.Require<ClusterNodeHost>(from, to);
+        t.Authorization.RequirePeer(Caller, claimedNodeId, operation);
+        return t;
+    }
+
     public async Task<RequestVoteResult?> RequestVoteAsync(RequestVotePayload request, CancellationToken cancellationToken) =>
-        Target is { } t ? await t.HandleRequestVoteAsync(request, cancellationToken).ConfigureAwait(false) : null;
+        Peer(request.CandidateId, nameof(RequestVoteAsync)) is { } t ? await t.HandleRequestVoteAsync(request, cancellationToken).ConfigureAwait(false) : null;
 
     public async Task<AppendEntriesResult?> HeartbeatAsync(HeartbeatPayload payload, CancellationToken cancellationToken) =>
-        Target is { } t ? await t.HandleHeartbeatAsync(payload, cancellationToken).ConfigureAwait(false) : null;
+        Peer(payload.LeaderId, nameof(HeartbeatAsync)) is { } t ? await t.HandleHeartbeatAsync(payload, cancellationToken).ConfigureAwait(false) : null;
 
-    public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.GetStatus());
+    public Task<ClusterNodeStatus?> GetStatusAsync(CancellationToken cancellationToken)
+    {
+        ClusterNodeHost? t = Target;
+        t?.Authorization.RequireAuthenticated(Caller, nameof(GetStatusAsync));
+        return Task.FromResult(t?.GetStatus());
+    }
 
     public async Task<ClusterAttachResult?> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest, CancellationToken cancellationToken) =>
-        Target is { } t ? await t.HandleCheckLogConsistencyAsync(latestSeq, termAtLatest, cancellationToken).ConfigureAwait(false) : null;
+        Peer(followerId, nameof(CheckLogConsistencyAsync)) is { } t
+            ? await t.HandleCheckLogConsistencyAsync(latestSeq, termAtLatest, cancellationToken).ConfigureAwait(false)
+            : null;
 
     public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(string followerId, ulong startSeq, CancellationToken cancellationToken) =>
-        InMemoryNetwork.Pump(ct => network.Require<ClusterNodeHost>(from, to).StreamUpdatesAsync(followerId, startSeq, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
+        InMemoryNetwork.Pump(ct => RequirePeer(followerId, nameof(StreamUpdatesAsync)).StreamUpdatesAsync(followerId, startSeq, ct), static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
 
     public async Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken)
     {
-        if (Target is { } t) await t.HandleReportProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken).ConfigureAwait(false);
+        if (Peer(followerId, nameof(ReportProgressAsync)) is { } t)
+            await t.HandleReportProgressAsync(followerId, appliedThrough, leaderTerm, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken) =>
-        network.Require<ClusterNodeHost>(from, to).HandleGetFileHashesAsync(candidates, cancellationToken);
+        RequirePeer(null, nameof(GetFileHashesAsync)).HandleGetFileHashesAsync(candidates, cancellationToken);
 
     public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
-        InMemoryNetwork.Pump(ct => network.Require<ClusterNodeHost>(from, to).StreamSnapshotAsync(verifiedInventory, ct), static c => c.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
+        InMemoryNetwork.Pump(ct => RequirePeer(null, nameof(StreamSnapshotAsync)).StreamSnapshotAsync(verifiedInventory, ct), static c => c.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
 
-    public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.HandleGetTerms());
+    public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => Task.FromResult(Peer(null, nameof(GetTermsAsync))?.HandleGetTerms());
 }
 
 /// <summary><see cref="IPairNodeClient"/> over an <see cref="InMemoryNetwork"/>, with the fault injection of rocksdb-sharp's SwitchoverTest.</summary>
@@ -214,14 +244,39 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
 
     public string NodeId => to;
 
+    /// <summary>
+    /// Who this client is to the target (see <see cref="InMemoryClusterClient.Caller"/>): the node it calls from. The
+    /// target's <see cref="ReplicationAuthorizer"/> is asked before every call.
+    /// </summary>
+    public ReplicationCaller Caller { get; set; } = ReplicationCaller.Node(from);
+
     private PairNodeHost? Target => network.Resolve<PairNodeHost>(from, to);
 
-    public Task<ReplicationNodeStatus?> GetStatusAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.HandleGetStatus());
+    private PairNodeHost? Peer(string? claimedNodeId, string operation)
+    {
+        PairNodeHost? t = Target;
+        t?.Authorization.RequirePeer(Caller, claimedNodeId, operation);
+        return t;
+    }
+
+    private PairNodeHost RequirePeer(string? claimedNodeId, string operation)
+    {
+        PairNodeHost t = network.Require<PairNodeHost>(from, to);
+        t.Authorization.RequirePeer(Caller, claimedNodeId, operation);
+        return t;
+    }
+
+    public Task<ReplicationNodeStatus?> GetStatusAsync(CancellationToken cancellationToken)
+    {
+        PairNodeHost? t = Target;
+        t?.Authorization.RequireAuthenticated(Caller, nameof(GetStatusAsync));
+        return Task.FromResult(t?.HandleGetStatus());
+    }
 
     public async Task<PromoteResult?> PromoteAsync(PromoteRequest request, CancellationToken cancellationToken)
     {
         // Faults apply to real promote requests, not to the warm-up probe sent before writes are held.
-        if (request.IsProbe) return await network.Require<PairNodeHost>(from, to).HandlePromoteAsync(request);
+        if (request.IsProbe) return await RequirePeer(request.FromPrimaryId, nameof(PromoteAsync)).HandlePromoteAsync(request);
         LastPromote = request;
         TimeSpan delay = DelayNextPromote;
         DelayNextPromote = TimeSpan.Zero;
@@ -231,12 +286,12 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
             _ = Task.Run(async () =>
             {
                 await Task.Delay(delay);
-                PairNodeHost? late = Target;
+                PairNodeHost? late = Peer(request.FromPrimaryId, nameof(PromoteAsync));
                 if (late != null) LateResult = await late.HandlePromoteAsync(request);
             });
             await Task.Delay(System.Threading.Timeout.Infinite, cancellationToken);
         }
-        PairNodeHost t = network.Require<PairNodeHost>(from, to);
+        PairNodeHost t = RequirePeer(request.FromPrimaryId, nameof(PromoteAsync));
         PromoteResult r = await t.HandlePromoteAsync(request);
         if (DropNextPromoteReply)
         {
@@ -254,12 +309,12 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
 
     public async Task<ReplicationNodeStatus?> RejectEpochAsync(long epoch, CancellationToken cancellationToken)
     {
-        PairNodeHost? t = Target;
+        PairNodeHost? t = Peer(null, nameof(RejectEpochAsync));
         return t == null ? null : await t.HandleRejectEpochAsync(epoch);
     }
 
     public Task<ReplicaLogCheck?> CheckReplicaLogAsync(ulong replicaLatestSeq, long replicaEpochAtLatest, CancellationToken cancellationToken) =>
-        Task.FromResult(Target?.HandleCheckReplicaLog(replicaLatestSeq, replicaEpochAtLatest));
+        Task.FromResult(Peer(null, nameof(CheckReplicaLogAsync))?.HandleCheckReplicaLog(replicaLatestSeq, replicaEpochAtLatest));
 
     /// <summary>Rewrites (or passes through) every message of the WAL streams opened from now on; null for none.</summary>
     public Func<WalStreamMessage, WalStreamMessage>? RewriteStream;
@@ -270,7 +325,7 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
     public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         Func<WalStreamMessage, WalStreamMessage>? rewrite = RewriteStream;
-        await foreach (WalStreamMessage m in InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamUpdatesAsync(startSeq, ct),
+        await foreach (WalStreamMessage m in InMemoryNetwork.Pump(ct => RequirePeer(null, nameof(StreamUpdatesAsync)).StreamUpdatesAsync(startSeq, ct),
                            static m => m.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken))
         {
             WalStreamMessage r = rewrite is null ? m : rewrite(m);
@@ -279,7 +334,7 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
         }
     }
 
-    public Task<string?> GetEpochsAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.HandleGetEpochs());
+    public Task<string?> GetEpochsAsync(CancellationToken cancellationToken) => Task.FromResult(Peer(null, nameof(GetEpochsAsync))?.HandleGetEpochs());
 
     /// <summary>Drop the replica's progress reports (they fail, as on a broken connection).</summary>
     public volatile bool DropProgressReports;
@@ -287,10 +342,10 @@ public sealed class InMemoryPairClient(InMemoryNetwork network, string from, str
     public Task ReportProgressAsync(ulong appliedThrough, long epochAtApplied, CancellationToken cancellationToken)
     {
         if (DropProgressReports) throw new IOException("progress report lost");
-        network.Require<PairNodeHost>(from, to).HandleReportProgress(appliedThrough, epochAtApplied);
+        RequirePeer(null, nameof(ReportProgressAsync)).HandleReportProgress(appliedThrough, epochAtApplied);
         return Task.CompletedTask;
     }
 
     public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(CancellationToken cancellationToken) =>
-        InMemoryNetwork.Pump(ct => network.Require<PairNodeHost>(from, to).StreamSnapshotAsync(ct), static c => c.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
+        InMemoryNetwork.Pump(ct => RequirePeer(null, nameof(StreamSnapshotAsync)).StreamSnapshotAsync(ct), static c => c.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
 }

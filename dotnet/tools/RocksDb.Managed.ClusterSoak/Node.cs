@@ -245,7 +245,7 @@ internal static class NodeMain
         };
         var clients = new Dictionary<string, GrpcClusterClient>(StringComparer.Ordinal);
         foreach (ClusterMember m in members)
-            if (m.NodeId != cfg.NodeId) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromMilliseconds(cfg.RpcTimeoutMs), channelOptions);
+            if (m.NodeId != cfg.NodeId) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromMilliseconds(cfg.RpcTimeoutMs), GrpcSecurity.InsecureNoAuthentication, channelOptions);
 
         var clock = new SkewedTimeProvider();
         ClusterMember self = members.Find(m => m.NodeId == cfg.NodeId)!;

@@ -53,8 +53,8 @@ internal static class StreamBenchmark
         IReplicationSourceClient client;
         if (config.Transport == "grpc")
         {
-            server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, CancellationToken.None).ConfigureAwait(false);
-            client = new GrpcReplicationClient(server.Endpoint);
+            server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None).ConfigureAwait(false);
+            client = new GrpcReplicationClient(server.Endpoint, GrpcSecurity.InsecureNoAuthentication);
         }
         else
         {

@@ -17,11 +17,20 @@ public interface IReplicationService : IService<IReplicationService>
     UnaryResult<ReplicaAttachCheckDto> CheckReplicaLog(ulong latestSeq, long incarnationAtLatest);
 }
 
-/// <summary>Server side of <see cref="IReplicationService"/>, over the process's <see cref="ReplicationPrimary"/>.</summary>
-public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase<IReplicationService>, IReplicationService
+/// <summary>
+/// Server side of <see cref="IReplicationService"/>, over the process's <see cref="ReplicationPrimary"/>. Every endpoint
+/// is for the primary's replicas (<see cref="GrpcNodeServerOptions.ReplicaNodeIds"/>): only they may read its streams
+/// and ask for the attach check, and each reports its progress under its own replica index. A refused call fails with
+/// PermissionDenied.
+/// </summary>
+public sealed class ReplicationService(ReplicationPrimary primary, GrpcCallerResolver callers, ReplicationAuthorizer replicas)
+    : ServiceBase<IReplicationService>, IReplicationService
 {
+    private void Replica(string operation) => GrpcAuthorization.Peer(callers, Context.CallContext, replicas, null, operation);
+
     public async Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync()
     {
+        Replica(nameof(SyncInitialStateAsync));
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
         await foreach (SnapshotChunk c in primary.StreamInitialStateAsync(Context.CallContext.CancellationToken).ConfigureAwait(false))
         {
@@ -32,6 +41,7 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
 
     public async Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(ulong startSeq)
     {
+        Replica(nameof(SyncUpdatesAsync));
         ServerStreamingContext<WalChunkDto> stream = GetServerStreamingContext<WalChunkDto>();
         CancellationToken ct = Context.CallContext.CancellationToken;
         try
@@ -51,12 +61,14 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
     {
         // The index comes from a peer: one that is out of range is an invalid request, not a server fault.
         if (replicaIndex < 0) throw new ReturnStatusException(Grpc.Core.StatusCode.InvalidArgument, "replica index " + replicaIndex);
+        GrpcAuthorization.Replica(callers, Context.CallContext, replicas, replicaIndex, nameof(ReportLastSyncSequenceNumber));
         primary.ReportProgress(replicaIndex, seqNumber);
         return UnaryResult.FromResult(true);
     }
 
     public UnaryResult<ReplicaAttachCheckDto> CheckReplicaLog(ulong latestSeq, long incarnationAtLatest)
     {
+        Replica(nameof(CheckReplicaLog));
         ReplicaAttachCheck r = primary.CheckReplicaLog(latestSeq, incarnationAtLatest);
         return UnaryResult.FromResult(new ReplicaAttachCheckDto { Consistent = r.Consistent, Lineage = r.Lineage, Reason = r.Reason });
     }
@@ -69,21 +81,23 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
     private readonly IReplicationService _client;
     private readonly TimeSpan _unaryTimeout;
 
-    public GrpcReplicationClient(string endpoint) : this(endpoint, TimeSpan.FromSeconds(10))
+    public GrpcReplicationClient(string endpoint, GrpcSecurity security) : this(endpoint, TimeSpan.FromSeconds(10), security)
     {
     }
 
     /// <param name="endpoint">The primary's address.</param>
     /// <param name="unaryTimeout">Deadline of a progress report (a report that misses it is sent again).</param>
-    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout) : this(endpoint, unaryTimeout, new GrpcChannelOptions())
+    /// <param name="security">With a shared secret the channel presents this replica's identity and accepts only a server that proves to be a node.</param>
+    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout, GrpcSecurity security) : this(endpoint, unaryTimeout, security, new GrpcChannelOptions())
     {
     }
 
     /// <summary>A client whose channel uses <paramref name="channelOptions"/>, completed with <see cref="GrpcTransportDefaults.Apply"/>.</summary>
-    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout, GrpcChannelOptions channelOptions)
+    public GrpcReplicationClient(string endpoint, TimeSpan unaryTimeout, GrpcSecurity security, GrpcChannelOptions channelOptions)
     {
+        ArgumentNullException.ThrowIfNull(security);
         ArgumentNullException.ThrowIfNull(channelOptions);
-        _channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.Apply(channelOptions));
+        _channel = GrpcChannel.ForAddress(endpoint, security.ApplyToChannel(channelOptions, endpoint, null));
         _client = MagicOnionClient.Create<IReplicationService>(_channel);
         _unaryTimeout = unaryTimeout;
     }
