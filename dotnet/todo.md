@@ -508,3 +508,11 @@ Still open from this round:
 - [x] FileSyncWorkers start rule, trash worker / recovery chain exception types, write buffer manager stall re-check, sub-millisecond lock wait spin
 - [x] Replication: resync flag on unexpected exceptions, linked CTS leaks, single-node commit index
 - [ ] OCC parallel validation: first-synchronous-committer window (async commits in flight finish on the pool)
+
+## Audit #14 (2026-11-24; docs/validation.md "Audit #14: second review pass")
+
+- [x] Concurrent SetOptions / SetDBOptions lost updates; rolled-back expirable transaction left the expirable map; nested merge clobbered the per-thread operand buffer; in-place memtable values reported pinned; transaction MultiGet torn across keys (WritePrepared / WriteUnprepared); compaction re-read verify flags; new column family visible before its super version; OnBackgroundError for non-stopping errors
+- [x] No flush before a successful open + failed open waits for jobs; SstFileManager reservation leak; LOG roll failure; sequential file refill; checkpoint waits for purges; OPTIONS files vs disabled deletions
+- [ ] LockWAL does not stop memtable / WAL switches; UnlockWAL does not wait for stalls to end; SwitchWAL skips empty column families
+- [ ] Atomic flush vs drop fails the group; SetOptions edits live options in place (jobs need an immutable snapshot); manual compaction room check; max-allowed-space check per output file
+- [ ] Replication: failed chunk write skipped after recovery; plain replication lineage check; commit delay controller stale lag; leftover checkpoint directories; restore without CURRENT

@@ -398,4 +398,37 @@ public sealed class Audit13ThreadingTests
             TestHooks.ClearAll();
         }
     }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public void ConcurrentSetOptionsCallsDoNotRevertEachOther(bool typed)
+    {
+        // DBImpl::SetOptions / SetDBOptions apply the caller's changes to the current options under options_mutex_. The
+        // port built its candidate from a clone taken before the lock and then applied every option that differed from
+        // the live value: a call for option x wrote the old value of y back over what a concurrent call had just set.
+        using RocksDatabase db = RocksDatabase.Open("/audit13setoptions", NewOptions(NewFs()));
+        ColumnFamily cf = db.DefaultColumnFamily;
+        for (int round = 1; round <= 150; round++)
+        {
+            int slowdown = 20 + round, maxBytes = 1_000_000 + round;
+            using var start = new Barrier(2);
+            Task a = Task.Factory.StartNew(() =>
+            {
+                start.SignalAndWait();
+                if (typed) cf.SetOptions(o => o.Level0SlowdownWritesTrigger = slowdown);
+                else cf.SetOptions([new KeyValuePair<string, string>("level0_slowdown_writes_trigger", slowdown.ToString())]);
+            }, TaskCreationOptions.LongRunning);
+            Task b = Task.Factory.StartNew(() =>
+            {
+                start.SignalAndWait();
+                if (typed) cf.SetOptions(o => o.MaxCompactionBytes = (ulong)maxBytes);
+                else cf.SetOptions([new KeyValuePair<string, string>("max_compaction_bytes", maxBytes.ToString())]);
+            }, TaskCreationOptions.LongRunning);
+            Task.WaitAll(a, b);
+            Assert.AreEqual(slowdown, cf.Options.Level0SlowdownWritesTrigger, "round " + round);
+            Assert.AreEqual((ulong)maxBytes, cf.Options.MaxCompactionBytes, "round " + round);
+        }
+    }
 }

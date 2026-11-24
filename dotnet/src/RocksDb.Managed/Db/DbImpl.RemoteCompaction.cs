@@ -122,7 +122,8 @@ internal sealed partial class DbImpl
             ProximalOutputRangeType = 0,
             KeepInLastLevelThroughSeqno = DbFormat.MaxSequenceNumber,
         };
-        (input.MinManifestFileNumber, input.MinManifestFileSize) = Versions.InstalledManifest;
+        // Under the mutex (CompactionJob::Prepare reads both under the DB mutex): a MANIFEST roll in between tears the pair.
+        lock (_mutex) (input.MinManifestFileNumber, input.MinManifestFileSize) = Versions.InstalledManifest;
         for (int l = 0; l < c.NumInputLevels; l++)
         {
             foreach (FileMetaData f in c.Inputs(l).Files) input.InputFiles.Add(FileNames.MakeTableFileName(f.FileNumber));

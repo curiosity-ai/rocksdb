@@ -225,6 +225,7 @@ internal sealed partial class DbImpl
             {
                 SchedulePendingCompaction(cfd);
             }
+            MaybeScheduleFlush(); // flushes queued while the DB was opening
             MaybeScheduleCompaction();
         }
         RescheduleCompactionTrigger();
@@ -716,6 +717,9 @@ internal sealed partial class DbImpl
         Compaction forwarded;
         if (needRepick)
         {
+            // The picked compaction is replaced by an intent and repicked on the bottom thread, which reserves room for
+            // what it picks: the reservation made for this one (keyed by it) would never be released.
+            ReleaseCompactionRoom(c);
             forwarded = CreateIntendedCompactionForwardedToBottomPriorityPool(cfd, c);
         }
         else
@@ -815,6 +819,12 @@ internal sealed partial class DbImpl
                             TestHooks.Invoke("DBImpl::BackgroundCompaction():BeforePickCompaction");
                             snapshots = SnapshotsForCompaction();
                             c = picker.PickCompaction(cfd.Current.Storage, snapshots, CurrentSnapshotChecker, requireMaxOutputLevel: true);
+                            // BackgroundCompaction's repick goes through EnoughRoomForCompaction like any pick.
+                            if (c is not null && !EnoughRoomForCompaction(cfd, c))
+                            {
+                                c = null;
+                                cfd.Current.Storage.ComputeCompactionScore();
+                            }
                             if (c is not null)
                             {
                                 c.InputVersion = cfd.Current;

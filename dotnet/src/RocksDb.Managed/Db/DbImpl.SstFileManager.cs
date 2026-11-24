@@ -83,6 +83,17 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>SstFileManagerImpl::OnCompactionCompletion: drops the reservation of a finished compaction. REQUIRES: mutex.</summary>
+    /// <summary>
+    /// Close: gives back the room still reserved (compactions that were queued and never ran). The manager may be shared
+    /// with other DBs, which would otherwise see less room for good. REQUIRES: mutex.
+    /// </summary>
+    private void ReleaseAllCompactionRoom()
+    {
+        if (_sfmReservedCompactions.Count == 0) return;
+        foreach (KeyValuePair<Compaction, ulong> kv in _sfmReservedCompactions) Options.SstFileManager?.OnCompactionCompletion(kv.Value);
+        _sfmReservedCompactions.Clear();
+    }
+
     private void ReleaseCompactionRoom(Compaction c)
     {
         if (_sfmReservedCompactions.Remove(c, out ulong size)) Options.SstFileManager?.OnCompactionCompletion(size);

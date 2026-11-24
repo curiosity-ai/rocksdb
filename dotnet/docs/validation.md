@@ -2696,3 +2696,84 @@ single-node cluster commits its writes.
 - First-synchronous-committer window (OCC parallel validation), as for the write path in audit #12: an asynchronous
   commit already waiting or writing when the first synchronous committer arrives still finishes on the pool.
 - The four fixes without a test above were made from reading only.
+
+## Audit #14: second review pass (2026-11-24)
+
+Scope: what audit #13 left unread, each slice read against the C++ it ports: memtable switch and WAL lifecycle
+(db_impl_write.cc, FlushWAL / SyncWAL / LockWAL, wal_manager.cc, transaction_log_impl.cc), flush / compaction /
+ingestion / checkpoint / column family / SetOptions job bodies (flush_job.cc, memtable_list.cc, compaction_job.cc,
+db_impl_compaction_flush.cc, external_sst_file_ingestion_job.cc, checkpoint_impl.cc), the read path's object lifetimes
+(iterators, MultiGet, pooled and per-thread state, row cache, secondary instance), open / recovery / file layer / error
+handler / SstFileManager / logging / backup, the transaction internals not read before (transaction_base.cc,
+pessimistic_transaction.cc, write_prepared_txn*.cc, write_unprepared_txn*.cc, write_batch_with_index), and the
+replication stream internals and gRPC services (no C++ original). This pass also recorded single-threaded divergences.
+
+Found matching upstream (no change), among others: serial versus concurrent memtable inserts (never overlap), WAL
+writer ownership and lock order, FlushWAL / SyncWAL coverage, recycling, DelayWrite wake-ups, WAL tailing; flush pick /
+rollback / commit ordering, atomic flush install, subcompaction boundaries and aggregation, the CompactRange driver,
+ReFitLevel, CompactFiles, ingestion sequence and level assignment; iterator handle / core pooling and disposal, table
+iterator block release, GetContext copies, MultiGet pooling; the error severity maps and the auto-resume loop, WAL
+replay by recovery mode, LocalWritableFile, the rate limiter, backup engine locking; save points, GetForUpdate
+validation, the 2PC state machine, WritePrepared / WriteUnprepared prepare / commit / rollback, WriteBatchWithIndex and
+BaseDeltaIterator; the WAL stream assembler, snapshot receiver, Raft persistent state, shared-secret TLS.
+
+### Fixed (tests in `Validation/Audit14ReviewTests.cs` unless noted; each fails without the fix)
+
+| # | Finding | C++ reference | Effect before the fix |
+|---|---|---|---|
+| 1 | Concurrent SetOptions / SetDBOptions built their candidate from a clone taken before the options lock and applied every option that differed from the live value (`Audit13ThreadingTests.ConcurrentSetOptionsCallsDoNotRevertEachOther`) | db_impl.cc SetOptions / SetDBOptions apply the caller's map under options_mutex_ | a call for option x wrote the old value of y back over a concurrent call's change (in memory and in the OPTIONS file) |
+| 2 | A rolled-back expirable transaction left the expirable map (`Clear` removed it; a regression of audit #13 fix 2) | pessimistic_transaction.cc: only the destructor and Reinitialize remove it | its locks could be taken as "owner gone" while it was committing, and it never learned they were stolen |
+| 3 | Merge resolution used one per-thread operand buffer without taking it out of its slot | the MergeContext is a stack object | a merge operator that read the DB (a nested merge on the thread) got its operands overwritten: wrong merge result |
+| 4 | Memtable values reported as pinned with `inplace_update_support` | memtable.cc `value_pinned_(!inplace_update_support)` | a reverse iterator showed a mix of old and new bytes after an in-place update |
+| 5 | Transaction MultiGet on WritePrepared / WriteUnprepared read each key at its own sequence | MultiGetWithCallback: one super version, one sequence, callback refreshed once | a commit between two keys showed in the later key only. Now one snapshot per call |
+| 6 | A compaction re-read the live `paranoid_file_checks` / `verify_output_flags` at its end | CompactionJob captures them at construction | enabling them during a compaction compared outputs written without a hash against a computed one: Corruption, DB stopped |
+| 7 | A new column family was visible before its memtable and super version were installed | CreateColumnFamilyImpl holds the mutex across both | NullReferenceException in a concurrent read, GetLiveFilesMetadata or the stats dump |
+| 8 | OnBackgroundError not raised for errors classified kNoError (e.g. flush error with paranoid_checks off) | error_handler.cc notifies for every non-OK status | listeners that count or alert on background errors saw nothing |
+
+Fixed from reading, without a test: no flush is scheduled before the open succeeded (`opened_successfully_`) and a
+failed open waits for background work before it releases LOCK; SstFileManager compaction reservations are released
+when a compaction is forwarded to the bottom pool for a repick, the repick checks for room, and a close gives back what
+is left; a failed LOG roll no longer leaves the logger without a file and its queue growing; `LocalSequentialFile`
+empties its buffer before a refill (a failed or canceled read handed out the previous buffer again); a checkpoint waits
+for purges in flight before it lists the WALs (GetSortedWalFilesImpl); old OPTIONS files are not deleted while file
+deletions are disabled; the remote-compaction manifest floor is read under the mutex; SetDBOptions cannot start the
+stats-dump timer after close.
+
+### Open (found by reading, not fixed)
+
+Engine:
+- LockWAL does not stop memtable / WAL switches: upstream's WaitForPendingWrites waits for LockWAL to clear before
+  every switch, and a manual flush under the lock fails (TryAgain / Aborted "likely deadlock"). Here a write that
+  finds a full memtable switches WALs under the lock and the old WAL can be purged; `Flush()` from the lock holder
+  with a stalled writer deadlocks. The port's own checkpoint under LockWAL is not affected.
+- UnlockWAL returns before stalled leaders removed their stall barrier (upstream waits for the stall-ended count), so
+  a `NoSlowdown` write right after it can fail with Incomplete.
+- SwitchWAL skips empty column families: an idle empty one with a stale log number can keep the oldest WAL and defeat
+  max_total_wal_size until the busy column family's memtable fills.
+- A closed, never-synced WAL released while deletions are disabled can be hard-linked by a no-flush checkpoint instead
+  of copied and synced (durability of the checkpoint only).
+- A drop racing an atomic flush fails the whole group (upstream skips the dropped column family's edits): the other
+  column families are flushed again after the back-off, and an error-recovery flush reports success without installing.
+- SetOptions edits the live options object in place: jobs and the write path can read a half-applied set (item 6 above
+  was the only hard failure found). Flush re-reads `paranoid_file_checks` across functions (small window).
+- Manual compactions skip the SstFileManager room check (upstream: CompactionTooLarge); "max allowed space reached" is
+  checked after the compaction is installed, not per output file.
+- A failed open has already set the shared SstFileManager's statistics pointer; thread-static native ZSTD dictionary
+  contexts are not freed when a thread ends; a secondary-cache lookup abandoned on cancellation drops its result
+  without disposing it; the row cache can store a truncated replay log for a key covered by an ingested range tombstone
+  (inherited from upstream); ingestion and import install the super version one critical section after the version.
+
+Replication:
+- A chunk whose WAL write fails on a replica can be skipped for good: the engine's recovery publishes the failed
+  sequence range (as upstream's ResumeImpl), the follower then re-attaches past it and reports it as held.
+- Plain replication (`ReplicationPrimary` / `ReplicaFollower`) has no lineage check: a primary that lost its unsynced
+  tail and wrote on streams over the replica's stale tail (the pair and cluster hosts have epochs / terms for this).
+- `AdaptiveCommitDelayController`: a replica that stops reporting pins the lag (and the delay at its maximum) for good.
+- Checkpoint directories of interrupted snapshot streams are never cleaned up; a restore whose stream never sent
+  CURRENT is accepted; the file-deletion pin ends with the snapshot stream instead of at attach; a follower whose apply
+  fails for a non-transient reason retries the same position forever; the term map after a snapshot comes from a
+  separate RPC; no per-node identities behind the shared secret.
+
+Test note: `Audit8AsyncWritePathTests.FailedInsertOfMixedGroupFailsEveryWriterOnce (Pipelined, "async,async,sync", 2)`
+is timing sensitive (the held leader sometimes receives the injected insert failure): it failed in 2 of 25 runs before
+this audit's changes and 1 of 25 after. Not addressed here.

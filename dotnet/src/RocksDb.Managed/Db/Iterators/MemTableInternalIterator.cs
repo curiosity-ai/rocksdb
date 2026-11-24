@@ -88,6 +88,14 @@ public sealed class MemTableInternalIterator : InternalIterator
     /// <summary>Memtable values live in arena memory at a fixed address while the memtable is alive (MemTableIterator::IsValuePinned).</summary>
     public override bool TryGetPinnedValue(out PinnedSlice value)
     {
+        // MemTableIterator: value_pinned_(!inplace_update_support) - with in-place updates a later Put rewrites the
+        // value's length and bytes where they are, so a kept pointer would show a value that never existed. Not pinned:
+        // the consumer copies.
+        if (_memtable is { InplaceUpdateSupport: true })
+        {
+            value = default;
+            return false;
+        }
         value = PinnedSlice.FromFixed(_it.Value);
         return true;
     }

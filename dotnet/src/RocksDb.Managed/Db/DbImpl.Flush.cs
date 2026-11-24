@@ -44,7 +44,11 @@ internal sealed partial class DbImpl
     /// </summary>
     private void MaybeScheduleFlush()
     {
-        if (_shuttingDown || IsBgWorkStopped) return;
+        // MaybeScheduleFlushOrCompaction: "if (!opened_successfully_) return" - no background job starts before the
+        // open has succeeded (a write the open itself makes, e.g. to the stats column family, can switch a memtable).
+        // A job started earlier would run next to the open's obsolete-file scan and outlive a failed open, which
+        // releases LOCK. The queued flush is scheduled when the open enables background work.
+        if (!_compactionsEnabled || _shuttingDown || IsBgWorkStopped) return;
         if (Options.AtomicFlush)
         {
             MaybeScheduleAtomicFlush();
@@ -992,6 +996,22 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 if (_backgroundJobs == 0 && _pendingPurges == 0) return;
+                signal = _bgSignal.Task;
+            }
+            if (synchronous) signal.Wait();
+            else await signal.ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Waits until no purge of obsolete files is running (pending_purge_obsolete_files_ == 0).</summary>
+    private async ValueTask WaitForPendingPurgesAsync(bool synchronous)
+    {
+        while (true)
+        {
+            Task signal;
+            lock (_mutex)
+            {
+                if (_pendingPurges == 0) return;
                 signal = _bgSignal.Task;
             }
             if (synchronous) signal.Wait();

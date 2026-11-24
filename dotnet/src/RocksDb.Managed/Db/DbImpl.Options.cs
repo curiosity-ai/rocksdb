@@ -164,74 +164,120 @@ internal sealed partial class DbImpl
         ArgumentNullException.ThrowIfNull(options);
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
-        var list = new List<KeyValuePair<string, string>>(options);
-        if (list.Count == 0)
+        // The lock is taken before the current options are read: DBImpl::SetOptions / SetDBOptions apply the caller's
+        // changes to the current options under options_mutex_. A candidate cloned outside the lock carried the old
+        // values of every other option, and applying it reverted what a concurrent call had just set.
+        if (synchronous) _setOptionsLock.Wait(ct);
+        else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            LogWarn("SetOptions() on column family [" + cfd.Name + "], empty input");
-            ThrowHelper.InvalidArgument("empty input");
+            var list = new List<KeyValuePair<string, string>>(options);
+            if (list.Count == 0)
+            {
+                LogWarn("SetOptions() on column family [" + cfd.Name + "], empty input");
+                ThrowHelper.InvalidArgument("empty input");
+            }
+            ColumnFamilyOptions candidate = cfd.Options.Clone();
+            foreach (KeyValuePair<string, string> kv in list)
+            {
+                if (TrySetTableOption(candidate, kv.Key, kv.Value)) continue;
+                if (!IsMutableCfOptionName(kv.Key))
+                {
+                    if (!candidate.IsKnownOption(kv.Key)) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
+                    ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
+                }
+                try
+                {
+                    candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
+                }
+                catch (Exception e) when (e is FormatException or ArgumentException or OverflowException)
+                {
+                    throw RocksDbException.InvalidArgument("Error parsing " + kv.Key + ": " + e.Message);
+                }
+            }
+            await ApplyColumnFamilyOptionsAsync(cfd, candidate, Describe(list), synchronous, ct).ConfigureAwait(false);
         }
-        ColumnFamilyOptions candidate = cfd.Options.Clone();
-        foreach (KeyValuePair<string, string> kv in list)
+        finally
         {
-            if (TrySetTableOption(candidate, kv.Key, kv.Value)) continue;
-            if (!IsMutableCfOptionName(kv.Key))
-            {
-                if (!candidate.IsKnownOption(kv.Key)) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
-                ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
-            }
-            try
-            {
-                candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
-            }
-            catch (Exception e) when (e is FormatException or ArgumentException or OverflowException)
-            {
-                throw RocksDbException.InvalidArgument("Error parsing " + kv.Key + ": " + e.Message);
-            }
+            _setOptionsLock.Release();
         }
-        await ApplyColumnFamilyOptionsAsync(cfd, candidate, Describe(list), synchronous, ct).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Typed SetOptions: applies every mutable option whose value in <paramref name="newOptions"/> differs from the
     /// current one. Fails with InvalidArgument ("Option not changeable") if an immutable option differs.
     /// </summary>
-    public async ValueTask SetOptionsAsync(ColumnFamilyData cfd, ColumnFamilyOptions newOptions, bool synchronous, CancellationToken ct)
+    public ValueTask SetOptionsAsync(ColumnFamilyData cfd, ColumnFamilyOptions newOptions, bool synchronous, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(newOptions);
+        return SetOptionsTypedAsync(cfd, newOptions, null, synchronous, ct);
+    }
+
+    /// <summary>
+    /// Typed SetOptions through an editing callback: <paramref name="update"/> edits a copy of the current options taken
+    /// under the options lock, so only what it changes is applied (a copy taken by the caller beforehand would carry
+    /// stale values of the options a concurrent SetOptions changed, and revert them).
+    /// </summary>
+    public ValueTask SetOptionsAsync(ColumnFamilyData cfd, Action<ColumnFamilyOptions> update, bool synchronous, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        return SetOptionsTypedAsync(cfd, null, update, synchronous, ct);
+    }
+
+    private async ValueTask SetOptionsTypedAsync(ColumnFamilyData cfd, ColumnFamilyOptions? newOptions, Action<ColumnFamilyOptions>? update,
+        bool synchronous, CancellationToken ct)
+    {
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
-        ColumnFamilyOptions current = cfd.Options;
-        ColumnFamilyOptions candidate = current.Clone();
-        var changed = new List<KeyValuePair<string, string>>();
-        foreach (KeyValuePair<string, string> kv in newOptions.ToOptionsList())
+        // The lock is taken before the current options are read: DBImpl::SetOptions / SetDBOptions apply the caller's
+        // changes to the current options under options_mutex_. A candidate cloned outside the lock carried the old
+        // values of every other option, and applying it reverted what a concurrent call had just set.
+        if (synchronous) _setOptionsLock.Wait(ct);
+        else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            string? old = current.GetOption(kv.Key);
-            if (old == kv.Value) continue;
-            // Objects resolved at open (comparator, merge operator, ...) are compared by name; derived values only differ
-            // here when the caller changed them.
-            if (!MutableCfOptionNames.Contains(kv.Key)) ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
-            candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
-            changed.Add(kv);
+            ColumnFamilyOptions current = cfd.Options;
+            if (update is not null)
+            {
+                newOptions = current.Clone();
+                update(newOptions);
+            }
+            ColumnFamilyOptions candidate = current.Clone();
+            var changed = new List<KeyValuePair<string, string>>();
+            foreach (KeyValuePair<string, string> kv in newOptions!.ToOptionsList())
+            {
+                string? old = current.GetOption(kv.Key);
+                if (old == kv.Value) continue;
+                // Objects resolved at open (comparator, merge operator, ...) are compared by name; derived values only differ
+                // here when the caller changed them.
+                if (!MutableCfOptionNames.Contains(kv.Key)) ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
+                candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
+                changed.Add(kv);
+            }
+            foreach (KeyValuePair<string, string> kv in newOptions.TableOptions.ToOptionsList())
+            {
+                if (current.TableOptions.GetOption(kv.Key) == kv.Value) continue;
+                SetTableOption(candidate.TableOptions, kv.Key, kv.Value);
+                changed.Add(new KeyValuePair<string, string>("table_factory." + kv.Key, kv.Value));
+            }
+            // Objects that are not serialized: the block cache and a filter policy object with the same id.
+            if (!ReferenceEquals(newOptions.TableOptions.BlockCache, current.TableOptions.BlockCache))
+            {
+                candidate.TableOptions.BlockCache = newOptions.TableOptions.BlockCache;
+                changed.Add(new KeyValuePair<string, string>("table_factory.block_cache", newOptions.TableOptions.BlockCache?.ToString() ?? "nullptr"));
+            }
+            if (newOptions.PrefixExtractor is not null && !ReferenceEquals(newOptions.PrefixExtractor, current.PrefixExtractor)
+                && newOptions.PrefixExtractor.AsString() == current.PrefixExtractor?.AsString())
+            {
+                candidate.PrefixExtractor = newOptions.PrefixExtractor;
+            }
+            if (changed.Count == 0) return;
+            await ApplyColumnFamilyOptionsAsync(cfd, candidate, Describe(changed), synchronous, ct).ConfigureAwait(false);
         }
-        foreach (KeyValuePair<string, string> kv in newOptions.TableOptions.ToOptionsList())
+        finally
         {
-            if (current.TableOptions.GetOption(kv.Key) == kv.Value) continue;
-            SetTableOption(candidate.TableOptions, kv.Key, kv.Value);
-            changed.Add(new KeyValuePair<string, string>("table_factory." + kv.Key, kv.Value));
+            _setOptionsLock.Release();
         }
-        // Objects that are not serialized: the block cache and a filter policy object with the same id.
-        if (!ReferenceEquals(newOptions.TableOptions.BlockCache, current.TableOptions.BlockCache))
-        {
-            candidate.TableOptions.BlockCache = newOptions.TableOptions.BlockCache;
-            changed.Add(new KeyValuePair<string, string>("table_factory.block_cache", newOptions.TableOptions.BlockCache?.ToString() ?? "nullptr"));
-        }
-        if (newOptions.PrefixExtractor is not null && !ReferenceEquals(newOptions.PrefixExtractor, current.PrefixExtractor)
-            && newOptions.PrefixExtractor.AsString() == current.PrefixExtractor?.AsString())
-        {
-            candidate.PrefixExtractor = newOptions.PrefixExtractor;
-        }
-        if (changed.Count == 0) return;
-        await ApplyColumnFamilyOptionsAsync(cfd, candidate, Describe(changed), synchronous, ct).ConfigureAwait(false);
     }
 
     private async ValueTask ApplyColumnFamilyOptionsAsync(ColumnFamilyData cfd, ColumnFamilyOptions candidate, string description,
@@ -243,8 +289,7 @@ internal sealed partial class DbImpl
         // (ColumnFamilyData::ValidateOptions) before anything is installed, so a rejected call changes nothing.
         ValidateMutableSizes(candidate);
         ValidateCfOptions(Options, candidate);
-        if (synchronous) _setOptionsLock.Wait(ct);
-        else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
+        // REQUIRES: _setOptionsLock (taken by the caller before it read the options the candidate was built from).
         try
         {
             lock (_mutex)
@@ -289,7 +334,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            _setOptionsLock.Release();
+            // _setOptionsLock is released by the caller.
         }
     }
 
@@ -540,56 +585,96 @@ internal sealed partial class DbImpl
         ArgumentNullException.ThrowIfNull(options);
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
-        var list = new List<KeyValuePair<string, string>>(options);
-        if (list.Count == 0)
+        // The lock is taken before the current options are read: DBImpl::SetOptions / SetDBOptions apply the caller's
+        // changes to the current options under options_mutex_. A candidate cloned outside the lock carried the old
+        // values of every other option, and applying it reverted what a concurrent call had just set.
+        if (synchronous) _setOptionsLock.Wait(ct);
+        else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            LogWarn("SetDBOptions(), empty input.");
-            ThrowHelper.InvalidArgument("empty input");
+            var list = new List<KeyValuePair<string, string>>(options);
+            if (list.Count == 0)
+            {
+                LogWarn("SetDBOptions(), empty input.");
+                ThrowHelper.InvalidArgument("empty input");
+            }
+            DbOptions candidate = Options.Clone();
+            foreach (KeyValuePair<string, string> kv in list)
+            {
+                if (!MutableDbOptionNames.Contains(kv.Key))
+                {
+                    if (!candidate.IsKnownOption(kv.Key)) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
+                    ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
+                }
+                try
+                {
+                    candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
+                }
+                catch (Exception e) when (e is FormatException or ArgumentException or OverflowException)
+                {
+                    throw RocksDbException.InvalidArgument("Error parsing " + kv.Key + ": " + e.Message);
+                }
+            }
+            await ApplyDbOptionsAsync(candidate, Describe(list), synchronous, ct).ConfigureAwait(false);
         }
-        DbOptions candidate = Options.Clone();
-        foreach (KeyValuePair<string, string> kv in list)
+        finally
         {
-            if (!MutableDbOptionNames.Contains(kv.Key))
-            {
-                if (!candidate.IsKnownOption(kv.Key)) ThrowHelper.InvalidArgument("Unrecognized option: " + kv.Key);
-                ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
-            }
-            try
-            {
-                candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
-            }
-            catch (Exception e) when (e is FormatException or ArgumentException or OverflowException)
-            {
-                throw RocksDbException.InvalidArgument("Error parsing " + kv.Key + ": " + e.Message);
-            }
+            _setOptionsLock.Release();
         }
-        await ApplyDbOptionsAsync(candidate, Describe(list), synchronous, ct).ConfigureAwait(false);
     }
 
     /// <summary>Typed SetDBOptions: applies every mutable DB option that differs (InvalidArgument if an immutable one differs).</summary>
-    public async ValueTask SetDbOptionsAsync(DbOptions newOptions, bool synchronous, CancellationToken ct)
+    public ValueTask SetDbOptionsAsync(DbOptions newOptions, bool synchronous, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(newOptions);
+        return SetDbOptionsTypedAsync(newOptions, null, synchronous, ct);
+    }
+
+    /// <summary>Typed SetDBOptions through an editing callback run on a copy taken under the options lock (see SetOptionsAsync).</summary>
+    public ValueTask SetDbOptionsAsync(Action<DbOptions> update, bool synchronous, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        return SetDbOptionsTypedAsync(null, update, synchronous, ct);
+    }
+
+    private async ValueTask SetDbOptionsTypedAsync(DbOptions? newOptions, Action<DbOptions>? update, bool synchronous, CancellationToken ct)
+    {
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
-        DbOptions candidate = Options.Clone();
-        var changed = new List<KeyValuePair<string, string>>();
-        foreach (KeyValuePair<string, string> kv in newOptions.ToOptionsList())
+        // The lock is taken before the current options are read: DBImpl::SetOptions / SetDBOptions apply the caller's
+        // changes to the current options under options_mutex_. A candidate cloned outside the lock carried the old
+        // values of every other option, and applying it reverted what a concurrent call had just set.
+        if (synchronous) _setOptionsLock.Wait(ct);
+        else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            if (Options.GetOption(kv.Key) == kv.Value) continue;
-            if (!MutableDbOptionNames.Contains(kv.Key)) ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
-            candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
-            changed.Add(kv);
+            if (update is not null)
+            {
+                newOptions = Options.Clone();
+                update(newOptions);
+            }
+            DbOptions candidate = Options.Clone();
+            var changed = new List<KeyValuePair<string, string>>();
+            foreach (KeyValuePair<string, string> kv in newOptions!.ToOptionsList())
+            {
+                if (Options.GetOption(kv.Key) == kv.Value) continue;
+                if (!MutableDbOptionNames.Contains(kv.Key)) ThrowHelper.InvalidArgument("Option not changeable: " + kv.Key);
+                candidate.SetOption(kv.Key, kv.Value, preserveUnknown: false);
+                changed.Add(kv);
+            }
+            if (changed.Count == 0) return;
+            await ApplyDbOptionsAsync(candidate, Describe(changed), synchronous, ct).ConfigureAwait(false);
         }
-        if (changed.Count == 0) return;
-        await ApplyDbOptionsAsync(candidate, Describe(changed), synchronous, ct).ConfigureAwait(false);
+        finally
+        {
+            _setOptionsLock.Release();
+        }
     }
 
     private async ValueTask ApplyDbOptionsAsync(DbOptions candidate, string description, bool synchronous, CancellationToken ct)
     {
         if (candidate.BytesPerSync == 0) candidate.BytesPerSync = 1024 * 1024;
-        if (synchronous) _setOptionsLock.Wait(ct);
-        else await _setOptionsLock.WaitAsync(ct).ConfigureAwait(false);
+        // REQUIRES: _setOptionsLock (taken by the caller before it read the options the candidate was built from).
         try
         {
             // MutableDBOptionsAreEqual: nothing changes (and no OPTIONS file is written) when every value is the same.
@@ -687,7 +772,7 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            _setOptionsLock.Release();
+            // _setOptionsLock is released by the caller.
         }
     }
 

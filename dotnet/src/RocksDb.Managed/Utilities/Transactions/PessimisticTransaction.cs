@@ -106,6 +106,7 @@ internal class PessimisticTransaction : Transaction
         ThrowIfDisposed();
         if (_name is not null && State != TransactionState.Committed) _txnDb.UnregisterTransaction(this);
         Clear();
+        RemoveFromExpirableMap(); // before the new id
         ReleaseSnapshots();
         _writeOptions = writeOptions ?? new WriteOptions();
         Initialize(options);
@@ -777,9 +778,9 @@ internal class PessimisticTransaction : Transaction
     private protected override void Clear()
     {
         _txnDb.LockManager.UnLockAll(this, _tracked);
-        // After the locks are gone (commit, rollback, reinitialize): a transaction missing from the map while it
-        // still holds locks could be stolen from.
-        RemoveFromExpirableMap();
+        // The transaction stays in the expirable map, as upstream (only ~PessimisticTransaction and Reinitialize remove
+        // it): after a Rollback it is usable again with the same id and expiration, and a transaction missing from the
+        // map reads as "gone, steal" even while it is committing.
         base.Clear();
     }
 

@@ -126,6 +126,16 @@ internal sealed partial class DbImpl
         FlushDeferredEvents(); // e.g. recovery_failed
         DeregisterFromWriteBufferManager();
         Volatile.Write(ref _disposed, 1);
+        // ~DBImpl of a failed open: CloseHelper cancels and waits for background work before the files are closed and
+        // LOCK is released.
+        lock (_mutex)
+        {
+            _shuttingDown = true;
+            _closePurgesOnly = true;
+            SignalBackgroundWork();
+        }
+        try { _bgCancellation.Cancel(); } catch (AggregateException) { }
+        Util.SyncValueTask.GetResult(WaitForBackgroundWorkAsync(synchronous: true));
         try
         {
             _log?.Dispose();

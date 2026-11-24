@@ -296,6 +296,10 @@ internal sealed class ErrorHandler
         }
         if (sev == ErrorSeverity.NoError)
         {
+            // ErrorHandler::SetBGError: "if (!new_bg_err.ok()) NotifyOnBackgroundError(...)" - a Status with severity
+            // kNoError is still not OK, so the listeners hear about it (e.g. a flush error with paranoid_checks off);
+            // it does not become the background error ("Hit less severe background error").
+            NotifyOnBackgroundError(reason, classified, autoRecovery, out _);
             _db.LogInfo("ErrorHandler: Hit less severe background error");
             return null;
         }

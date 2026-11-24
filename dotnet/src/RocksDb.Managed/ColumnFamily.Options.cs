@@ -28,18 +28,14 @@ public sealed partial class ColumnFamily
     public void SetOptions(Action<ColumnFamilyOptions> update)
     {
         ArgumentNullException.ThrowIfNull(update);
-        ColumnFamilyOptions copy = _cfd.Options.Clone();
-        update(copy);
-        SyncValueTask.GetResult(_db.SetOptionsAsync(_cfd, copy, synchronous: true, CancellationToken.None));
+        SyncValueTask.GetResult(_db.SetOptionsAsync(_cfd, update, synchronous: true, CancellationToken.None));
     }
 
     /// <inheritdoc cref="SetOptions(Action{ColumnFamilyOptions})"/>
     public ValueTask SetOptionsAsync(Action<ColumnFamilyOptions> update, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(update);
-        ColumnFamilyOptions copy = _cfd.Options.Clone();
-        update(copy);
-        return _db.SetOptionsAsync(_cfd, copy, synchronous: false, cancellationToken);
+        return _db.SetOptionsAsync(_cfd, update, synchronous: false, cancellationToken);
     }
 }
 
@@ -85,18 +81,14 @@ public sealed partial class RocksDatabase
     public void SetDBOptions(Action<DbOptions> update)
     {
         ArgumentNullException.ThrowIfNull(update);
-        DbOptions copy = _db.Options.Clone();
-        update(copy);
-        SyncValueTask.GetResult(_db.SetDbOptionsAsync(copy, synchronous: true, CancellationToken.None));
+        SyncValueTask.GetResult(_db.SetDbOptionsAsync(update, synchronous: true, CancellationToken.None));
     }
 
     /// <inheritdoc cref="SetDBOptions(Action{DbOptions})"/>
     public ValueTask SetDBOptionsAsync(Action<DbOptions> update, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(update);
-        DbOptions copy = _db.Options.Clone();
-        update(copy);
-        return _db.SetDbOptionsAsync(copy, synchronous: false, cancellationToken);
+        return _db.SetDbOptionsAsync(update, synchronous: false, cancellationToken);
     }
 
     /// <summary>A copy of the DB options currently in effect (DB::GetDBOptions).</summary>

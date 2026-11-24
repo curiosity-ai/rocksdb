@@ -495,7 +495,10 @@ internal sealed class LocalSequentialFile : ISequentialFile
                         _position += d;
                         return total + d;
                     }
+                    // Emptied before the refill: a read that throws must not leave the previous fill's length behind (the
+                    // next Read handed the old bytes out again at the new position).
                     _bufferStart = 0;
+                    _bufferEnd = 0;
                     _bufferEnd = RandomAccess.Read(_handle, _buffer, _position);
                     if (_bufferEnd == 0) break;
                 }
@@ -548,7 +551,9 @@ internal sealed class LocalSequentialFile : ISequentialFile
                         _position += d;
                         return total + d;
                     }
+                    // Emptied before the refill (a failed or canceled read, see the synchronous Read).
                     _bufferStart = 0;
+                    _bufferEnd = 0;
                     _bufferEnd = await RandomAccess.ReadAsync(_handle, _buffer, _position, cancellationToken).ConfigureAwait(false);
                     if (_bufferEnd == 0) break;
                 }
