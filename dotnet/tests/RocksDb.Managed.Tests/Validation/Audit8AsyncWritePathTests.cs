@@ -701,7 +701,12 @@ public sealed class Audit8AsyncWritePathTests
         using RocksDatabase db = RocksDatabase.Open(DbPath, ModeOptions(NewFs(), mode));
         db.Put(s_protected, B("before"), B("1"));
         (Exception?[] errors, Exception? heldError) = RunGroupBehindHeldLeader(db, keys, async, s_protected);
-        Assert.IsNull(heldError, heldError?.ToString());
+        // Pipelined: the held writer leads its memtable stage once its WAL write is released. If the group behind it
+        // finished its WAL stage by then, the held writer's memtable group includes those writers, and the failed insert
+        // is the status of that whole group (write_group.status), the held writer included. Which of the two happens is
+        // a matter of timing (the test failed about once in fifteen runs when it insisted on the first).
+        bool heldSharedTheGroup = mode == WriteMode.Pipelined && heldError is RocksDbException { Code: StatusCode.Corruption };
+        if (!heldSharedTheGroup) Assert.IsNull(heldError, heldError?.ToString());
         Assert.AreEqual(1, corrupted);
         for (int i = 0; i < keys.Length; i++)
         {
