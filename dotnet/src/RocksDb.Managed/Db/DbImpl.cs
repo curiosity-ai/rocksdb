@@ -828,6 +828,35 @@ internal sealed partial class DbImpl : IAsyncDisposable
     /// </summary>
     internal void PurgeObsoleteFiles()
     {
+        // pending_purge_obsolete_files_ (FindObsoleteFiles increments it under the mutex, PurgeObsoleteFiles decrements
+        // it, CloseHelper waits for 0): the purge of a foreground caller (an iterator release, an ingestion, a column
+        // family drop, an error recovery) is not a background job, and one still running after the close returned could
+        // scan and delete in a directory that was reopened. Once the close has begun, it purges alone.
+        lock (_mutex)
+        {
+            if (_closePurgesOnly) return;
+            _pendingPurges++;
+        }
+        try
+        {
+            PurgeObsoleteFilesCore();
+        }
+        finally
+        {
+            lock (_mutex)
+            {
+                if (--_pendingPurges == 0) SignalBackgroundWork();
+            }
+        }
+    }
+
+    // pending_purge_obsolete_files_: purges running outside the close. Guarded by mutex.
+    private int _pendingPurges;
+    // Set by the close before it waits for the pending purges: later purges are left to the close. Guarded by mutex.
+    private bool _closePurgesOnly;
+
+    private void PurgeObsoleteFilesCore()
+    {
         var tables = new List<ObsoleteTableFile>();
         var blobs = new List<ObsoleteBlobFile>();
         var wals = new List<ulong>();
@@ -1188,6 +1217,10 @@ internal sealed partial class DbImpl : IAsyncDisposable
         DeregisterFromWriteBufferManager();
         // CancelErrorRecoveryForShutDown: stop automatic recovery first (it needs the write thread and background work).
         await ErrorHandler.EndAutoRecoveryAsync(synchronous).ConfigureAwait(false);
+        // CloseHelper waits while error_handler_.IsRecoveryInProgress(): a recovery driven by the SstFileManager or a
+        // manual Resume on another thread is not the task joined above. Before the write queue is taken (the recovery
+        // needs it), and not when this close is called from inside that recovery (a listener).
+        await WaitForResumesAsync(synchronous).ConfigureAwait(false);
         // CloseHelper -> CancelAllBackgroundWork(false): the shutdown flush and OnDBShutdownBegin, unless a public
         // CancelAllBackgroundWork already began the shutdown (DbImpl.Shutdown.cs).
         bool alreadyShuttingDown = IsShuttingDown;
@@ -1210,6 +1243,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             lock (_mutex)
             {
                 _shuttingDown = true;
+                _closePurgesOnly = true;
                 SignalBackgroundWork(); // wake FlushAsync waiters whose queued flush will never be scheduled now
             }
             CancelBackgroundCompactions();
@@ -1264,7 +1298,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             {
                 try
                 {
-                    PurgeObsoleteFiles();
+                    PurgeObsoleteFilesCore();
                     DeleteObsoleteFilesFullScan(atOpen: false, dbDirChildren: null);
                 }
                 catch (Exception e) when (e is IOException or RocksDbException) { }

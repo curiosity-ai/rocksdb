@@ -446,6 +446,10 @@ internal sealed class ClockShard
         {
             Interlocked.Increment(ref _mutators);
             if (Volatile.Read(ref _resizing) == 0) return;
+            // Re-entered from an eviction callback or a value's Dispose that this thread runs under its own mutator
+            // count: the grow that set _resizing is still waiting for that count, so the table cannot change yet.
+            // Waiting for the grow here would deadlock (it waits for us).
+            if (ReferenceEquals(t_callbackShard, this)) return;
             Interlocked.Decrement(ref _mutators);
             var spin = new SpinWait();
             while (Volatile.Read(ref _resizing) != 0) spin.SpinOnce();
@@ -464,21 +468,25 @@ internal sealed class ClockShard
     /// the new array. Lookups keep running on the old array meanwhile (they may miss an entry, never find a wrong one).
     /// REQUIRES: the caller does not hold a mutator count.
     /// </summary>
-    private void Grow(Table expected)
+    private bool Grow(Table expected)
     {
+        // Called from a callback this thread runs under its own mutator count (see EnterMutation): a grow would wait
+        // for that count forever. The insert goes on without growing (it evicts for occupancy or fails as when the
+        // table cannot grow).
+        if (ReferenceEquals(t_callbackShard, this)) return false;
         if (Interlocked.CompareExchange(ref _resizing, 1, 0) != 0)
         {
             // Another thread grows the table: wait for it (the caller re-checks).
             var wait = new SpinWait();
             while (Volatile.Read(ref _resizing) != 0) wait.SpinOnce();
-            return;
+            return true;
         }
         try
         {
             var spin = new SpinWait();
             while (Volatile.Read(ref _mutators) != 0) spin.SpinOnce();
             Table old = _t;
-            if (old != expected || old.LengthBits >= _maxLengthBits) return;
+            if (old != expected || old.LengthBits >= _maxLengthBits) return true;
             int newBits = old.LengthBits + 1;
             var array = new ClockSlot?[1 << newBits];
             int mask = array.Length - 1;
@@ -504,12 +512,17 @@ internal sealed class ClockShard
                 Interlocked.Add(ref _usage, (long)(array.Length - old.Array.Length) * HyperClockCache.SlotMetadataCharge);
             }
             Volatile.Write(ref _t, new Table(array, newBits, newBits < _maxLengthBits));
+            return true;
         }
         finally
         {
             Volatile.Write(ref _resizing, 0);
         }
     }
+
+    // The shard whose mutator count the current thread holds while it runs foreign code (an eviction handler, a cached
+    // value's Dispose): lets that code re-enter the shard while another thread waits to grow it.
+    [ThreadStatic] private static object? t_callbackShard;
 
     public long EvictionEffortExceededCount => Volatile.Read(ref _evictionEffortExceededCount);
 
@@ -630,6 +643,10 @@ internal sealed class ClockShard
             ClockSlot? h = LookupIn(t, key, h1, h2);
             if (h is not null) return h;
             if (Volatile.Read(ref _resizing) == 0 && ReferenceEquals(Volatile.Read(ref _t), t)) return null;
+            // Called from a callback this thread runs under its own mutator count (see EnterMutation): a grow that set
+            // _resizing still waits for that count and has not touched the table, so the miss is good; waiting for the
+            // grow would deadlock.
+            if (ReferenceEquals(t_callbackShard, this)) return null;
             var spin = new SpinWait();
             while (Volatile.Read(ref _resizing) != 0) spin.SpinOnce();
         }
@@ -681,7 +698,7 @@ internal sealed class ClockShard
                 if (newOccupancy <= t0.GrowLimit) break;
                 if (t0.GrowLimit == long.MaxValue
                     || (newOccupancy <= t0.OccupancyLimit && Volatile.Read(ref _usage) + charge > Volatile.Read(ref _capacity))) break;
-                Grow(t0);
+                if (!Grow(t0)) break;
             }
         }
         EnterMutation();
@@ -710,16 +727,31 @@ internal sealed class ClockShard
         long oldOccupancy = Interlocked.Increment(ref _occupancy) - 1;
         bool needEvictForOccupancy = oldOccupancy + 1 > Volatile.Read(ref _t).OccupancyLimit;
         bool useStandalone = false;
+        bool charged;
+        try
+        {
+            charged = Volatile.Read(ref _strict)
+                ? ChargeUsageMaybeEvictStrict(totalCharge, needEvictForOccupancy)
+                : ChargeUsageMaybeEvictNonStrict(totalCharge, needEvictForOccupancy);
+        }
+        catch
+        {
+            // An eviction handler or an evicted value's Dispose threw (Evict released what it had freed): the entry is
+            // not inserted.
+            Interlocked.Decrement(ref _occupancy);
+            if (!wantHandle) value.FreeForCache();
+            throw;
+        }
         if (Volatile.Read(ref _strict))
         {
-            if (!ChargeUsageMaybeEvictStrict(totalCharge, needEvictForOccupancy))
+            if (!charged)
             {
                 Interlocked.Decrement(ref _occupancy);
                 if (!wantHandle) value.FreeForCache();
                 return null; // MemoryLimit: with a handle the caller keeps ownership
             }
         }
-        else if (!ChargeUsageMaybeEvictNonStrict(totalCharge, needEvictForOccupancy))
+        else if (!charged)
         {
             // Can't meet occupancy requirement.
             Interlocked.Decrement(ref _occupancy);
@@ -845,7 +877,16 @@ internal sealed class ClockShard
         if (needEvictForOccupancy && requestEvictCharge == 0) requestEvictCharge = 1;
         if (requestEvictCharge > 0)
         {
-            Evict(requestEvictCharge, out long freedCharge, out long freedCount);
+            long freedCharge, freedCount;
+            try
+            {
+                Evict(requestEvictCharge, out freedCharge, out freedCount);
+            }
+            catch
+            {
+                Interlocked.Add(ref _usage, -(newUsage - oldUsage)); // the capacity grabbed above
+                throw;
+            }
             Interlocked.Add(ref _occupancy, -freedCount);
             if (freedCharge > needEvictCharge)
             {
@@ -911,12 +952,48 @@ internal sealed class ClockShard
                 ClockSlot? h = t.Array[(int)((oldClockPointer + (ulong)i) & (ulong)t.Mask)];
                 if (h is not null && ClockUpdate(h, ref seenPinnedCount))
                 {
-                    freedCharge += h.TotalCharge;
-                    freedCount++;
-                    // eviction_callback_(key, handle, was_hit) while this thread owns the slot, before the value is freed.
-                    if (handler is not null) handler.OnEvicted(h.Key, h, (h.LoadMeta() & ClockSlot.HitBit) != 0);
+                    long charge = h.TotalCharge;
+                    object? outer = t_callbackShard;
+                    if (_auto) t_callbackShard = this;
+                    try
+                    {
+                        // eviction_callback_(key, handle, was_hit) while this thread owns the slot, before the value is freed.
+                        if (handler is not null) handler.OnEvicted(h.Key, h, (h.LoadMeta() & ClockSlot.HitBit) != 0);
+                    }
+                    catch
+                    {
+                        // Upstream's callback cannot throw. The entry is gone whatever the handler did, and the caller
+                        // never gets to account for it (nor for the ones freed before it in this call).
+                        Rollback(t, h.H1, h.H2, h);
+                        try
+                        {
+                            FreeDataMarkEmpty(h);
+                        }
+                        finally
+                        {
+                            t_callbackShard = outer;
+                            Interlocked.Add(ref _usage, -(freedCharge + charge));
+                            Interlocked.Add(ref _occupancy, -(freedCount + 1));
+                        }
+                        throw;
+                    }
                     Rollback(t, h.H1, h.H2, h);
-                    FreeDataMarkEmpty(h);
+                    try
+                    {
+                        FreeDataMarkEmpty(h);
+                    }
+                    catch
+                    {
+                        Interlocked.Add(ref _usage, -(freedCharge + charge));
+                        Interlocked.Add(ref _occupancy, -(freedCount + 1));
+                        throw;
+                    }
+                    finally
+                    {
+                        t_callbackShard = outer;
+                    }
+                    freedCharge += charge;
+                    freedCount++;
                 }
             }
             if (freedCharge >= requestedCharge) return;
@@ -962,9 +1039,39 @@ internal sealed class ClockShard
     // Caller owns the slot (Construction state).
     private static void FreeDataMarkEmpty(ClockSlot h)
     {
-        h.FreeValue();
-        h.Generation++;
-        Volatile.Write(ref h.Meta, 0);
+        try
+        {
+            h.FreeValue();
+        }
+        finally
+        {
+            // Also when the value's Dispose throws: a slot left under construction is never usable again.
+            h.Generation++;
+            Volatile.Write(ref h.Meta, 0);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="FreeDataMarkEmpty"/> for a slot freed under this thread's mutator count (release, erase): the value's
+    /// Dispose may re-enter the shard (see <see cref="EnterMutation"/>).
+    /// </summary>
+    private void FreeDataMarkEmptyUnderGate(ClockSlot h)
+    {
+        if (!_auto)
+        {
+            FreeDataMarkEmpty(h);
+            return;
+        }
+        object? outer = t_callbackShard;
+        t_callbackShard = this;
+        try
+        {
+            FreeDataMarkEmpty(h);
+        }
+        finally
+        {
+            t_callbackShard = outer;
+        }
     }
 
     // ---- release / erase ----
@@ -1019,9 +1126,9 @@ internal sealed class ClockShard
                 return;
             }
             Rollback(Volatile.Read(ref _t), h.H1, h.H2, h);
-            FreeDataMarkEmpty(h);
             Interlocked.Add(ref _usage, -totalCharge);
             Interlocked.Decrement(ref _occupancy);
+            FreeDataMarkEmptyUnderGate(h);
         }
     }
 
@@ -1072,9 +1179,9 @@ internal sealed class ClockShard
                         {
                             long totalCharge = h.TotalCharge;
                             Rollback(t, h1, h2, h);
-                            FreeDataMarkEmpty(h);
                             Interlocked.Add(ref _usage, -totalCharge);
                             Interlocked.Decrement(ref _occupancy);
+                            FreeDataMarkEmptyUnderGate(h);
                             break;
                         }
                         oldMeta = seen;
@@ -1177,9 +1284,9 @@ internal sealed class ClockShard
             {
                 long totalCharge = h.TotalCharge;
                 Rollback(t, h.H1, h.H2, h);
-                FreeDataMarkEmpty(h);
                 Interlocked.Add(ref _usage, -totalCharge);
                 Interlocked.Decrement(ref _occupancy);
+                FreeDataMarkEmptyUnderGate(h);
             }
         }
     }

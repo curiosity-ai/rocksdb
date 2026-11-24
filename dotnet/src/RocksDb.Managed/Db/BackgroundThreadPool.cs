@@ -188,8 +188,22 @@ internal sealed class BackgroundThreadPool
         public SwitchToAwaitable GetAwaiter() => this;
         public bool IsCompleted => false;
         public void GetResult() { }
-        public void OnCompleted(Action continuation) => pool.Schedule(new ContinuationWorkItem(continuation));
-        public void UnsafeOnCompleted(Action continuation) => pool.Schedule(new ContinuationWorkItem(continuation));
+        public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
+
+        public void UnsafeOnCompleted(Action continuation)
+        {
+            try
+            {
+                pool.Schedule(new ContinuationWorkItem(continuation));
+            }
+            catch (Exception e) when (e is OutOfMemoryException or ThreadStartException or InvalidOperationException)
+            {
+                // No thread could be started (Schedule withdrew the item). The awaiting method must still continue: it
+                // may hold the write queue's leadership or a background job's accounting, and an exception thrown
+                // out of the await would skip their release. The .NET thread pool runs it instead.
+                ThreadPool.UnsafeQueueUserWorkItem(static c => ((Action)c!)(), continuation);
+            }
+        }
     }
 
     private sealed class ContinuationWorkItem(Action continuation) : IThreadPoolWorkItem

@@ -285,4 +285,117 @@ public sealed class Audit13ThreadingTests
         foreach (object? o in after) Assert.AreNotSame(old, o, "an obsolete super version was left in a slot");
         Assert.AreEqual("1", GetString(db, "a"));
     }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void CloseWaitsForAForegroundPurge()
+    {
+        // DBImpl::CloseHelper waits while pending_purge_obsolete_files_ > 0: the purge an iterator release (or an
+        // ingestion, a column family drop, an error recovery) runs on its own thread is not a background job. The port
+        // only waited for background jobs, so such a purge could still be scanning and deleting after the close
+        // returned, in a directory that may have been reopened by then.
+        RocksDatabase db = RocksDatabase.Open("/audit13purge", NewOptions(NewFs()));
+        db.Put(B("a"), B("1"));
+        Iterator it = db.NewIterator(new ReadOptions());
+        it.SeekToFirst();
+        db.Put(B("b"), B("2"));
+        db.Flush(); // the iterator now holds the last reference on the previous super version
+        db.Impl.WaitForBackgroundWorkForTest();
+        using var inPurge = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        int purges = 0;
+        TestHooks.Set("DBImpl::PurgeObsoleteFiles:Start", () =>
+        {
+            if (Interlocked.Increment(ref purges) != 1) return; // the close's own purge passes
+            inPurge.Set();
+            release.Wait();
+        });
+        try
+        {
+            Task dispose = Task.Factory.StartNew(it.Dispose, TaskCreationOptions.LongRunning);
+            Assert.IsTrue(inPurge.Wait(30_000));
+            Task close = Task.Factory.StartNew(db.Dispose, TaskCreationOptions.LongRunning);
+            Assert.IsFalse(close.Wait(500), "the close returned while a purge was running");
+            release.Set();
+            dispose.Wait();
+            close.Wait();
+        }
+        finally
+        {
+            release.Set();
+            TestHooks.ClearAll();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void UnexpectedExceptionInFlushCleanupDoesNotHangTheClose()
+    {
+        // BackgroundCallFlush cannot throw upstream. Here anything the cleanup after a flush throws that is not an
+        // IOException / RocksDbException (a custom IFileSystem) skipped the job's accounting: the close waited for the
+        // "running" job forever.
+        RocksDatabase db = RocksDatabase.Open("/audit13flushthrow", NewOptions(NewFs()));
+        int thrown = 0;
+        TestHooks.Set("DBImpl::BackgroundCallFlush:FlushFinish:0", () =>
+        {
+            if (Interlocked.Exchange(ref thrown, 1) == 0) throw new InvalidOperationException("injected");
+        });
+        try
+        {
+            db.Put(B("a"), B("1"));
+            Task flush = Task.Factory.StartNew(() => db.Flush(), TaskCreationOptions.LongRunning);
+            Assert.IsTrue(flush.Wait(20_000), "Flush(wait) hung");
+            Assert.AreEqual(1, Volatile.Read(ref thrown));
+            Assert.AreEqual("1", GetString(db, "a"));
+            Task close = Task.Factory.StartNew(db.Dispose, TaskCreationOptions.LongRunning);
+            Assert.IsTrue(close.Wait(20_000), "the close waited for a job that was never accounted as finished");
+        }
+        finally
+        {
+            TestHooks.ClearAll();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void CloseWaitsForARunningManualRecovery()
+    {
+        // DBImpl::CloseHelper waits while error_handler_.IsRecoveryInProgress(). The port joined only the automatic
+        // recovery task: a manual Resume on another thread (or the SstFileManager's recovery) went on flushing and
+        // purging on the closed instance.
+        var fs = new RocksDb.Managed.Tests.Db.FaultInjectionFileSystem(NewFs());
+        DbOptions o = NewOptions(fs);
+        o.MaxBgErrorResumeCount = 0;
+        RocksDatabase db = RocksDatabase.Open("/audit13resume", o);
+        db.Put(B("a"), B("1"));
+        fs.FailMatching(".sst", RocksDb.Managed.Tests.Db.FaultOps.Append, 1, RocksDb.Managed.Tests.Db.InjectedFaultKind.Retryable);
+        Assert.ThrowsExactly<RocksDbException>(() => db.Flush());
+        Assert.IsNotNull(db.BackgroundError);
+        using var inResume = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        TestHooks.Set("DBImpl::ResumeImpl:Start", () =>
+        {
+            inResume.Set();
+            release.Wait();
+        });
+        try
+        {
+            Task resume = Task.Factory.StartNew(() =>
+            {
+                try { db.Resume(); }
+                catch (Exception e) when (e is RocksDbException or ObjectDisposedException) { }
+            }, TaskCreationOptions.LongRunning);
+            Assert.IsTrue(inResume.Wait(30_000));
+            Task close = Task.Factory.StartNew(db.Dispose, TaskCreationOptions.LongRunning);
+            Assert.IsFalse(close.Wait(500), "the close returned while a recovery was running");
+            release.Set();
+            Assert.IsTrue(resume.Wait(30_000));
+            Assert.IsTrue(close.Wait(30_000));
+        }
+        finally
+        {
+            release.Set();
+            TestHooks.ClearAll();
+        }
+    }
 }

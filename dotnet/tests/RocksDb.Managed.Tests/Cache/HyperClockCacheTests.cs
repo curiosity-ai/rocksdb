@@ -373,4 +373,92 @@ public sealed class HyperClockCacheTests
         Assert.AreEqual(threads * perThread, c.Count);
         Assert.AreEqual(0, c.PinnedUsage);
     }
+
+    private static HyperClockCache NewAutoCache(long capacity) =>
+        new(new HyperClockCacheOptions
+        {
+            Capacity = capacity,
+            EstimatedEntryCharge = 0, // automatic table
+            NumShardBits = 0,
+            MetadataChargePolicy = CacheMetadataChargePolicy.DontCharge,
+        });
+
+    private sealed class ThrowOnceHandler : CacheEvictionHandler
+    {
+        public int Thrown;
+
+        internal override void OnEvicted(in CacheKey key, CacheEntry entry, bool wasHit)
+        {
+            if (Interlocked.Exchange(ref Thrown, 1) == 0) throw new InvalidOperationException("injected");
+        }
+    }
+
+    [TestMethod]
+    public void ThrowingEvictionHandlerDoesNotLeakTheSlotOrItsCharge()
+    {
+        // Audit #13: clock_cache.cc's eviction callback cannot throw. A handler that threw left the slot under
+        // construction forever (never usable again, its displacements not rolled back) and its charge in the usage.
+        HyperClockCache c = NewAutoCache(64 * 100);
+        var handler = new ThrowOnceHandler();
+        c.SetEvictionHandler(handler);
+        int failed = 0;
+        for (int k = 0; k < 2000; k++)
+        {
+            try
+            {
+                c.Insert(Key(k), CacheValue.FromObject(new object()), 100, CachePriority.Low);
+            }
+            catch (InvalidOperationException)
+            {
+                failed++;
+            }
+        }
+        Assert.AreEqual(1, handler.Thrown);
+        Assert.AreEqual(1, failed);
+        Assert.IsTrue(c.Usage <= 64 * 100 + 100, "usage " + c.Usage);
+        c.EraseUnreferencedEntries();
+        Assert.AreEqual(0, c.Usage, "the charge of the entry whose eviction threw was never released");
+        Assert.AreEqual(0, c.Count);
+    }
+
+    private sealed class ReenteringHandler(HyperClockCache cache) : CacheEvictionHandler
+    {
+        internal override void OnEvicted(in CacheKey key, CacheEntry entry, bool wasHit)
+        {
+            // A lookup miss enters the shard's mutator gate.
+            if (cache.TryLookup(new CacheKey(0x7777, key.OffsetEtc64), out CachedBlock h)) h.Dispose();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public void EvictionHandlerReenteringTheShardDoesNotDeadlockWithAGrow()
+    {
+        // Audit #13: the automatic table runs the eviction handler under the evicting thread's mutator count, and a
+        // grow waits for every mutator while new mutators wait for the grow. A handler (a secondary cache, a cached
+        // value's Dispose) that came back into the same shard while another thread was waiting to grow it waited for
+        // that grow forever.
+        for (int round = 0; round < 20; round++)
+        {
+            HyperClockCache c = NewAutoCache(1 << 16);
+            c.SetEvictionHandler(new ReenteringHandler(c));
+            var threads = new Thread[4];
+            for (int t = 0; t < threads.Length; t++)
+            {
+                int id = t;
+                threads[t] = new Thread(() =>
+                {
+                    var rnd = new Random(id * 7919 + 1);
+                    for (int i = 0; i < 20_000; i++)
+                    {
+                        // Large entries first (evictions), then ever smaller ones (the table grows under eviction).
+                        int charge = i < 2000 ? 4096 : rnd.Next(1, 64);
+                        c.Insert(Key(id * 1_000_000 + i), CacheValue.FromObject(new object()), charge, CachePriority.Low);
+                    }
+                }) { IsBackground = true };
+                threads[t].Start();
+            }
+            foreach (Thread t in threads) Assert.IsTrue(t.Join(60_000), "deadlock between an eviction handler and a grow (round " + round + ")");
+        }
+    }
 }

@@ -775,6 +775,30 @@ internal sealed partial class DbImpl
     /// </summary>
     internal async ValueTask<RocksDbException?> ResumeImplAsync(ErrorRecoveryRun? run, bool synchronous)
     {
+        lock (_mutex)
+        {
+            if (_resumeClosed) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+            _resumesInFlight++;
+        }
+        DbImpl? outer = s_insideResume.Value;
+        s_insideResume.Value = this;
+        try
+        {
+            return await ResumeImplCoreAsync(run, synchronous).ConfigureAwait(false);
+        }
+        finally
+        {
+            s_insideResume.Value = outer;
+            lock (_mutex)
+            {
+                _resumesInFlight--;
+                SignalBackgroundWork();
+            }
+        }
+    }
+
+    private async ValueTask<RocksDbException?> ResumeImplCoreAsync(ErrorRecoveryRun? run, bool synchronous)
+    {
         await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
         TestHooks.Invoke("DBImpl::ResumeImpl:Start");
         RocksDbException? s = null;
