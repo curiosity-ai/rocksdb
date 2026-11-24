@@ -54,6 +54,15 @@ public sealed class WalChunkDto
             : new WalStreamMessage(FirstSequence, EntryCount, Data, SourceId, SourceTerm, EntryTerm);
 }
 
+/// <summary>Wire form of <see cref="Hosting.ReplicaAttachCheck"/>.</summary>
+[MessagePackObject]
+public sealed class ReplicaAttachCheckDto
+{
+    [Key(0)] public bool Consistent { get; set; }
+    [Key(1)] public string? Lineage { get; set; }
+    [Key(2)] public string? Reason { get; set; }
+}
+
 [MessagePackObject]
 public sealed class SnapshotChunkDto
 {
@@ -64,9 +73,12 @@ public sealed class SnapshotChunkDto
     [Key(4)] public long FileSize { get; set; }
     [Key(5)] public long Offset { get; set; }
     [Key(6)] public ReadOnlyMemory<byte> Content { get; set; }
+    /// <summary>Plan only: <see cref="SnapshotChunk.LogDescription"/> (null from a source that sends none).</summary>
+    [Key(7)] public string? LogDescription { get; set; }
 
     public static SnapshotChunkDto From(in SnapshotChunk c) => new()
     {
+        LogDescription = c.LogDescription,
         Kind = (int)c.Kind,
         SequenceNumber = c.SequenceNumber,
         KeepFiles = [.. c.KeepFiles],
@@ -83,7 +95,7 @@ public sealed class SnapshotChunkDto
     /// </summary>
     public SnapshotChunk ToChunk() => (SnapshotChunkKind)Kind switch
     {
-        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles ?? []),
+        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles ?? []).WithLogDescription(LogDescription),
         SnapshotChunkKind.Complete => FileSize is >= 0 and <= int.MaxValue
             ? SnapshotChunk.Complete((int)FileSize)
             : throw new InvalidDataException("snapshot end marker with file count " + FileSize),

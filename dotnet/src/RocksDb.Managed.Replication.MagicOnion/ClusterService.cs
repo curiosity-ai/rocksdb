@@ -81,7 +81,7 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         {
             await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
+                await StreamWrites.WriteOrAbortAsync(stream, WalChunkDto.From(m), Context.CallContext, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -107,7 +107,7 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         CancellationToken ct = linked.Token;
         await foreach (SnapshotChunk c in host.StreamSnapshotAsync(FileInfoDto.To(verifiedInventory), ct).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(ct).ConfigureAwait(false);
+            await StreamWrites.WriteOrAbortAsync(stream, SnapshotChunkDto.From(c), Context.CallContext, ct).ConfigureAwait(false);
         }
         return stream.Result();
     }

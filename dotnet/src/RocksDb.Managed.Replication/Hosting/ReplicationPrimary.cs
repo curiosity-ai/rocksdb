@@ -15,6 +15,15 @@ public sealed class ReplicationPrimary : IReplicationChunkSizes
     private readonly string _checkpointRoot;
     private readonly ReplicationSource _source;
     private readonly AdaptiveCommitDelayController? _delay;
+    private readonly ReplicationLineage _lineage;
+    private readonly Func<ulong, long> _incarnationForSeq;
+    private readonly SnapshotAttachPin _attachPin = new();
+
+    /// <summary>
+    /// How long the primary keeps its obsolete files (its WAL) after a snapshot stream ended, waiting for the replica to
+    /// start following; the first WAL stream it serves ends the wait. Zero releases them with the end of the snapshot.
+    /// </summary>
+    public TimeSpan SnapshotAttachTimeout { get; init; } = TimeSpan.FromSeconds(30);
     // "replica-N" ids by index (copy-on-grow), so progress reports do not build a string each.
     private volatile string[] _replicaIds = [];
     private readonly Lock _idsLock = new();
@@ -30,6 +39,42 @@ public sealed class ReplicationPrimary : IReplicationChunkSizes
         _checkpointRoot = checkpointRoot;
         _source = new ReplicationSource(db);
         _delay = commitDelay;
+        // What this primary writes from here on belongs to a new incarnation (ReplicationLineage): a replica whose
+        // tail lies past the log this database has now (it lost its unsynced end, or was restored from a backup) fails
+        // the attach check instead of continuing behind entries this log never had.
+        _lineage = ReplicationLineage.Load(db);
+        _lineage.StartIncarnation(db.GetLatestSequenceNumber());
+        _incarnationForSeq = _lineage.GetIncarnationForSeq;
+        // Checkpoints of snapshot streams that an earlier process did not live to remove: each pins (hard links) every
+        // table file of its moment.
+        HostResync.DeleteLeftoverCheckpoints(db.FileSystem, checkpointRoot, "checkpoint-", null);
+    }
+
+    /// <summary>The lineage of this primary's log (which incarnation wrote which sequence numbers).</summary>
+    public ReplicationLineage Lineage => _lineage;
+
+    /// <summary>
+    /// A replica's attach check, asked before it follows from <paramref name="latestSeq"/> + 1: whether its log can be a
+    /// prefix of this one. <paramref name="incarnationAtLatest"/> is the incarnation the replica has recorded for its
+    /// latest entry (0 when it knows none: a replica fresh from a snapshot, or one from before lineages existed - then
+    /// only the sequence number is checked, as before). Not consistent when the replica holds entries past the end of
+    /// this log, or when this log's entry at that sequence number belongs to another incarnation: the replica's tail was
+    /// written by an incarnation that lost it. The answer carries the lineage for the replica to adopt.
+    /// </summary>
+    public ReplicaAttachCheck CheckReplicaLog(ulong latestSeq, long incarnationAtLatest)
+    {
+        ulong latest = _db.GetLatestSequenceNumber();
+        string map = _lineage.Serialize();
+        if (latestSeq > latest)
+            return new ReplicaAttachCheck(false, map, "the replica's log ends at " + latestSeq + ", past the primary's at " + latest);
+        if (latestSeq == 0 || incarnationAtLatest == 0) return new ReplicaAttachCheck(true, map, null);
+        long mine = _lineage.GetIncarnationForSeq(latestSeq);
+        if (mine != incarnationAtLatest)
+        {
+            return new ReplicaAttachCheck(false, map, "the replica's entry " + latestSeq + " belongs to incarnation " + incarnationAtLatest +
+                ", the primary's to " + mine + ": the logs diverged");
+        }
+        return new ReplicaAttachCheck(true, map, null);
     }
 
     public RocksDatabase Database => _db;
@@ -70,20 +115,41 @@ public sealed class ReplicationPrimary : IReplicationChunkSizes
         _db.FileSystem.CreateDirectoryIfMissing(_checkpointRoot);
         string dir = FileSystemHelpers.Combine(_checkpointRoot, "checkpoint-" + Guid.NewGuid().ToString("N"));
         using ReplicationSession session = await _source.GetInitialStateAsync(dir, cancellationToken).ConfigureAwait(false);
-        await foreach (SnapshotChunk c in session.StreamSnapshotAsync([], SnapshotChunkBytes, cancellationToken).ConfigureAwait(false)) yield return c;
+        // The lineage travels with the files it describes (SnapshotChunk.LogDescription).
+        string lineage = _lineage.Serialize();
+        await foreach (SnapshotChunk c in session.StreamSnapshotAsync([], SnapshotChunkBytes, cancellationToken).ConfigureAwait(false))
+        {
+            yield return c.Kind == SnapshotChunkKind.Plan ? c.WithLogDescription(lineage) : c;
+        }
+        // Sent completely: keep the WAL until the replica follows (before the session re-enables deletions).
+        _attachPin.HoldUntilAttach(_db, SnapshotAttachTimeout);
     }
 
     /// <summary>
     /// The WAL stream from <paramref name="startSeq"/> (a single resync message if those WALs are gone). A write batch
     /// larger than <see cref="MaxChunkBytes"/> is sent in pieces (<see cref="WalStreamMessage.IsFragment"/>).
     /// </summary>
-    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken) =>
-        WalStreamSender.StreamAsync(_db, startSeq, Tag, static _ => 0, MaxChunkBytes, null, cancellationToken);
+    public IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken)
+    {
+        IAsyncEnumerable<WalStreamMessage> stream = WalStreamSender.StreamAsync(_db, startSeq, Tag, _incarnationForSeq, MaxChunkBytes, null, cancellationToken);
+        return _attachPin.HasHolds ? ReleasePinAtFirstMessage(stream, cancellationToken) : stream;
+    }
+
+    private async IAsyncEnumerable<WalStreamMessage> ReleasePinAtFirstMessage(IAsyncEnumerable<WalStreamMessage> stream,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (WalStreamMessage m in stream.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            // A replica is reading the WAL: the files kept for a snapshot's receiver may go.
+            if (_attachPin.HasHolds) _attachPin.ReleaseAll();
+            yield return m;
+        }
+    }
 
     private bool Tag(out string sourceId, out long term)
     {
         sourceId = Id;
-        term = 0;
+        term = _lineage.CurrentIncarnation;
         return true;
     }
 
@@ -93,9 +159,12 @@ public sealed class ReplicationPrimary : IReplicationChunkSizes
     /// </summary>
     public int ReportProgress(int replicaIndex, ulong appliedThrough)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(replicaIndex);
         _source.ReportReplicaProgress(ReplicaId(replicaIndex), appliedThrough);
         ulong latest = _db.GetLatestSequenceNumber();
-        _delay?.ReportLag(replicaIndex, latest > appliedThrough ? (long)(latest - appliedThrough) : 0);
+        // A replica the controller has no slot for is not a reason to skip the WAL retirement below (the report failed
+        // for good and that replica's archived WALs were never retired).
+        if (_delay is { } delay && replicaIndex < delay.ReplicaCount) delay.ReportLag(replicaIndex, latest > appliedThrough ? (long)(latest - appliedThrough) : 0);
         return _source.RetireArchivedWals();
     }
 
@@ -128,6 +197,14 @@ public interface IReplicationSourceClient
     IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken);
     IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, CancellationToken cancellationToken);
     Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The attach check (<see cref="ReplicationPrimary.CheckReplicaLog"/>). Null when the primary cannot be asked (a
+    /// transport or a primary from before the check existed): the replica then follows as before, on sequence numbers
+    /// alone. The default implementation returns null.
+    /// </summary>
+    Task<ReplicaAttachCheck?> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
+        Task.FromResult<ReplicaAttachCheck?>(null);
 }
 
 /// <summary>
@@ -165,7 +242,24 @@ public static class ReplicaFollower
         IEnumerable<string> preserveNames, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(primary);
-        return SnapshotReceiver.ReceiveAsync(primary.StreamInitialStateAsync(cancellationToken), fileSystem, dbPath, preserveNames, cancellationToken);
+        // The primary's lineage (ReplicationLineage) comes with the plan and is stored before CURRENT appears: the
+        // replica then knows which incarnation wrote its entries from its first attach on.
+        return SnapshotReceiver.ReceiveAsync(primary.StreamInitialStateAsync(cancellationToken), fileSystem, dbPath, preserveNames,
+            description => ReplicationLineage.Load(fileSystem, dbPath).Replace(description), cancellationToken);
+    }
+
+    /// <summary>
+    /// Prepares the options a replica's database is opened with: adds <see cref="ReplicaRecoveryVeto"/>, so that the
+    /// engine does not recover on its own from a failed write of a replicated chunk (which would publish the chunk's
+    /// sequence numbers without its data, see <see cref="ReplicaApplyGuard"/>). <see cref="FollowAsync(IReplicationSourceClient, RocksDatabase, int, CancellationToken)"/>
+    /// detects such a replica either way and asks for a resync; with this the database also stays consistent across a
+    /// restart. Returns <paramref name="options"/>.
+    /// </summary>
+    public static DbOptions ProtectReplicaOptions(DbOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Listeners.Add(new ReplicaRecoveryVeto(static () => true));
+        return options;
     }
 
     /// <summary>
@@ -183,6 +277,13 @@ public static class ReplicaFollower
     /// <see cref="ReplicaFollowerOptions.MaxBatchBytes"/> throws <see cref="ReplicationResyncRequiredException"/>, a
     /// stream that breaks the fragment protocol throws <see cref="WalStreamProtocolException"/>. Whenever this method
     /// ends, a partial batch is discarded; following again starts at the replica's latest sequence number + 1.
+    /// <para>
+    /// Before it follows, the replica asks the primary whether its log can be a prefix of the primary's
+    /// (<see cref="IReplicationSourceClient.CheckReplicaLogAsync"/>, see <see cref="ReplicationLineage"/>) and throws
+    /// <see cref="ReplicationResyncRequiredException"/> when it is not. It throws the same when an earlier chunk failed
+    /// to apply and the replica's log has since moved past it (<see cref="ReplicaApplyGuard"/>). A chunk whose write
+    /// fails is recorded and the failure rethrown.
+    /// </para>
     /// </summary>
     public static async Task<long> FollowAsync(IReplicationSourceClient primary, RocksDatabase replica, int replicaIndex, ReplicaFollowerOptions options,
         CancellationToken cancellationToken)
@@ -193,7 +294,20 @@ public static class ReplicaFollower
         var consumer = new ReplicationConsumer(replica);
         await using var progress = new ProgressReporter((seq, ct) => primary.ReportProgressAsync(replicaIndex, seq, ct));
         long chunks = 0;
-        ulong start = replica.GetLatestSequenceNumber() + 1;
+        if (ReplicaApplyGuard.IsLogEndUnknown(replica))
+        {
+            throw new ReplicationResyncRequiredException("an earlier chunk failed to apply and the replica's log end (" + replica.GetLatestSequenceNumber() +
+                ") moved past it: what the replica holds is unknown");
+        }
+        ulong latest = replica.GetLatestSequenceNumber();
+        ReplicationLineage lineage = ReplicationLineage.Load(replica);
+        ReplicaAttachCheck? check = await primary.CheckReplicaLogAsync(latest, lineage.GetIncarnationForSeq(latest), cancellationToken).ConfigureAwait(false);
+        if (check is not null)
+        {
+            if (!check.Consistent) throw new ReplicationResyncRequiredException("the replica's log is not a prefix of the primary's: " + check.Reason);
+            lineage.AdoptAfter(latest, check.Lineage);
+        }
+        ulong start = latest + 1;
         using var assembler = new WalStreamAssembler(options.MaxBatchBytes);
         await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(start, cancellationToken).ConfigureAwait(false))
         {
@@ -204,7 +318,20 @@ public static class ReplicaFollower
                 throw new ReplicationResyncRequiredException("primary's stream cannot be followed from " + consumer.ExpectedNextSequence + ": " + assembler.LastError);
             if (assembled == WalAssemblyStatus.Invalid)
                 throw new WalStreamProtocolException("stream from " + consumer.ExpectedNextSequence + " dropped: " + assembler.LastError, replica.GetLatestSequenceNumber());
-            if (!await consumer.TryIngestChunkAsync(chunk, cancellationToken).ConfigureAwait(false))
+            ulong appliedThrough = replica.GetLatestSequenceNumber();
+            bool applied;
+            try
+            {
+                applied = await consumer.TryIngestChunkAsync(chunk, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception e) when (e is not OperationCanceledException and not OutOfMemoryException)
+            {
+                // The write failed: whatever the engine does with the chunk's sequence numbers from here on, the
+                // replica holds its log through appliedThrough and nothing after it.
+                ReplicaApplyGuard.RecordFailure(replica, appliedThrough);
+                throw;
+            }
+            if (!applied)
                 throw new ReplicationResyncRequiredException("stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
             chunks++;
             progress.Report(replica.GetLatestSequenceNumber());

@@ -152,6 +152,13 @@ public enum SnapshotChunkKind
 public readonly struct SnapshotChunk
 {
     private SnapshotChunk(SnapshotChunkKind kind, ulong sequenceNumber, IReadOnlyList<string>? keepFiles, string? fileName, long fileSize, long offset,
+        ReadOnlyMemory<byte> content, string? logDescription)
+        : this(kind, sequenceNumber, keepFiles, fileName, fileSize, offset, content)
+    {
+        LogDescription = logDescription;
+    }
+
+    private SnapshotChunk(SnapshotChunkKind kind, ulong sequenceNumber, IReadOnlyList<string>? keepFiles, string? fileName, long fileSize, long offset,
         ReadOnlyMemory<byte> content)
     {
         Kind = kind;
@@ -179,6 +186,19 @@ public readonly struct SnapshotChunk
 
     /// <summary>Plan only: the consumer's verified files that are reused and not transferred.</summary>
     public IReadOnlyList<string> KeepFiles { get; }
+
+    /// <summary>
+    /// Plan only, optional: the source's description of the log the snapshot holds - the term map of a Raft leader, the
+    /// epoch map of a pair primary, the lineage of a plain primary - captured with the checkpoint. The receiver persists
+    /// it before the restored directory becomes an openable database (<see cref="SnapshotReceiver.OnLogDescription"/>),
+    /// so the files and their description always come from the same moment of the same source. Null from a source that
+    /// sends none (the receiver then asks for the map separately, as before).
+    /// </summary>
+    public string? LogDescription { get; }
+
+    /// <summary>A copy of a plan with <see cref="LogDescription"/> set (other kinds are returned unchanged).</summary>
+    public SnapshotChunk WithLogDescription(string? logDescription) =>
+        Kind != SnapshotChunkKind.Plan ? this : new(Kind, SequenceNumber, KeepFiles, FileName, FileSize, Offset, Content, logDescription);
 
     public string? FileName { get; }
     public long FileSize { get; }

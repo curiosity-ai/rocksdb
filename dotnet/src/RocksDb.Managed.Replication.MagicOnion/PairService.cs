@@ -71,7 +71,7 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         {
             await foreach (WalStreamMessage m in host.StreamUpdatesAsync(startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
+                await StreamWrites.WriteOrAbortAsync(stream, WalChunkDto.From(m), Context.CallContext, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -89,7 +89,7 @@ public sealed class PairService(PairNodeHost host) : ServiceBase<IPairService>, 
         CancellationToken ct = linked.Token;
         await foreach (SnapshotChunk c in host.StreamSnapshotAsync(ct).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(ct).ConfigureAwait(false);
+            await StreamWrites.WriteOrAbortAsync(stream, SnapshotChunkDto.From(c), Context.CallContext, ct).ConfigureAwait(false);
         }
         return stream.Result();
     }

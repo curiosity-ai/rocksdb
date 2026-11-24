@@ -137,6 +137,23 @@ public sealed class FollowerResyncPolicy
         long at = unchecked((long)latestSeq);
         return Interlocked.Exchange(ref _streamFaultAtSeq, at) == at;
     }
+
+    // The log end at the latest chunk that could not be applied, or None.
+    private long _applyFaultAtSeq = None;
+
+    /// <summary>
+    /// A chunk of the stream could not be applied (the write threw) while this node's log ended at
+    /// <paramref name="latestSeq"/>. False the first time at that position: the node attaches again and tries once
+    /// more (a transient failure does not repeat). True when the previous such failure happened at the same position:
+    /// nothing was applied in between, so trying again would fail the same way without end (a database stopped by a
+    /// background error, a batch that names a column family this node does not have, a batch that fails validation) -
+    /// the node rebuilds from a snapshot, which carries the data as files and replaces the database.
+    /// </summary>
+    public bool ShouldRebuildAfterApplyFault(ulong latestSeq)
+    {
+        long at = unchecked((long)latestSeq);
+        return Interlocked.Exchange(ref _applyFaultAtSeq, at) == at;
+    }
 }
 
 /// <summary>Source-side producer of <see cref="WalStreamMessage"/>s over a <see cref="WalTailer"/>.</summary>
@@ -444,9 +461,135 @@ public sealed class DatabaseUsageGate
     public void Reopen() => _gate.OpenGate();
 }
 
+/// <summary>
+/// Keeps a source's obsolete files (most importantly its WAL) from being deleted between the end of a snapshot stream and
+/// the moment the receiver attaches to the WAL stream. The snapshot session disables file deletions only while it
+/// streams; without a WAL archive, a memtable flush right after it purged the WAL the receiver was about to ask for,
+/// and the receiver had to pull another snapshot - under sustained writes, again and again. The hold ends at the first
+/// message of the next WAL stream this source serves (the tailer is positioned in the WAL by then), or after a timeout
+/// when nobody attaches. The WAL stream does not say which snapshot it follows, so any attach releases every hold.
+/// </summary>
+internal sealed class SnapshotAttachPin
+{
+    private sealed class Hold(RocksDatabase db)
+    {
+        public readonly RocksDatabase Db = db;
+        public int Released;
+    }
+
+    private readonly Lock _gate = new();
+    private readonly List<Hold> _holds = new();
+    private volatile bool _any;
+
+    /// <summary>Whether a hold is outstanding (one volatile read; for the per-message check of a WAL stream).</summary>
+    public bool HasHolds => _any;
+
+    /// <summary>Disables file deletions on <paramref name="db"/> until <see cref="ReleaseAll"/> or <paramref name="timeout"/>.</summary>
+    public void HoldUntilAttach(RocksDatabase db, TimeSpan timeout)
+    {
+        if (timeout <= TimeSpan.Zero) return;
+        try
+        {
+            db.DisableFileDeletions();
+        }
+        catch (Exception e) when (e is ObjectDisposedException or RocksDbException)
+        {
+            return;
+        }
+        var hold = new Hold(db);
+        lock (_gate)
+        {
+            _holds.Add(hold);
+            _any = true;
+        }
+        _ = ExpireAsync(hold, timeout);
+    }
+
+    private async Task ExpireAsync(Hold hold, TimeSpan timeout)
+    {
+        await Task.Delay(timeout).ConfigureAwait(false);
+        lock (_gate)
+        {
+            _holds.Remove(hold);
+            _any = _holds.Count > 0;
+        }
+        Release(hold);
+    }
+
+    /// <summary>A follower attached: obsolete files may go again.</summary>
+    public void ReleaseAll()
+    {
+        Hold[] holds;
+        lock (_gate)
+        {
+            if (_holds.Count == 0) return;
+            holds = [.. _holds];
+            _holds.Clear();
+            _any = false;
+        }
+        foreach (Hold h in holds) Release(h);
+    }
+
+    private static void Release(Hold hold)
+    {
+        if (Interlocked.Exchange(ref hold.Released, 1) != 0) return;
+        try
+        {
+            hold.Db.EnableFileDeletions();
+        }
+        catch (Exception e) when (e is ObjectDisposedException or RocksDbException or IOException)
+        {
+            // The database was closed (or replaced by a resync) meanwhile: nothing left to re-enable.
+        }
+    }
+}
+
 /// <summary>Steps of a host's resync (snapshot restore) shared by <see cref="PairNodeHost"/> and <see cref="ClusterNodeHost"/>.</summary>
 internal static class HostResync
 {
+    /// <summary>
+    /// Deletes the checkpoint directories (and their ".tmp" staging siblings) that snapshot streams of an earlier
+    /// process left in <paramref name="directory"/>: entries whose name starts with <paramref name="namePrefix"/>. A
+    /// session removes its checkpoint when its stream ends, but a process that is killed or loses power during a stream
+    /// does not, and each leftover pins (hard links) every table file of its moment - up to a database size per
+    /// incident once compaction has replaced them. Call before any stream is served. Best effort.
+    /// </summary>
+    public static void DeleteLeftoverCheckpoints(IFileSystem fs, string directory, string namePrefix, Action<string>? log)
+    {
+        if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(namePrefix)) return;
+        try
+        {
+            if (!Internal.FileSystemHelpers.DirectoryExists(fs, directory)) return;
+            foreach (string name in fs.GetChildren(directory))
+            {
+                if (!name.StartsWith(namePrefix, StringComparison.Ordinal)) continue;
+                string path = Internal.FileSystemHelpers.Combine(directory, name);
+                if (fs.FileExists(path)) continue;
+                try
+                {
+                    Internal.FileSystemHelpers.DeleteDirectoryRecursive(fs, path);
+                    log?.Invoke("removed the leftover snapshot checkpoint " + path);
+                }
+                catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException)
+                {
+                    log?.Invoke("could not remove the leftover snapshot checkpoint " + path + ": " + e.Message);
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    /// <summary>The checkpoint directories of the host whose database is at <paramref name="dbPath"/> ("&lt;dbPath&gt;.checkpoint-...").</summary>
+    public static void DeleteLeftoverCheckpointsOf(IFileSystem fs, string dbPath, Action<string>? log)
+    {
+        string trimmed = dbPath.TrimEnd('/', '\\');
+        int slash = trimmed.LastIndexOfAny(['/', '\\']);
+        if (slash < 0) return;
+        DeleteLeftoverCheckpoints(fs, slash == 0 ? "/" : trimmed[..slash], trimmed[(slash + 1)..] + ".checkpoint-", log);
+    }
+
     /// <summary>
     /// Closes the database a resync is about to replace. An error the close reports (RocksDatabase.DisposeAsync throws
     /// the status of DB::Close, e.g. a WAL file that failed to close) does not stop the resync: the close has completed

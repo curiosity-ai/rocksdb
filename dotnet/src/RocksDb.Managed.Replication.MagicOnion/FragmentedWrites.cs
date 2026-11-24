@@ -78,6 +78,13 @@ public sealed class FragmentedWriteOptions
     /// (30 s by default): a client that stops sending without closing the call must not hold memory.
     /// </summary>
     public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How long a whole upload may take, from its first piece to its last (5 minutes by default). The idle timeout
+    /// alone restarts with every piece, so a client that trickles a byte at a time held its buffer (and its share of
+    /// <see cref="MaxPendingBytes"/>) for as long as it liked; a few such clients refuse every other large write.
+    /// </summary>
+    public TimeSpan MaxUploadDuration { get; init; } = TimeSpan.FromMinutes(5);
 }
 
 /// <summary>
@@ -207,18 +214,32 @@ internal sealed class FragmentedWriteUpload(FragmentedWriteBudget budget) : IDis
     {
         using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         TimeSpan timeout = budget.Options.IdleTimeout;
+        TimeSpan total = budget.Options.MaxUploadDuration;
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        bool totalExceeded = false, boundedByTotal = false;
         try
         {
             while (true)
             {
-                idle.CancelAfter(timeout);
+                // Each piece within the idle timeout, and all of them within the total (the idle timeout restarts with
+                // every piece, however small).
+                TimeSpan remaining = total - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                if (remaining <= TimeSpan.Zero)
+                {
+                    totalExceeded = true;
+                    throw new OperationCanceledException();
+                }
+                boundedByTotal = remaining < timeout;
+                idle.CancelAfter(boundedByTotal ? remaining : timeout);
                 if (!await next(idle.Token).ConfigureAwait(false)) break;
                 Accept(current());
             }
         }
-        catch (Exception e) when (e is not ReturnStatusException && idle.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        catch (Exception e) when (e is not ReturnStatusException && (idle.IsCancellationRequested || totalExceeded) && !cancellationToken.IsCancellationRequested)
         {
-            throw new ReturnStatusException(Grpc.Core.StatusCode.DeadlineExceeded, InvalidToken + "no piece of the upload arrived within " + timeout +
+            throw new ReturnStatusException(Grpc.Core.StatusCode.DeadlineExceeded, InvalidToken + (totalExceeded || boundedByTotal
+                    ? "the upload did not complete within " + total
+                    : "no piece of the upload arrived within " + timeout) +
                 " (" + _buffer.ReceivedLength + " of " + _buffer.TotalLength + " bytes received)");
         }
         Complete();

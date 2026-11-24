@@ -116,6 +116,34 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
   write). The transport's own serialization is extra; see `docs/allocations.md` ("Replication and WAL tailing").
 * Use the same column families on the replica (batches carry column family ids) and keep the WAL in the DB directory
   (`WalDir` empty) on replicas restored from a checkpoint (a checkpoint stores its WALs next to the tables).
+* **Lineage of plain replication** (`ReplicationLineage`). Every `ReplicationPrimary` created over a database starts
+  a new *incarnation* at the database's latest sequence number + 1 and persists it (fsync'd, in the `replication`
+  subdirectory of the database directory). The map travels with a snapshot and is returned by the attach check
+  (`IReplicationSourceClient.CheckReplicaLogAsync` -> `ReplicationPrimary.CheckReplicaLog`), which
+  `ReplicaFollower.FollowAsync` asks before it follows: the replica names the incarnation of its latest entry and the
+  primary confirms that entry belongs to that incarnation in its own log. A primary that lost the unsynced end of its
+  log (power loss without fsync, a restore from a backup) and wrote other entries at those sequence numbers fails the
+  check for a replica that still holds the lost ones, and `FollowAsync` throws `ReplicationResyncRequiredException`
+  instead of continuing behind them. A client or primary without the check (`CheckReplicaLogAsync` returns null, a gRPC
+  primary answers Unimplemented) keeps the earlier behaviour: sequence numbers only.
+* **A chunk whose write fails on a replica** (`ReplicaApplyGuard`). The engine allocates a write's sequence numbers
+  before the WAL append; when the append or its fsync fails, the recovery from that error publishes the range although
+  its data is nowhere (as upstream RocksDB does). A replica's position is its latest sequence number, so it would
+  attach behind the failed chunk and never receive it. Two measures: the pair and cluster hosts open their database
+  with `ReplicaRecoveryVeto` (no automatic recovery while the node is a replica / follower; for plain replication pass
+  the replica's options through `ReplicaFollower.ProtectReplicaOptions`), and a failed apply records the last applied
+  sequence number (in memory and in the `REPLICA_APPLY_FAILED` file of the database directory, which a snapshot restore
+  removes). Before attaching again - also after a restart - a replica whose log no longer ends there is rebuilt from a
+  snapshot (`FollowAsync` throws `ReplicationResyncRequiredException`). A chunk that fails to apply twice at the same
+  position (a stopped database, a column family the replica lacks) rebuilds the node as well.
+* A source keeps its obsolete files for up to `SnapshotAttachTimeout` (30 s) after a snapshot stream ended, until the
+  receiver's WAL stream reads its first message, so that a flush in between does not purge the WAL the receiver is
+  about to ask for. The WAL stream does not name the snapshot it follows, so the first attach of any follower ends the
+  wait. Checkpoint directories left behind by a process that died during a snapshot stream are removed when a host
+  starts or a `ReplicationPrimary` is created. A restore needs CURRENT in the stream, and the source's term / epoch /
+  lineage map comes in the snapshot's plan (`SnapshotChunk.LogDescription`) and is persisted before CURRENT appears.
+* `AdaptiveCommitDelayController` ignores a replica that has not reported for `ReplicaLagStaleAfter` (30 s; or after
+  `ForgetReplica`), and recommends no delay when no replica reports at all.
 
 ## Large write batches and large client writes
 

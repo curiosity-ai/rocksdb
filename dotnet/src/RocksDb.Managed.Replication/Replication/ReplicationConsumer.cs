@@ -115,7 +115,11 @@ public sealed class ReplicationConsumer
 /// <param name="ReusedFiles">Local files kept because the plan confirmed them.</param>
 /// <param name="TransferredFiles">Files written from the stream.</param>
 /// <param name="TransferredBytes">Bytes written from the stream.</param>
-public sealed record SnapshotRestoreResult(ulong SequenceNumber, int ReusedFiles, int TransferredFiles, long TransferredBytes);
+public sealed record SnapshotRestoreResult(ulong SequenceNumber, int ReusedFiles, int TransferredFiles, long TransferredBytes)
+{
+    /// <summary>The description of the log the source sent with the plan (<see cref="SnapshotChunk.LogDescription"/>), or null.</summary>
+    public string? LogDescription { get; init; }
+}
 
 /// <summary>
 /// Consumer side of a snapshot transfer: applies the <see cref="SnapshotChunk"/>s produced by
@@ -147,6 +151,15 @@ public sealed class SnapshotReceiver : IAsyncDisposable
     private string? _currentName;
     private long _currentSize;
     private bool _currentFileReceived;
+    private string? _logDescription;
+
+    /// <summary>
+    /// Called by <see cref="CompleteAsync"/> with the plan's <see cref="SnapshotChunk.LogDescription"/> (when the source
+    /// sent one) after every file is in place and synced and before CURRENT is renamed into place: what it persists is
+    /// durable before the directory opens as a database. A crash in between leaves the description without a database,
+    /// and the restore starts over. If it throws, the restore fails and no CURRENT appears.
+    /// </summary>
+    public Action<string>? OnLogDescription { get; init; }
 
     private const string CurrentFileName = "CURRENT";
     // Not a name RocksDB knows; a leftover is deleted by the next restore (it is never in a plan's keep list).
@@ -162,11 +175,16 @@ public sealed class SnapshotReceiver : IAsyncDisposable
     }
 
     /// <summary>Receives a whole stream and completes the restore.</summary>
+    public static ValueTask<SnapshotRestoreResult> ReceiveAsync(IAsyncEnumerable<SnapshotChunk> stream, IFileSystem fileSystem, string dbPath,
+        IEnumerable<string> preserveNames, CancellationToken cancellationToken) =>
+        ReceiveAsync(stream, fileSystem, dbPath, preserveNames, null, cancellationToken);
+
+    /// <summary>Receives a whole stream and completes the restore; <paramref name="onLogDescription"/> is <see cref="OnLogDescription"/>.</summary>
     public static async ValueTask<SnapshotRestoreResult> ReceiveAsync(IAsyncEnumerable<SnapshotChunk> stream, IFileSystem fileSystem, string dbPath,
-        IEnumerable<string> preserveNames, CancellationToken cancellationToken)
+        IEnumerable<string> preserveNames, Action<string>? onLogDescription, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        await using var receiver = new SnapshotReceiver(fileSystem, dbPath, preserveNames);
+        await using var receiver = new SnapshotReceiver(fileSystem, dbPath, preserveNames) { OnLogDescription = onLogDescription };
         await foreach (SnapshotChunk chunk in stream.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             await receiver.WriteAsync(chunk, cancellationToken).ConfigureAwait(false);
@@ -189,6 +207,7 @@ public sealed class SnapshotReceiver : IAsyncDisposable
             ReplicationDelta.PrepareForRestore(_fs, _dbPath, chunk.KeepFiles, _preserve);
             _reused = chunk.KeepFiles.Count;
             _sequence = chunk.SequenceNumber;
+            _logDescription = chunk.LogDescription;
             _planApplied = true;
             return;
         }
@@ -239,14 +258,15 @@ public sealed class SnapshotReceiver : IAsyncDisposable
         // Without the end marker the transfer was cut off; CURRENT goes last, but a partially written file before it
         // must not be taken for a complete restore either.
         if (!_complete) throw new InvalidOperationException("snapshot stream ended before its end marker");
-        if (_currentFileReceived)
-        {
-            // Everything else is in place and synced; only now does the directory become an openable database.
-            _fs.SyncDirectory(_dbPath);
-            _fs.RenameFile(FileSystemHelpers.Combine(_dbPath, PendingCurrentFileName), FileSystemHelpers.Combine(_dbPath, CurrentFileName));
-        }
+        // A checkpoint always has a CURRENT, and a plan cannot keep the local one: a stream without it is not a snapshot.
+        // Accepting it left a directory that the node then created an empty database in (at sequence number 0).
+        if (!_currentFileReceived) throw new InvalidOperationException("snapshot stream ended without CURRENT");
+        // Everything else is in place and synced; only now does the directory become an openable database.
         _fs.SyncDirectory(_dbPath);
-        return new SnapshotRestoreResult(_sequence, _reused, _files, _bytes);
+        if (_logDescription is not null) OnLogDescription?.Invoke(_logDescription);
+        _fs.RenameFile(FileSystemHelpers.Combine(_dbPath, PendingCurrentFileName), FileSystemHelpers.Combine(_dbPath, CurrentFileName));
+        _fs.SyncDirectory(_dbPath);
+        return new SnapshotRestoreResult(_sequence, _reused, _files, _bytes) { LogDescription = _logDescription };
     }
 
     private async ValueTask CloseCurrentAsync(CancellationToken cancellationToken)

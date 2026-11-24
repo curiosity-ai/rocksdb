@@ -124,15 +124,22 @@ public sealed class RaftLogTerms
     {
         var t = new RaftLogTerms();
         if (string.IsNullOrEmpty(content)) return t;
-        foreach (string line in content.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        foreach (string raw in content.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
+            string line = raw.TrimEnd('\r');
+            if (line.Length == 0) continue;
+            // Strict: a line that cannot be read, or ranges out of order, mean the map is damaged (or is not a map), and a
+            // map with a range silently missing describes a different log - the attach check and the votes rely on it.
             string[] parts = line.Split(',');
-            if (parts.Length != 2) continue;
-            if (ulong.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong s) &&
-                long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out long term))
+            if (parts.Length != 2
+                || !ulong.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out ulong s)
+                || !long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out long term))
             {
-                t._ranges.Add((s, term));
+                throw new InvalidDataException("term map: malformed line '" + (line.Length > 64 ? line[..64] : line) + "'");
             }
+            if (t._ranges.Count > 0 && (s < t._ranges[^1].StartSeq || term <= t._ranges[^1].Term))
+                throw new InvalidDataException("term map: ranges out of order at '" + line + "'");
+            t._ranges.Add((s, term));
         }
         return t;
     }

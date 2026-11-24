@@ -13,6 +13,8 @@ public interface IReplicationService : IService<IReplicationService>
     Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync();
     Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(ulong startSeq);
     UnaryResult<bool> ReportLastSyncSequenceNumber(int replicaIndex, ulong seqNumber);
+    /// <summary>The attach check (<see cref="ReplicationPrimary.CheckReplicaLog"/>). Not implemented by servers from before it existed.</summary>
+    UnaryResult<ReplicaAttachCheckDto> CheckReplicaLog(ulong latestSeq, long incarnationAtLatest);
 }
 
 /// <summary>Server side of <see cref="IReplicationService"/>, over the process's <see cref="ReplicationPrimary"/>.</summary>
@@ -23,7 +25,7 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
         await foreach (SnapshotChunk c in primary.StreamInitialStateAsync(Context.CallContext.CancellationToken).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(Context.CallContext.CancellationToken).ConfigureAwait(false);
+            await StreamWrites.WriteOrAbortAsync(stream, SnapshotChunkDto.From(c), Context.CallContext, Context.CallContext.CancellationToken).ConfigureAwait(false);
         }
         return stream.Result();
     }
@@ -36,7 +38,7 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
         {
             await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
+                await StreamWrites.WriteOrAbortAsync(stream, WalChunkDto.From(m), Context.CallContext, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -47,8 +49,16 @@ public sealed class ReplicationService(ReplicationPrimary primary) : ServiceBase
 
     public UnaryResult<bool> ReportLastSyncSequenceNumber(int replicaIndex, ulong seqNumber)
     {
+        // The index comes from a peer: one that is out of range is an invalid request, not a server fault.
+        if (replicaIndex < 0) throw new ReturnStatusException(Grpc.Core.StatusCode.InvalidArgument, "replica index " + replicaIndex);
         primary.ReportProgress(replicaIndex, seqNumber);
         return UnaryResult.FromResult(true);
+    }
+
+    public UnaryResult<ReplicaAttachCheckDto> CheckReplicaLog(ulong latestSeq, long incarnationAtLatest)
+    {
+        ReplicaAttachCheck r = primary.CheckReplicaLog(latestSeq, incarnationAtLatest);
+        return UnaryResult.FromResult(new ReplicaAttachCheckDto { Consistent = r.Consistent, Lineage = r.Lineage, Reason = r.Reason });
     }
 }
 
@@ -93,6 +103,22 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
     public async Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken) =>
         await _client.WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + _unaryTimeout, cancellationToken: cancellationToken))
             .ReportLastSyncSequenceNumber(replicaIndex, appliedThrough);
+
+    public async Task<ReplicaAttachCheck?> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken)
+    {
+        try
+        {
+            ReplicaAttachCheckDto r = await _client
+                .WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + _unaryTimeout, cancellationToken: cancellationToken))
+                .CheckReplicaLog(latestSeq, incarnationAtLatest);
+            return new ReplicaAttachCheck(r.Consistent, r.Lineage ?? "", r.Reason);
+        }
+        catch (Grpc.Core.RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+        {
+            // A primary from before the check existed: follow on sequence numbers alone, as before.
+            return null;
+        }
+    }
 
     public void Dispose() => _channel.Dispose();
 }

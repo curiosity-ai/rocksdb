@@ -98,6 +98,13 @@ public sealed class ClusterNodeHostOptions
     public TimeSpan DisposeDrainTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// How long this node, as the source of a snapshot, keeps its obsolete files (its WAL) after the snapshot stream
+    /// ended, waiting for the receiver to attach to the WAL stream; the first WAL stream it serves ends the wait. Zero
+    /// releases them with the end of the snapshot stream (a flush in between can then force another snapshot).
+    /// </summary>
+    public TimeSpan SnapshotAttachTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// The largest serialized write batch this node takes from a WAL stream while it follows
     /// (<see cref="WalStreamAssembler.MaxBatchBytes"/>; default <see cref="WalStreamAssembler.DefaultMaxBatchBytes"/>,
     /// 1 GiB). A follower holds a whole batch in memory before applying it, however it arrived; a batch announced
@@ -148,6 +155,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     private int _walStreamFaults;
     private string? _lastWalStreamFault;
     private readonly FollowerResyncPolicy _resyncPolicy = new();
+    private readonly SnapshotAttachPin _attachPin = new();
 
     public ClusterNodeHost(ClusterNodeHostOptions options, Func<ClusterMember, IClusterNodeClient> clientFactory)
     {
@@ -180,6 +188,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         _fs.CreateDirectoryIfMissing(_cfg.DbPath);
+        HostResync.DeleteLeftoverCheckpointsOf(_fs, _cfg.DbPath, Log);
         _state = new RaftPersistentState(_fs, RaftDir);
 
         // A node without a database pulls a snapshot before it takes part: a new follower, and any node whose Raft state
@@ -193,6 +202,24 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             await PullInitialSnapshotAsync(cancellationToken).ConfigureAwait(false);
         }
         _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
+        // A chunk failed to apply before this node stopped, and its log does not end where it ended then (the engine
+        // published the failed range, or the restart replayed the failed write): the log end no longer says what this
+        // node holds. Rebuild before taking part, voting meanwhile on the log end it is known to have had.
+        if (ReplicaApplyGuard.TryReadMarker(_fs, _cfg.DbPath, out ulong appliedBeforeFailure) && ReplicaApplyGuard.IsLogEndUnknown(_db))
+        {
+            if (IsBootstrapPrimary && _state.Mode == ClusterMode.Bootstrap)
+            {
+                Log("a chunk failed to apply before the restart, but this node is the bootstrap primary: keeping its log");
+            }
+            else
+            {
+                Log("a chunk failed to apply before the restart and the log no longer ends at " + appliedBeforeFailure + ": rebuilding from a snapshot");
+                if (appliedBeforeFailure != ulong.MaxValue) _state.RecordLogEnd(appliedBeforeFailure, _state.Terms.GetTermForSeq(appliedBeforeFailure));
+                await HostResync.CloseDatabaseAsync(_db, Log).ConfigureAwait(false);
+                await PullInitialSnapshotAsync(cancellationToken).ConfigureAwait(false);
+                _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
 
         var peers = new List<ClusterMember>();
         foreach (ClusterMember m in _cfg.Members)
@@ -257,6 +284,10 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     {
         DbOptions o = _cfg.DbOptionsFactory();
         o.CreateIfMissing = true;
+        // While this node follows, the engine must not recover from a background error on its own: the recovery from a
+        // failed WAL write publishes the sequence numbers of a chunk that was not applied (ReplicaApplyGuard). The node
+        // rebuilds from a snapshot instead. Before the node exists nothing is applied.
+        o.Listeners.Add(new ReplicaRecoveryVeto(() => Volatile.Read(ref _node) is { } n && n.Role != RaftRole.Leader));
         Func<ColumnFamilyOptions>? cf = _cfg.DefaultColumnFamilyOptionsFactory;
         return cf is null
             ? await RocksDatabase.OpenAsync(_cfg.DbPath, o, cancellationToken).ConfigureAwait(false)
@@ -546,10 +577,16 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             string dir = _cfg.DbPath.TrimEnd('/') + ".checkpoint-" + Guid.NewGuid().ToString("N");
             using ReplicationSession session = await new ReplicationSource(_db).GetInitialStateAsync(dir, cancellationToken).ConfigureAwait(false);
+            // The term map travels with the files it describes, captured now: this node's map only changes for entries
+            // past its log (and is replaced only by its own resync, which waits for this handler). Fetched by a separate
+            // call after the transfer, it could be the map of another log - this node deposed and rebuilt in between.
+            string terms = _node.SerializeTerms();
             await foreach (SnapshotChunk c in session.StreamSnapshotAsync(verifiedInventory, _cfg.SnapshotChunkBytes, cancellationToken).ConfigureAwait(false))
             {
-                yield return c;
+                yield return c.Kind == SnapshotChunkKind.Plan ? c.WithLogDescription(terms) : c;
             }
+            // Sent completely: keep the WAL until the receiver attaches (before the session re-enables deletions).
+            _attachPin.HoldUntilAttach(_db, _cfg.SnapshotAttachTimeout);
         }
         finally
         {
@@ -575,6 +612,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetTermForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
+                // A follower is reading the WAL: the files kept for a snapshot's receiver may go.
+                if (_attachPin.HasHolds) _attachPin.ReleaseAll();
                 yield return m;
             }
         }
@@ -691,6 +730,15 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 // First let the client writes this node admitted while it led reach its log (the gate closed when the role
                 // was lost): the log end read here must be final, or one of them lands where the leader's next entry goes.
                 await _leaderWrites.DrainAsync(ct).ConfigureAwait(false);
+                // A chunk that failed to apply earlier, and a log that no longer ends where it ended then: the failed
+                // range was published without its data (ReplicaApplyGuard). Attaching would report it as held and
+                // stream from behind it.
+                if (ReplicaApplyGuard.IsLogEndUnknown(_db))
+                {
+                    if (ct.IsCancellationRequested) return;
+                    TriggerResync("a chunk failed to apply and the log end moved past it: the log end is unknown");
+                    return;
+                }
                 ulong myLatest = _db.GetLatestSequenceNumber();
                 ClusterAttachResult? check = await client.CheckLogConsistencyAsync(_cfg.NodeId, myLatest, _node.GetTermForSeq(myLatest), ct).ConfigureAwait(false);
                 if (check is null || !check.IsLeader)
@@ -772,7 +820,25 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                         if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
                         // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or
                         // an overlap diverges the copy. Not cancellable once started: the chunk is applied whole.
-                        if (!await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false))
+                        ulong appliedThrough = _db.GetLatestSequenceNumber();
+                        bool applied;
+                        try
+                        {
+                            applied = await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch (Exception ex) when (ex is not OutOfMemoryException)
+                        {
+                            // The write failed: whatever the engine does with the chunk's sequence numbers from here
+                            // on, this node holds its log through appliedThrough and nothing after it.
+                            ReplicaApplyGuard.RecordFailure(_db, appliedThrough);
+                            if (_resyncPolicy.ShouldRebuildAfterApplyFault(appliedThrough))
+                            {
+                                TriggerResync("the chunk at " + (appliedThrough + 1) + " cannot be applied: " + ex.Message);
+                                return;
+                            }
+                            throw;
+                        }
+                        if (!applied)
                         {
                             TriggerResync("WAL stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
                             return;
@@ -854,11 +920,16 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             IReadOnlyDictionary<string, string> sourceHashes = await client.GetFileHashesAsync(local, ct).ConfigureAwait(false);
             verified = await ReplicationDelta.VerifyCandidatesAsync(_fs, _cfg.DbPath, local, sourceHashes, ct).ConfigureAwait(false);
         }
-        SnapshotRestoreResult r = await SnapshotReceiver.ReceiveAsync(client.StreamSnapshotAsync(verified, ct), _fs, _cfg.DbPath, [RaftDirName], ct)
-            .ConfigureAwait(false);
-        // The restored log is byte-for-byte the leader's, so the leader's term map is its correct description.
-        string? terms = await client.GetTermsAsync(ct).ConfigureAwait(false) ?? throw new InvalidOperationException("no term map from " + source.NodeId);
-        _state.ReplaceTerms(RaftLogTerms.Deserialize(terms));
+        // The restored log is byte-for-byte the source's, so the source's term map is its correct description. It comes
+        // with the snapshot's plan and is persisted before CURRENT appears, so the files and the map are from one moment.
+        SnapshotRestoreResult r = await SnapshotReceiver.ReceiveAsync(client.StreamSnapshotAsync(verified, ct), _fs, _cfg.DbPath, [RaftDirName],
+            description => _state.ReplaceTerms(RaftLogTerms.Deserialize(description)), ct).ConfigureAwait(false);
+        if (r.LogDescription is null)
+        {
+            // A source from before the map travelled with the snapshot: ask for it.
+            string? terms = await client.GetTermsAsync(ct).ConfigureAwait(false) ?? throw new InvalidOperationException("no term map from " + source.NodeId);
+            _state.ReplaceTerms(RaftLogTerms.Deserialize(terms));
+        }
         Log("snapshot from " + source.NodeId + ": reused " + r.ReusedFiles + " files, transferred " + r.TransferredFiles + " files / " + r.TransferredBytes + " bytes");
     }
 
@@ -1050,7 +1121,17 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         if (_db != null) await _db.DisposeAsync().ConfigureAwait(false);
     }
 
-    private void Log(string message) => _cfg.Log?.Invoke(_cfg.NodeId + ": " + message);
+    private void Log(string message)
+    {
+        try
+        {
+            _cfg.Log?.Invoke(_cfg.NodeId + ": " + message);
+        }
+        catch (Exception)
+        {
+            // The application's logger: an exception from it must not escape a catch block or end a loop of this host.
+        }
+    }
 
     private sealed class Transport(ClusterNodeHost host) : IPeerTransport
     {
