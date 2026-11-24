@@ -701,15 +701,89 @@ internal sealed class ClockShard
                 if (!Grow(t0)) break;
             }
         }
+        ClockSlot? inserted;
         EnterMutation();
         try
         {
-            return InsertCore(key, h1, h2, value, charge, priority, wantHandle);
+            inserted = InsertCore(key, h1, h2, value, charge, priority, wantHandle);
         }
-        finally
+        catch
         {
             ExitMutation();
+            if (t_deferredEvictions is not null) RunDeferredEvictions(rethrow: false);
+            throw;
         }
+        ExitMutation();
+        if (t_deferredEvictions is not null)
+        {
+            try
+            {
+                RunDeferredEvictions(rethrow: true);
+            }
+            catch
+            {
+                // The handler's failure is reported to the inserter; the handle it will not get is given back.
+                if (inserted is not null && wantHandle) Release(inserted, inserted.Generation, eraseIfLastRef: true);
+                throw;
+            }
+        }
+        return inserted;
+    }
+
+    /// <summary>
+    /// An entry evicted from an automatic table whose eviction handler has not run yet: it carries the entry's key and
+    /// value out of the slot, which is emptied (and reusable) at once.
+    /// </summary>
+    private sealed class EvictedEntry : CacheEntry
+    {
+        public bool WasHit;
+        public EvictedEntry? Next;
+
+        internal override void Release(int generation, bool eraseIfLastRef) => CachedBlock.ThrowStale();
+        internal override void AddRef(int generation) => CachedBlock.ThrowStale();
+    }
+
+    // Entries evicted by the current thread under its mutator count, waiting for their eviction handler.
+    [ThreadStatic] private static EvictedEntry? t_deferredEvictions;
+
+    /// <summary>
+    /// Runs the eviction handler for the entries this thread evicted from an automatic table and frees their values,
+    /// after the thread left the mutator gate: the handler (a secondary cache's insert: serialization, compression) may
+    /// be slow, and a grow waits for every mutator while every new mutator waits for the grow, so a handler running
+    /// under the gate stalled the whole shard for its duration (upstream's table has no such gate; its callback blocks
+    /// only the evicting thread). Every entry is freed whatever a handler throws; the first exception is rethrown.
+    /// </summary>
+    private void RunDeferredEvictions(bool rethrow)
+    {
+        Exception? first = null;
+        // A handler may insert into this cache again and evict more: until the list stays empty.
+        while (t_deferredEvictions is { } e)
+        {
+            t_deferredEvictions = null;
+            CacheEvictionHandler? handler = _owner?.EvictionHandler;
+            while (e is not null)
+            {
+                EvictedEntry? next = e.Next;
+                e.Next = null;
+                try
+                {
+                    try
+                    {
+                        handler?.OnEvicted(e.Key, e, e.WasHit);
+                    }
+                    finally
+                    {
+                        e.FreeValue();
+                    }
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    first ??= ex;
+                }
+                e = next;
+            }
+        }
+        if (rethrow && first is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(first);
     }
 
     private ClockSlot? InsertCore(in CacheKey key, ulong h1, ulong h2, in CacheValue value, long charge, CachePriority priority, bool wantHandle)
@@ -953,6 +1027,35 @@ internal sealed class ClockShard
                 if (h is not null && ClockUpdate(h, ref seenPinnedCount))
                 {
                     long charge = h.TotalCharge;
+                    if (_auto && handler is not null)
+                    {
+                        // The handler runs after this thread left the mutator gate (RunDeferredEvictions): move the
+                        // value out of the slot and empty the slot now.
+                        var evicted = new EvictedEntry
+                        {
+                            WasHit = (h.LoadMeta() & ClockSlot.HitBit) != 0,
+                            Key = h.Key,
+                            TotalCharge = charge,
+                            Buffer = h.Buffer,
+                            Length = h.Length,
+                            Object = h.Object,
+                            ReturnBufferToPool = h.ReturnBufferToPool,
+                            Helper = h.Helper,
+                            Next = t_deferredEvictions,
+                        };
+                        h.Buffer = null;
+                        h.Object = null;
+                        h.Length = 0;
+                        h.ReturnBufferToPool = false;
+                        h.Helper = null;
+                        t_deferredEvictions = evicted;
+                        Rollback(t, h.H1, h.H2, h);
+                        h.Generation++;
+                        Volatile.Write(ref h.Meta, 0);
+                        freedCharge += charge;
+                        freedCount++;
+                        continue;
+                    }
                     object? outer = t_callbackShard;
                     if (_auto) t_callbackShard = this;
                     try

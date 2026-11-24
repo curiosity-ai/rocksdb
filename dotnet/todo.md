@@ -497,5 +497,8 @@ Still open from this round:
 - [x] Background job accounting released on any exception; pool thread start failure no longer strands a write leader or a manual compaction
 - [x] HyperClock automatic table: callbacks re-entering the shard vs a grow; throwing eviction handler / Dispose; `BlockCacheTier.Close` racing inserts and lookups
 - [x] Replication: restarted pair primary waits for its role before admitting writes; cluster leader write gate; `ForcePromoteAsync` reattach; election timer re-armed; `ProgressReporter`; gate sealed at dispose
-- [ ] Thread-pool dependent sync waits left: `Dispose` on auto recovery, parallel backup, OCC parallel validation behind an async commit
-- [ ] HyperClock automatic table: slow eviction callback stalls the shard during a grow; replication: sticky resync flag, linked CTS leaks, commit index with no peers
+- [x] Thread-pool dependent sync waits: `Dispose` on auto recovery (dedicated thread), synchronous parallel backup (dedicated threads), OCC parallel validation behind an async commit (synchronous once a sync committer exists)
+- [x] HyperClock automatic table: eviction handler runs outside the mutator gate
+- [x] FileSyncWorkers start rule, trash worker / recovery chain exception types, write buffer manager stall re-check, sub-millisecond lock wait spin
+- [x] Replication: resync flag on unexpected exceptions, linked CTS leaks, single-node commit index
+- [ ] OCC parallel validation: first-synchronous-committer window (async commits in flight finish on the pool)

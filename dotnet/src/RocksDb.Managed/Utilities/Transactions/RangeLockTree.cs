@@ -761,7 +761,8 @@ internal sealed class RangeLockRequest
                 }
                 if (wait > 0)
                 {
-                    var timeout = TimeSpan.FromTicks(Math.Min(wait, (long)int.MaxValue * 1000) * 10);
+                    // At least 1 ms: the timed waits truncate to whole milliseconds (see PointLockManager).
+                    var timeout = TimeSpan.FromTicks(Math.Clamp(wait, 1000, (long)int.MaxValue * 1000) * 10);
                     if (synchronous) signal.Task.Wait(timeout, cancellationToken);
                     else await signal.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
                     cancellationToken.ThrowIfCancellationRequested();

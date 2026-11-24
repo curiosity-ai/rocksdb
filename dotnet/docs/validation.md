@@ -2672,15 +2672,27 @@ cluster leader with a write in flight always rebuilds from a snapshot; a cluster
 cancellable once started. New public members: `PrimaryWriteGate.Seal`, `PrimaryWriteGate.DrainAsync`,
 `RaftClusterNode.QuiesceLogBeforeLeadingAsync`.
 
-### Still open (found by reading, not fixed, not reproduced)
+### Third pass: the remaining open items
 
-- Synchronous `Dispose` waits for the auto-recovery task, and synchronous backup with `MaxBackgroundOperations > 1`
-  and synchronous OCC commits behind an async commit (parallel validation) wait for thread-pool work: slow with a
-  saturated pool, a deadlock with a capped one (the class audits #8 / #12 removed from the write path).
-- `FileSyncWorkers` can queue two syncs behind one idle worker; the DeleteScheduler worker and the SstFileManager
-  recovery chain end on an unexpected exception type; `WriteBufferManager` stall: a late signal can end the next stall
-  round early (after a cancellation); timed lock waits spin for the last sub-millisecond.
-- HyperClock automatic table: a slow eviction callback still stalls the shard while another thread waits to grow it
-  (callbacks run inside the mutator gate; latency only).
-- Replication: the resync flag can stick on an unexpected exception type; linked CancellationTokenSources leak per
-  attach and per leadership; a cluster with no peers never advances its commit index.
+| Area | Finding | Fix | Test |
+|---|---|---|---|
+| Thread pool | Synchronous `Dispose` waited for the automatic recovery, a thread-pool task that needed pool threads to observe the shutdown | the recovery runs on a dedicated thread with synchronous waits (upstream: recovery_thread_) | `Audit13ThreadPoolTests.DisposeDuringAutoRecoveryDoesNotNeedThePool` |
+| Thread pool | Synchronous backup / verify / restore with `MaxBackgroundOperations > 1` blocked on thread-pool workers | the caller is one worker, the others are dedicated threads | `SynchronousParallelBackupDoesNotNeedThePool` |
+| Thread pool | OCC parallel validation: an asynchronous committer got its bucket or finished its write through a pool continuation while synchronous committers blocked on the bucket | once the DB has had a synchronous committer, asynchronous commits take buckets and write synchronously (the audit #12 rule) | `OptimisticParallelValidationMixedCommitsDoNotNeedThePool` |
+| HyperClock (automatic table) | A slow eviction handler under the mutator gate stalled every insert, erase and lookup miss of the shard during a grow | the evicted value is moved out of the slot and the handler runs after the thread left the gate | `HyperClockCacheTests.SlowEvictionHandlerDoesNotStallTheShard` |
+| Env | `FileSyncWorkers` started a worker only when none was idle, so two requests could queue behind one idle worker | a worker is started when queued requests outnumber idle workers | none |
+| SstFileManager | The trash worker and the recovery chain ended for good on an unexpected exception type; a delete after Dispose queued trash nobody empties | any exception is the operation's status; deletes after Dispose are immediate | none |
+| Write buffer manager | A wake-up meant for an earlier stall round could end the next one | the stall conditions are re-checked after a wake-up | none |
+| Lock managers | Timed lock waits spun for the last sub-millisecond (the waits truncate to whole milliseconds) | the wait is at least 1 ms | none |
+| Replication | Resync flag stuck on an unexpected exception; linked CancellationTokenSources leaked per attach and per leadership; a cluster with no peers never advanced its commit index | flag released / rebuild continued on any exception; the sources are no longer linked (dispose cancels the current one); a leader without peers commits from its own log | `Audit13ReplicationThreadingTests` (resync on the cluster host, single-node commit); the rest by reading |
+
+Behaviour changes: with parallel validation, an asynchronous optimistic commit blocks its caller for the commit once the
+DB has had a synchronous committer; the automatic HyperClock table allocates one small object per eviction when an
+eviction handler (a secondary cache) is installed, and the handler sees the entry after its slot was emptied; a
+single-node cluster commits its writes.
+
+### Still open
+
+- First-synchronous-committer window (OCC parallel validation), as for the write path in audit #12: an asynchronous
+  commit already waiting or writing when the first synchronous committer arrives still finishes on the pool.
+- The four fixes without a test above were made from reading only.

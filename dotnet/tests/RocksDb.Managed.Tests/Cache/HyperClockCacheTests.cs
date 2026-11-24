@@ -461,4 +461,57 @@ public sealed class HyperClockCacheTests
             foreach (Thread t in threads) Assert.IsTrue(t.Join(60_000), "deadlock between an eviction handler and a grow (round " + round + ")");
         }
     }
+
+    private sealed class BlockingHandler(ManualResetEventSlim entered, ManualResetEventSlim release) : CacheEvictionHandler
+    {
+        private int _calls;
+
+        internal override void OnEvicted(in CacheKey key, CacheEntry entry, bool wasHit)
+        {
+            if (Interlocked.Increment(ref _calls) != 1) return;
+            entered.Set();
+            release.Wait();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public void SlowEvictionHandlerDoesNotStallTheShard()
+    {
+        // Audit #13: the automatic table ran the eviction handler (a secondary cache's insert) under the evicting
+        // thread's mutator count. A grow waits for every mutator and every new mutator waits for the grow, so one slow
+        // handler stopped all inserts, erases and lookup misses on the shard. Upstream's callback blocks only the
+        // evicting thread. The handler now runs after the thread left the gate.
+        HyperClockCache c = NewAutoCache(1 << 16);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        c.SetEvictionHandler(new BlockingHandler(entered, release));
+        var evictor = new Thread(() =>
+        {
+            for (int i = 0; i < 100 && !entered.IsSet; i++) c.Insert(Key(i), CacheValue.FromObject(new object()), 4096, CachePriority.Low);
+        }) { IsBackground = true };
+        evictor.Start();
+        try
+        {
+            Assert.IsTrue(entered.Wait(30_000), "no eviction");
+            // Small entries: the table has to grow while the first handler call is still running.
+            int size = c.TableSize;
+            var other = new Thread(() =>
+            {
+                for (int i = 0; i < 50_000; i++)
+                {
+                    c.Insert(Key(1_000_000 + i), CacheValue.FromObject(new object()), 1, CachePriority.Low);
+                    if ((i & 15) == 0) Assert.AreEqual(-1, Lookup(c, 2_000_000 + i));
+                }
+            }) { IsBackground = true };
+            other.Start();
+            Assert.IsTrue(other.Join(30_000), "inserts and lookups waited for another thread's eviction handler");
+            Assert.IsTrue(c.TableSize > size, "the table did not grow, so the test did not exercise the gate");
+        }
+        finally
+        {
+            release.Set();
+        }
+        Assert.IsTrue(evictor.Join(30_000));
+    }
 }

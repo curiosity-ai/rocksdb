@@ -33,6 +33,7 @@ internal static class FileSyncWorkers
     private static readonly SemaphoreSlim s_signal = new(0, int.MaxValue);
     private static int s_workers;
     private static int s_idle;
+    private static int s_pending; // requests queued and not yet taken by a worker
 
     /// <summary>Number of started worker threads (test observability).</summary>
     internal static int WorkerCount => Volatile.Read(ref s_workers);
@@ -44,9 +45,14 @@ internal static class FileSyncWorkers
         r.Handle = handle;
         r.Path = path;
         ValueTask task = new(r, r.Version);
+        // Counted before it is visible: a worker that dequeues it decrements after this increment.
+        int pending = Interlocked.Increment(ref s_pending);
         s_queue.Enqueue(r);
-        // Start a worker when none is idle (or about to pick this request up); otherwise wake an idle one.
-        if (Volatile.Read(ref s_idle) == 0) MaybeStartWorker();
+        // Start a worker when the queued requests outnumber the idle workers; otherwise an idle one takes it. (Comparing
+        // idle with 0 let two requests queued back to back both count on the same idle worker, so the second sync
+        // waited for the whole of the first although more workers were allowed.) The counts are read without a lock:
+        // at worst one worker more than needed is started, never one too few for a request that stays queued.
+        if (pending > Volatile.Read(ref s_idle)) MaybeStartWorker();
         s_signal.Release();
         return task;
     }
@@ -78,6 +84,7 @@ internal static class FileSyncWorkers
                 s_signal.Wait();
                 Interlocked.Decrement(ref s_idle);
                 if (!s_queue.TryDequeue(out r)) continue;
+                Interlocked.Decrement(ref s_pending);
             }
             else
             {
@@ -114,7 +121,11 @@ internal static class FileSyncWorkers
         var spin = new SpinWait();
         do
         {
-            if (s_queue.TryDequeue(out Request? r)) return r;
+            if (s_queue.TryDequeue(out Request? r))
+            {
+                Interlocked.Decrement(ref s_pending);
+                return r;
+            }
             spin.SpinOnce(sleep1Threshold: -1);
         }
         while (Stopwatch.GetTimestamp() < until);
