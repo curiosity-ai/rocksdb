@@ -42,10 +42,11 @@ public static class ReplicaApplyGuard
 
     /// <summary>
     /// Records that a chunk could not be applied to <paramref name="replica"/> while its log ended at
-    /// <paramref name="lastApplied"/>. The marker file is best effort (the disk that failed the write may fail this one
-    /// too); the in-memory record always holds for this database instance.
+    /// <paramref name="lastApplied"/>. The in-memory record always holds for this database instance. Returns whether the
+    /// marker file is durable (written now or by an earlier failure): the disk that failed the write may fail this one
+    /// too, and the caller must then stop following - what would tell a later process about the failure is missing.
     /// </summary>
-    public static void RecordFailure(RocksDatabase replica, ulong lastApplied)
+    public static bool RecordFailure(RocksDatabase replica, ulong lastApplied)
     {
         ArgumentNullException.ThrowIfNull(replica);
         Recorded r = s_recorded.GetOrCreateValue(replica);
@@ -64,9 +65,11 @@ public static class ReplicaApplyGuard
             IFileSystem fs = replica.FileSystem;
             string path = FileSystemHelpers.Combine(replica.Path, MarkerFileName);
             if (!fs.FileExists(path)) FileSystemHelpers.AtomicWrite(fs, path, lastApplied.ToString(CultureInfo.InvariantCulture));
+            return true;
         }
         catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException)
         {
+            return false;
         }
     }
 
@@ -165,5 +168,25 @@ public sealed class ReplicaRecoveryVeto : EventListener
             replica = true;
         }
         if (replica) e.AutoRecovery = false;
+    }
+
+    /// <summary>
+    /// A manual <c>Resume</c> publishes the failed range just like the automatic recovery does: refused while the
+    /// database is a replica's (the engine then fails the call with NotSupported).
+    /// </summary>
+    public override void OnManualRecoveryRequested(ManualRecoveryEventArgs e)
+    {
+        bool replica;
+        try
+        {
+            replica = _isReplica();
+        }
+        catch (Exception)
+        {
+            replica = true;
+        }
+        if (!replica) return;
+        e.Allow = false;
+        e.Reason = "the database is a replication follower's; a follower with a background error is rebuilt from a snapshot";
     }
 }

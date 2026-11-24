@@ -44,8 +44,6 @@ public sealed class Audit4ReplicationOriginalTests
 
         public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
             inner.StreamSnapshotAsync(verifiedInventory, cancellationToken);
-
-        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => inner.GetTermsAsync(cancellationToken);
     }
 
     /// <summary>

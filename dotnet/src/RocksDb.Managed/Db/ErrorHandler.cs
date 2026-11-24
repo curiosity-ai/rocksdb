@@ -784,6 +784,16 @@ internal sealed partial class DbImpl
             if (_readOnly) ThrowHelper.NotSupported("Cannot resume a read-only DB");
             if (ErrorHandler.IsRecoveryInProgress) throw new RocksDbException(StatusCode.Busy, "Resource busy: Recovery in progress");
         }
+        // Managed extension (EventListener.OnManualRecoveryRequested): a listener may refuse the manual recovery.
+        if (Options.Listeners.Count > 0)
+        {
+            var request = new ManualRecoveryEventArgs(ErrorHandler.BgError);
+            foreach (EventListener l in Options.Listeners)
+            {
+                l.OnManualRecoveryRequested(request);
+                if (!request.Allow) ThrowHelper.NotSupported("Resume refused" + (request.Reason is null ? "" : ": " + request.Reason));
+            }
+        }
         // Synchronous: the whole recovery (waits, MANIFEST and WAL switch, flushes) runs on the calling thread, and the
         // ValueTask is complete when returned.
         RocksDbException? s = await ErrorHandler.RecoverFromBgErrorAsync(isManual: true, run: null, synchronous).ConfigureAwait(false);

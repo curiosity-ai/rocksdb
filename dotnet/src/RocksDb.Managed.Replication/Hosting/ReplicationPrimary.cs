@@ -56,10 +56,11 @@ public sealed class ReplicationPrimary : IReplicationChunkSizes
     /// <summary>
     /// A replica's attach check, asked before it follows from <paramref name="latestSeq"/> + 1: whether its log can be a
     /// prefix of this one. <paramref name="incarnationAtLatest"/> is the incarnation the replica has recorded for its
-    /// latest entry (0 when it knows none: a replica fresh from a snapshot, or one from before lineages existed - then
-    /// only the sequence number is checked, as before). Not consistent when the replica holds entries past the end of
-    /// this log, or when this log's entry at that sequence number belongs to another incarnation: the replica's tail was
-    /// written by an incarnation that lost it. The answer carries the lineage for the replica to adopt.
+    /// latest entry. An empty replica (<paramref name="latestSeq"/> 0) is consistent. Not consistent when the replica
+    /// holds entries past the end of this log, when it has no incarnation for its latest entry (0: its log comes with no
+    /// lineage, so nothing says it is this log's prefix - a snapshot brings the lineage with it), or when this log's
+    /// entry at that sequence number belongs to another incarnation: the replica's tail was written by an incarnation
+    /// that lost it. The answer carries the lineage for the replica to adopt.
     /// </summary>
     public ReplicaAttachCheck CheckReplicaLog(ulong latestSeq, long incarnationAtLatest)
     {
@@ -67,7 +68,9 @@ public sealed class ReplicationPrimary : IReplicationChunkSizes
         string map = _lineage.Serialize();
         if (latestSeq > latest)
             return new ReplicaAttachCheck(false, map, "the replica's log ends at " + latestSeq + ", past the primary's at " + latest);
-        if (latestSeq == 0 || incarnationAtLatest == 0) return new ReplicaAttachCheck(true, map, null);
+        if (latestSeq == 0) return new ReplicaAttachCheck(true, map, null);
+        if (incarnationAtLatest == 0)
+            return new ReplicaAttachCheck(false, map, "the replica has no lineage for its log (ending at " + latestSeq + ")");
         long mine = _lineage.GetIncarnationForSeq(latestSeq);
         if (mine != incarnationAtLatest)
         {
@@ -199,12 +202,10 @@ public interface IReplicationSourceClient
     Task ReportProgressAsync(int replicaIndex, ulong appliedThrough, CancellationToken cancellationToken);
 
     /// <summary>
-    /// The attach check (<see cref="ReplicationPrimary.CheckReplicaLog"/>). Null when the primary cannot be asked (a
-    /// transport or a primary from before the check existed): the replica then follows as before, on sequence numbers
-    /// alone. The default implementation returns null.
+    /// The attach check (<see cref="ReplicationPrimary.CheckReplicaLog"/>). Every replica is checked before it follows:
+    /// a transport that cannot ask the primary fails the call.
     /// </summary>
-    Task<ReplicaAttachCheck?> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
-        Task.FromResult<ReplicaAttachCheck?>(null);
+    Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -245,7 +246,12 @@ public static class ReplicaFollower
         // The primary's lineage (ReplicationLineage) comes with the plan and is stored before CURRENT appears: the
         // replica then knows which incarnation wrote its entries from its first attach on.
         return SnapshotReceiver.ReceiveAsync(primary.StreamInitialStateAsync(cancellationToken), fileSystem, dbPath, preserveNames,
-            description => ReplicationLineage.Load(fileSystem, dbPath).Replace(description), cancellationToken);
+            new SnapshotRestoreOptions
+            {
+                // Without the lineage the replica could not pass its attach check: such a snapshot is refused.
+                RequireLogDescription = true,
+                OnLogDescription = description => ReplicationLineage.Load(fileSystem, dbPath).Replace(description),
+            }, cancellationToken);
     }
 
     /// <summary>
@@ -301,12 +307,10 @@ public static class ReplicaFollower
         }
         ulong latest = replica.GetLatestSequenceNumber();
         ReplicationLineage lineage = ReplicationLineage.Load(replica);
-        ReplicaAttachCheck? check = await primary.CheckReplicaLogAsync(latest, lineage.GetIncarnationForSeq(latest), cancellationToken).ConfigureAwait(false);
-        if (check is not null)
-        {
-            if (!check.Consistent) throw new ReplicationResyncRequiredException("the replica's log is not a prefix of the primary's: " + check.Reason);
-            lineage.AdoptAfter(latest, check.Lineage);
-        }
+        ReplicaAttachCheck check = await primary.CheckReplicaLogAsync(latest, lineage.GetIncarnationForSeq(latest), cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("the primary did not answer the attach check");
+        if (!check.Consistent) throw new ReplicationResyncRequiredException("the replica's log is not a prefix of the primary's: " + check.Reason);
+        lineage.AdoptAfter(latest, check.Lineage);
         ulong start = latest + 1;
         using var assembler = new WalStreamAssembler(options.MaxBatchBytes);
         await foreach (WalStreamMessage m in primary.StreamUpdatesAsync(start, cancellationToken).ConfigureAwait(false))
@@ -328,7 +332,12 @@ public static class ReplicaFollower
             {
                 // The write failed: whatever the engine does with the chunk's sequence numbers from here on, the
                 // replica holds its log through appliedThrough and nothing after it.
-                ReplicaApplyGuard.RecordFailure(replica, appliedThrough);
+                if (!ReplicaApplyGuard.RecordFailure(replica, appliedThrough))
+                {
+                    // Nothing durable says that a chunk failed here: do not follow this database again.
+                    throw new ReplicationResyncRequiredException("the chunk at " + (appliedThrough + 1) + " could not be applied (" + e.Message +
+                        ") and the failure could not be recorded in the replica's directory: rebuild the replica from a snapshot");
+                }
                 throw;
             }
             if (!applied)

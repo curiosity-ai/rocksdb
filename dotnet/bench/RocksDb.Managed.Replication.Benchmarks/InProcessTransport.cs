@@ -61,6 +61,9 @@ internal sealed class InProcessReplicationClient(ReplicationPrimary primary) : I
         primary.ReportProgress(replicaIndex, appliedThrough);
         return Task.CompletedTask;
     }
+
+    public Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
+        Task.FromResult(primary.CheckReplicaLog(latestSeq, incarnationAtLatest));
 }
 
 /// <summary><see cref="IPairNodeClient"/> calling the other <see cref="PairNodeHost"/> in process.</summary>

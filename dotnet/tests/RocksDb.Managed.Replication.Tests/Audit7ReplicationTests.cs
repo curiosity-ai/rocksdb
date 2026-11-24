@@ -65,6 +65,9 @@ public sealed class Audit7ReplicationTests
 
         public IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken) => primary.StreamInitialStateAsync(cancellationToken);
 
+        public Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
+            Task.FromResult(primary.CheckReplicaLog(latestSeq, incarnationAtLatest));
+
         public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             int n = 0;
@@ -335,7 +338,6 @@ public sealed class Audit7ReplicationTests
             inner.GetFileHashesAsync(candidates, cancellationToken);
         public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
             inner.StreamSnapshotAsync(verifiedInventory, cancellationToken);
-        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => inner.GetTermsAsync(cancellationToken);
     }
 
     private static async Task WriteCommittedAsync(ClusterHarness c, int from, int to)

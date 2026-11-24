@@ -95,7 +95,7 @@ public sealed class SnapshotChunkDto
     /// </summary>
     public SnapshotChunk ToChunk() => (SnapshotChunkKind)Kind switch
     {
-        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles ?? []).WithLogDescription(LogDescription),
+        SnapshotChunkKind.Plan => SnapshotChunk.Plan(SequenceNumber, KeepFiles ?? [], FileSize).WithLogDescription(LogDescription),
         SnapshotChunkKind.Complete => FileSize is >= 0 and <= int.MaxValue
             ? SnapshotChunk.Complete((int)FileSize)
             : throw new InvalidDataException("snapshot end marker with file count " + FileSize),

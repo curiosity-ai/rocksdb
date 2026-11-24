@@ -506,6 +506,9 @@ internal static partial class Scenarios
             primary.ReportProgress(replicaIndex, appliedThrough);
             return Task.CompletedTask;
         }
+
+        public Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
+            Task.FromResult(primary.CheckReplicaLog(latestSeq, incarnationAtLatest));
     }
 
     /// <summary>The other <see cref="PairNodeHost"/> in process; null answers while it is not started.</summary>
@@ -575,8 +578,6 @@ internal static partial class Scenarios
 
         public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
             Require.StreamSnapshotAsync(verifiedInventory, cancellationToken);
-
-        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => Task.FromResult(Target?.HandleGetTerms());
     }
 
     /// <summary>Cancels and awaits a background task on disposal (registered with <see cref="ScenarioContext.Own"/>).</summary>

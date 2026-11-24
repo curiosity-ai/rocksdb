@@ -186,8 +186,8 @@ public sealed class Audit14ReplicationTests
             return Task.CompletedTask;
         }
 
-        public Task<ReplicaAttachCheck?> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
-            Task.FromResult<ReplicaAttachCheck?>(primary().CheckReplicaLog(latestSeq, incarnationAtLatest));
+        public Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
+            Task.FromResult(primary().CheckReplicaLog(latestSeq, incarnationAtLatest));
     }
 
     /// <summary>Follows until the replica reaches <paramref name="target"/>, then stops the stream.</summary>

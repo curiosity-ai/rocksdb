@@ -118,20 +118,12 @@ public sealed class GrpcReplicationClient : IReplicationSourceClient, IDisposabl
         await _client.WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + _unaryTimeout, cancellationToken: cancellationToken))
             .ReportLastSyncSequenceNumber(replicaIndex, appliedThrough);
 
-    public async Task<ReplicaAttachCheck?> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken)
+    public async Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken)
     {
-        try
-        {
-            ReplicaAttachCheckDto r = await _client
-                .WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + _unaryTimeout, cancellationToken: cancellationToken))
-                .CheckReplicaLog(latestSeq, incarnationAtLatest);
-            return new ReplicaAttachCheck(r.Consistent, r.Lineage ?? "", r.Reason);
-        }
-        catch (Grpc.Core.RpcException e) when (e.StatusCode == Grpc.Core.StatusCode.Unimplemented)
-        {
-            // A primary from before the check existed: follow on sequence numbers alone, as before.
-            return null;
-        }
+        ReplicaAttachCheckDto r = await _client
+            .WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + _unaryTimeout, cancellationToken: cancellationToken))
+            .CheckReplicaLog(latestSeq, incarnationAtLatest);
+        return new ReplicaAttachCheck(r.Consistent, r.Lineage ?? "", r.Reason);
     }
 
     public void Dispose() => _channel.Dispose();

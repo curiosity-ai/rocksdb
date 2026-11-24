@@ -6,7 +6,11 @@ namespace RocksDb.Managed.Replication.Hosting;
 
 /// <summary>Status of a cluster node, as reported by <see cref="ClusterNodeHost.GetStatus"/>.</summary>
 public sealed record ClusterNodeStatus(string NodeId, RaftRole Role, long Term, string? LeaderId, ulong LatestSeq, ulong CommitSeq, ClusterMode Mode,
-    int BootstrapInSyncCount, bool Resyncing, int Resyncs);
+    int BootstrapInSyncCount, bool Resyncing, int Resyncs)
+{
+    /// <summary><see cref="ClusterNodeHost.FollowerFault"/>: why the node stopped following for good, or null.</summary>
+    public string? FollowerFault { get; init; }
+}
 
 /// <summary>Outcome of <see cref="ClusterNodeHost.WriteCommittedAsync(WriteBatch, TimeSpan, CancellationToken)"/>.</summary>
 public enum ClusterWriteStatus
@@ -46,7 +50,6 @@ public interface IClusterNodeClient
     Task ReportProgressAsync(string followerId, ulong appliedThrough, long leaderTerm, CancellationToken cancellationToken);
     Task<IReadOnlyDictionary<string, string>> GetFileHashesAsync(IReadOnlyList<ReplicationFileInfo> candidates, CancellationToken cancellationToken);
     IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken);
-    Task<string?> GetTermsAsync(CancellationToken cancellationToken);
 }
 
 /// <summary>Configuration of a <see cref="ClusterNodeHost"/>.</summary>
@@ -103,6 +106,20 @@ public sealed class ClusterNodeHostOptions
     /// releases them with the end of the snapshot stream (a flush in between can then force another snapshot).
     /// </summary>
     public TimeSpan SnapshotAttachTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How a resync treats the copy this node has (<see cref="SnapshotRestoreMode"/>). Default
+    /// <see cref="SnapshotRestoreMode.Auto"/>: the snapshot is restored next to the current copy and swapped in when the
+    /// volume has room for it (the node then keeps an openable copy for the whole resync), and the current copy is
+    /// deleted first when it has not, or when the free space cannot be determined. The host logs which was chosen.
+    /// </summary>
+    public SnapshotRestoreMode ResyncRestoreMode { get; init; } = SnapshotRestoreMode.Auto;
+
+    /// <summary>
+    /// <see cref="SnapshotRestoreMode.Auto"/>: the free space that must remain beyond the bytes the snapshot announces
+    /// (default 64 MiB).
+    /// </summary>
+    public long ResyncFreeSpaceMarginBytes { get; init; } = SnapshotRestoreOptions.DefaultFreeSpaceMarginBytes;
 
     /// <summary>
     /// The largest serialized write batch this node takes from a WAL stream while it follows
@@ -195,9 +212,19 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        // A resync that was swapping the restored copy in when the process ended (SnapshotRestoreSwap): completed or
+        // discarded before the directory and the Raft state in it are touched.
+        string? restoredTerms = SnapshotRestoreSwap.Recover(_fs, _cfg.DbPath, [RaftDirName], Log);
         _fs.CreateDirectoryIfMissing(_cfg.DbPath);
         HostResync.DeleteLeftoverCheckpointsOf(_fs, _cfg.DbPath, Log);
         _state = new RaftPersistentState(_fs, RaftDir);
+        if (restoredTerms is not null)
+        {
+            // The swap was done but the term map of the restored log had not been stored yet.
+            _state.ReplaceTerms(RaftLogTerms.Deserialize(restoredTerms));
+            SnapshotRestoreSwap.ClearPendingDescription(_fs, _cfg.DbPath);
+            Log("applied the term map of the snapshot restored before the restart");
+        }
 
         // A node without a database pulls a snapshot before it takes part: a new follower, and any node whose Raft state
         // outlived its database (killed during a snapshot restore, which deletes the old files before CURRENT arrives).
@@ -537,7 +564,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             }
         }
         return new ClusterNodeStatus(_cfg.NodeId, _node.Role, _node.CurrentTerm, _node.CurrentLeaderId, latest, _node.CommitSeq, _node.Mode,
-            _node.BootstrapInSyncCount, _resyncing, Resyncs);
+            _node.BootstrapInSyncCount, _resyncing, Resyncs) { FollowerFault = _followerFault };
     }
 
     public async ValueTask<ClusterAttachResult> HandleCheckLogConsistencyAsync(ulong followerLatestSeq, long followerTermAtLatest,
@@ -697,7 +724,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     {
         lock (_followerLock)
         {
-            if (_resyncing || _cts.IsCancellationRequested) return;
+            if (_resyncing || _cts.IsCancellationRequested || _followerFault is not null) return;
             if (_following == leaderId && _followerTask is { IsCompleted: false }) return;
             _followerCts?.Cancel();
             // Not linked to _cts: a linked source keeps a registration on the host's source until it is disposed, one
@@ -720,6 +747,23 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 await RunFollowerStreamAsync(leaderId, ct).ConfigureAwait(false);
             });
         }
+    }
+
+    // Set when a failed apply could not be recorded durably: this node stops following until it is rebuilt.
+    private volatile string? _followerFault;
+
+    /// <summary>
+    /// Why this node stopped following for good, or null. Set when a chunk failed to apply and the failure could not be
+    /// recorded in the database directory (<see cref="ReplicaApplyGuard"/>): nothing durable would tell a later process
+    /// that its log end may not say what it holds, so the node does not go on as if nothing happened. A resync
+    /// (<see cref="TriggerResync"/>) clears it.
+    /// </summary>
+    public string? FollowerFault => _followerFault;
+
+    private void EnterFollowerFault(string reason)
+    {
+        _followerFault = reason;
+        Log("FOLLOWER FAULT, not following any more (rebuild this node with a resync): " + reason);
     }
 
     private async Task RunFollowerStreamAsync(string leaderId, CancellationToken ct)
@@ -838,7 +882,12 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                         {
                             // The write failed: whatever the engine does with the chunk's sequence numbers from here
                             // on, this node holds its log through appliedThrough and nothing after it.
-                            ReplicaApplyGuard.RecordFailure(_db, appliedThrough);
+                            if (!ReplicaApplyGuard.RecordFailure(_db, appliedThrough))
+                            {
+                                EnterFollowerFault("the chunk at " + (appliedThrough + 1) + " could not be applied (" + ex.Message +
+                                    ") and the failure could not be recorded in the database directory");
+                                return;
+                            }
                             if (_resyncPolicy.ShouldRebuildAfterApplyFault(appliedThrough))
                             {
                                 TriggerResync("the chunk at " + (appliedThrough + 1) + " cannot be applied: " + ex.Message);
@@ -930,15 +979,21 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         }
         // The restored log is byte-for-byte the source's, so the source's term map is its correct description. It comes
         // with the snapshot's plan and is persisted before CURRENT appears, so the files and the map are from one moment.
+        // A snapshot without the map is refused. While this node has a database, the snapshot is restored next to it and
+        // swapped in (SnapshotRestoreMode; the Raft state moves with the swap, under its own lock): a crash during the
+        // resync then leaves the old log, which the recorded log end and the term map still describe.
         SnapshotRestoreResult r = await SnapshotReceiver.ReceiveAsync(client.StreamSnapshotAsync(verified, ct), _fs, _cfg.DbPath, [RaftDirName],
-            description => _state.ReplaceTerms(RaftLogTerms.Deserialize(description)), ct).ConfigureAwait(false);
-        if (r.LogDescription is null)
-        {
-            // A source from before the map travelled with the snapshot: ask for it.
-            string? terms = await client.GetTermsAsync(ct).ConfigureAwait(false) ?? throw new InvalidOperationException("no term map from " + source.NodeId);
-            _state.ReplaceTerms(RaftLogTerms.Deserialize(terms));
-        }
-        Log("snapshot from " + source.NodeId + ": reused " + r.ReusedFiles + " files, transferred " + r.TransferredFiles + " files / " + r.TransferredBytes + " bytes");
+            new SnapshotRestoreOptions
+            {
+                Mode = _cfg.ResyncRestoreMode,
+                FreeSpaceMarginBytes = _cfg.ResyncFreeSpaceMarginBytes,
+                RequireLogDescription = true,
+                OnLogDescription = description => _state.ReplaceTerms(RaftLogTerms.Deserialize(description)),
+                SwapGuard = _state.RunExclusive,
+                Log = Log,
+            }, ct).ConfigureAwait(false);
+        Log("snapshot from " + source.NodeId + ": reused " + r.ReusedFiles + " files, transferred " + r.TransferredFiles + " files / " + r.TransferredBytes +
+            " bytes" + (r.Swapped ? " (swapped in)" : ""));
     }
 
     /// <summary>Rebuilds this node from the current leader's snapshot (also triggered automatically on divergence).</summary>
@@ -948,6 +1003,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             if (_resyncing || _cts.IsCancellationRequested) return;
             _resyncing = true;
+            // The rebuild replaces the log whose end was in doubt.
+            _followerFault = null;
             Log("resync: " + reason);
             _resyncTask = Task.Run(PerformResyncAsync);
         }

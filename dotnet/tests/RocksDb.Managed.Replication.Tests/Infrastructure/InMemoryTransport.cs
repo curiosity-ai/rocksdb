@@ -229,8 +229,6 @@ public sealed class InMemoryClusterClient(InMemoryNetwork network, string from, 
 
     public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
         InMemoryNetwork.Pump(ct => RequirePeer(null, nameof(StreamSnapshotAsync)).StreamSnapshotAsync(verifiedInventory, ct), static c => c.Detach(), network.Lifetime(to), network.Link(from, to), cancellationToken);
-
-    public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => Task.FromResult(Peer(null, nameof(GetTermsAsync))?.HandleGetTerms());
 }
 
 /// <summary><see cref="IPairNodeClient"/> over an <see cref="InMemoryNetwork"/>, with the fault injection of rocksdb-sharp's SwitchoverTest.</summary>

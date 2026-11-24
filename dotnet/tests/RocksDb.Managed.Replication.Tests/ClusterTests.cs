@@ -265,8 +265,6 @@ public sealed class ClusterTests
 
         public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
             blocked() ? throw new IOException("replication blocked") : inner.StreamSnapshotAsync(verifiedInventory, cancellationToken);
-
-        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => inner.GetTermsAsync(cancellationToken);
     }
 
     /// <summary>

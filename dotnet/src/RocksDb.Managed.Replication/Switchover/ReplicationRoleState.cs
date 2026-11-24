@@ -224,6 +224,17 @@ public sealed class ReplicationRoleState
     }
 
     /// <summary>Replaces the epoch map wholesale - after a snapshot restore, when the local log is the primary's.</summary>
+    /// <summary>
+    /// Runs <paramref name="action"/> while nothing else reads or persists this state: for an owner that moves the
+    /// directory the state lives in (a snapshot restore swapping the database directory, see
+    /// <see cref="SnapshotRestoreSwap"/>). The action may call back into this object.
+    /// </summary>
+    public void RunExclusive(Action action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_gate) action();
+    }
+
     public void ReplaceEpochs(string serialized)
     {
         lock (_gate)

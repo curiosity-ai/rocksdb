@@ -95,7 +95,9 @@ public sealed class ReplicationLineage
             RaftLogTerms next = _map.Clone();
             next.TruncateAfter(latestSequence);
             long id = Math.Max(_map.GetLast().Term + 1, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            next.Record(latestSequence + 1, id);
+            // The first incarnation of a log covers what the log already holds: every entry then belongs to an
+            // incarnation, and "no incarnation" (0) only ever means a replica that has no lineage for its log.
+            next.Record(next.GetLast().Term == 0 ? 1 : latestSequence + 1, id);
             Persist(next);
             _map = next;
             return id;

@@ -157,6 +157,25 @@ public sealed class ErrorRecoveryBeginEventArgs
     public bool AutoRecovery { get; set; } = true;
 }
 
+/// <summary>
+/// Argument of <see cref="EventListener.OnManualRecoveryRequested"/> (managed extension, no upstream equivalent):
+/// <see cref="RocksDatabase.Resume"/> was called while a background error is set; clearing <see cref="Allow"/> makes
+/// the call fail with NotSupported instead of recovering.
+/// </summary>
+public sealed class ManualRecoveryEventArgs
+{
+    internal ManualRecoveryEventArgs(RocksDbException? error) => Error = error;
+
+    /// <summary>The background error the recovery would clear (null if it was cleared meanwhile).</summary>
+    public RocksDbException? Error { get; }
+
+    /// <summary>False refuses the recovery.</summary>
+    public bool Allow { get; set; } = true;
+
+    /// <summary>Why the recovery is refused (part of the error message).</summary>
+    public string? Reason { get; set; }
+}
+
 /// <summary>Port of rocksdb::BackgroundErrorRecoveryInfo.</summary>
 public sealed class BackgroundErrorRecoveryInfo
 {
@@ -535,6 +554,17 @@ public abstract class EventListener
     /// disabled through <see cref="ErrorRecoveryBeginEventArgs.AutoRecovery"/>.
     /// </summary>
     public virtual void OnErrorRecoveryBegin(ErrorRecoveryBeginEventArgs e)
+    {
+    }
+
+    /// <summary>
+    /// Managed extension: a manual recovery (<see cref="RocksDatabase.Resume"/>) is about to start; it can be refused
+    /// through <see cref="ManualRecoveryEventArgs.Allow"/>. <see cref="OnErrorRecoveryBegin"/> only covers automatic
+    /// recovery; an owner of the database that must not have a background error recovered in place (a replication
+    /// follower: the recovery from a failed WAL write publishes sequence numbers whose data was never written) needs
+    /// the manual path closed as well. Runs on the calling thread, without the DB mutex.
+    /// </summary>
+    public virtual void OnManualRecoveryRequested(ManualRecoveryEventArgs e)
     {
     }
 

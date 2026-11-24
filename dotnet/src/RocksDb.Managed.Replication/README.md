@@ -118,30 +118,77 @@ if (!await consumer.TryIngestChunkAsync(chunkBytes, ct)) Resync();   // must sta
   (`WalDir` empty) on replicas restored from a checkpoint (a checkpoint stores its WALs next to the tables).
 * **Lineage of plain replication** (`ReplicationLineage`). Every `ReplicationPrimary` created over a database starts
   a new *incarnation* at the database's latest sequence number + 1 and persists it (fsync'd, in the `replication`
-  subdirectory of the database directory). The map travels with a snapshot and is returned by the attach check
+  subdirectory of the database directory); the first one starts at sequence 1, so that every entry of a database with
+  a lineage belongs to an incarnation. The map travels with a snapshot and is returned by the attach check
   (`IReplicationSourceClient.CheckReplicaLogAsync` -> `ReplicationPrimary.CheckReplicaLog`), which
   `ReplicaFollower.FollowAsync` asks before it follows: the replica names the incarnation of its latest entry and the
   primary confirms that entry belongs to that incarnation in its own log. A primary that lost the unsynced end of its
   log (power loss without fsync, a restore from a backup) and wrote other entries at those sequence numbers fails the
   check for a replica that still holds the lost ones, and `FollowAsync` throws `ReplicationResyncRequiredException`
-  instead of continuing behind them. A client or primary without the check (`CheckReplicaLogAsync` returns null, a gRPC
-  primary answers Unimplemented) keeps the earlier behaviour: sequence numbers only.
+  instead of continuing behind them. **The lineage is mandatory**: a replica that holds entries but no lineage for
+  them (no lineage file - a directory copied by hand, or one written before the lineage existed) fails the check and
+  must be rebuilt from a snapshot, the check itself is a required member of `IReplicationSourceClient` (there is no
+  "sequence numbers only" path), and a snapshot whose plan carries no log description is refused before anything of
+  the existing database is touched. An empty replica (latest sequence 0) attaches without one.
 * **A chunk whose write fails on a replica** (`ReplicaApplyGuard`). The engine allocates a write's sequence numbers
   before the WAL append; when the append or its fsync fails, the recovery from that error publishes the range although
   its data is nowhere (as upstream RocksDB does). A replica's position is its latest sequence number, so it would
   attach behind the failed chunk and never receive it. Two measures: the pair and cluster hosts open their database
-  with `ReplicaRecoveryVeto` (no automatic recovery while the node is a replica / follower; for plain replication pass
+  with `ReplicaRecoveryVeto` (no recovery while the node is a replica / follower: the automatic one is vetoed and a
+  manual `RocksDatabase.Resume()` / `ResumeAsync()` throws NotSupported, through the engine's
+  `EventListener.OnManualRecoveryRequested`; for plain replication pass
   the replica's options through `ReplicaFollower.ProtectReplicaOptions`), and a failed apply records the last applied
   sequence number (in memory and in the `REPLICA_APPLY_FAILED` file of the database directory, which a snapshot restore
   removes). Before attaching again - also after a restart - a replica whose log no longer ends there is rebuilt from a
   snapshot (`FollowAsync` throws `ReplicationResyncRequiredException`). A chunk that fails to apply twice at the same
-  position (a stopped database, a column family the replica lacks) rebuilds the node as well.
+  position (a stopped database, a column family the replica lacks) rebuilds the node as well. The marker file is the
+  second line of defence, not the first: with no recovery possible the database keeps its background error and its
+  log keeps ending at the last applied entry. When the marker cannot be written (the disk that failed the chunk fails
+  the marker too), the node does not carry on without it: `ReplicaFollower.FollowAsync` throws
+  `ReplicationResyncRequiredException`, and a pair / cluster host stops following and says why in
+  `PairNodeHost.FollowerFault` / `ClusterNodeHost.FollowerFault` (also in `GetStatus()`) until `TriggerResync` rebuilds
+  the node or it is restarted.
 * A source keeps its obsolete files for up to `SnapshotAttachTimeout` (30 s) after a snapshot stream ended, until the
   receiver's WAL stream reads its first message, so that a flush in between does not purge the WAL the receiver is
   about to ask for. The WAL stream does not name the snapshot it follows, so the first attach of any follower ends the
   wait. Checkpoint directories left behind by a process that died during a snapshot stream are removed when a host
   starts or a `ReplicationPrimary` is created. A restore needs CURRENT in the stream, and the source's term / epoch /
   lineage map comes in the snapshot's plan (`SnapshotChunk.LogDescription`) and is persisted before CURRENT appears.
+  The hosts refuse a snapshot without it (`SnapshotRestoreOptions.RequireLogDescription`); there is no separate
+  "fetch the map afterwards" call.
+* **Restore-then-swap** (`SnapshotRestoreMode`, `SnapshotRestoreSwap`). A restore that deletes the old files first
+  leaves the node without any database from the first deleted file until CURRENT arrives: a source that dies in
+  between costs the node the copy it could have been promoted on. `SnapshotReceiver` can instead restore into the
+  sibling directory `<db>.resync-new` (files the plan keeps are hard-linked into it) and swap: `<db>` is renamed to
+  `<db>.resync-old`, the new directory to `<db>`, the owner's preserved subdirectories (`role`, `raft`) are moved over,
+  the snapshot's log description is applied, and the old copy is deleted. The plan announces the bytes to transfer
+  (`SnapshotChunk.TransferBytes`), and the mode decides:
+
+  | `ResyncRestoreMode` (hosts) / `SnapshotRestoreOptions.Mode` | behaviour |
+  |---|---|
+  | `Auto` (default of `PairNodeHostOptions` and `ClusterNodeHostOptions`) | swap when `IFileSystem.GetFreeSpace` reports at least the announced bytes + `ResyncFreeSpaceMarginBytes` (64 MiB); delete-first when there is less, when the file system cannot tell (unknown is not "enough"), when the source did not announce a size, or when the directory holds no database to keep |
+  | `AlwaysSwap` | swap regardless of the free space (the restore fails when the disk fills) |
+  | `AlwaysDeleteFirst` (default of `SnapshotRestoreOptions` and `ReplicaFollower.SyncInitialStateAsync`) | delete what the plan does not keep, restore in place |
+
+  Every restore logs one line naming the mode and the reason (`snapshot restore: restore-then-swap (... bytes free for
+  ... to transfer plus a margin of ...)`, `snapshot restore: delete-first (not enough free disk space: ...)`). During
+  the transfer the node needs the room for both copies (minus the reused files, which are links). What a crash leaves,
+  and what `SnapshotRestoreSwap.Recover` - called by both hosts when they start, and by the receiver before a restore -
+  makes of it:
+
+  | crash | on disk | at the next start |
+  |---|---|---|
+  | during the transfer, or before the first rename | `<db>` (old, complete, with the state describing it) + `<db>.resync-new` | the staged copy is deleted; the node runs on its old copy and asks for a resync again if it still needs one |
+  | between the two renames | `<db>.resync-old` + `<db>.resync-new` (complete: it has CURRENT) | the swap is completed |
+  | after the renames | `<db>` (new) + `<db>.resync-old` (still holding `role` / `raft`) | the preserved subdirectories are moved, the old copy is deleted |
+  | before the description was applied | `<db>/RESTORED_LOG_DESCRIPTION` | the host stores the epoch / term map from that file, then removes it |
+
+  The description is applied only after the swap, so a crash before it leaves the old database with the old map. The
+  renames, the move of the preserved state and the map update run under the role / Raft state's lock
+  (`ReplicationRoleState.RunExclusive`, `RaftPersistentState.RunExclusive`): a vote or a role change is persisted
+  before or after the swap, never into a directory that is being moved. The cluster's `raft.logend` record is written
+  before the restore as before and travels with the `raft` directory. A user-configured `WalDir` outside the database
+  directory is not covered (as for a checkpoint restore in general: keep the WAL in the database directory).
 * `AdaptiveCommitDelayController` ignores a replica that has not reported for `ReplicaLagStaleAfter` (30 s; or after
   `ForgetReplica`), and recommends no delay when no replica reports at all.
 
