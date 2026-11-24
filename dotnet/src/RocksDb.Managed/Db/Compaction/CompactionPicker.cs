@@ -23,7 +23,12 @@ internal abstract partial class CompactionPicker
         Icmp = icmp;
     }
 
-    public ColumnFamilyOptions Options { get; }
+    /// <summary>
+    /// The column family's options as an immutable snapshot (ColumnFamilyData.OptionsSnapshot), replaced after each
+    /// SetOptions: a compaction keeps the snapshot it was picked with (upstream: Compaction::mutable_cf_options_, a copy
+    /// taken at pick time), so a running job never sees options change under it. REQUIRES: DB mutex to replace.
+    /// </summary>
+    public ColumnFamilyOptions Options { get; internal set; }
     public InternalKeyComparator Icmp { get; }
     public int NumberLevels => Math.Max(1, Options.NumLevels);
 

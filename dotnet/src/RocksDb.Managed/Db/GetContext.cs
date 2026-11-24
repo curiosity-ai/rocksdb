@@ -294,6 +294,10 @@ internal sealed class GetContext
                 or EntryType.DeletionWithTimestamp or EntryType.ValuePreferredSeqno or EntryType.BlobIndex or EntryType.WideColumnEntity)
         {
             type = EntryType.RangeDeletion;
+            // The lookup ends here, before the file's remaining entries for the key: what was recorded is not the file's
+            // complete row cache entry (same reasoning as for ShouldMerge below; docs/upstream-issues/16). A read the
+            // tombstone does not cover (an older snapshot) would replay a truncated entry. Not cached.
+            ReplayLog?.Clear();
         }
         switch (type)
         {

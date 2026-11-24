@@ -1459,6 +1459,14 @@ internal sealed class CompactionJob
         // FinishCompactionOutputFile: LogAndNotifyTableFileCreationFinished with the builder's table properties
         // (outputs.UpdateTableProperties()), once the file is closed and before the subcompaction completes.
         _db.NotifyOnTableFileCreated(_cfd, JobId, outputPath, meta.FileSize, TableFileCreationReason.Compaction, null, builder.Properties);
+        // FinishCompactionOutputFile: "Report new file to SstFileManagerImpl" and, once the tracked files reach the limit,
+        // fail the compaction with SpaceLimit("Max allowed space was reached") - before anything is installed, so the
+        // outputs are discarded and the inputs stay (the limit used to be checked only after the install).
+        if (OutputDirectory is null && meta.PathId == 0 && _db.Options.SstFileManager is { } sfm)
+        {
+            sfm.OnAddFile(outputPath, meta.FileSize);
+            if (sfm.IsMaxAllowedSpaceReached) throw RocksDbException.SpaceLimit("Max allowed space was reached");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------

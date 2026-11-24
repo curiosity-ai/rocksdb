@@ -228,9 +228,10 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
     private async ValueTask WaitAllSlowAsync(AsyncLookupHandle[] handles, int count, CancellationToken cancellationToken)
     {
         AsyncLookupHandle[] mine = RocksArrayPool<AsyncLookupHandle>.Shared.Rent(count);
+        int n = 0;
         try
         {
-            int n = CollectPending(handles.AsSpan(0, count), mine, out bool innerPending);
+            n = CollectPending(handles.AsSpan(0, count), mine, out bool innerPending);
             if (innerPending)
             {
                 await _target.WaitAllAsync(handles, count, cancellationToken).ConfigureAwait(false);
@@ -242,6 +243,25 @@ internal sealed class CacheWithSecondaryAdapter : BlockCache
                 if (!sh.IsReady) await sh.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             for (int i = 0; i < n; i++) Complete(mine[i]);
+        }
+        catch
+        {
+            // A wait was canceled or failed: the lookups that are ready already hold a value the tier created (a block
+            // on a pooled buffer). Completing them turns it into the handle's result, which the caller releases; left
+            // pending, the caller's Reset dropped it without disposing it (upstream: the handle's unique_ptr frees it).
+            for (int i = 0; i < n; i++)
+            {
+                AsyncLookupHandle h = mine[i];
+                if (h is not { PendingHandle: { IsReady: true } }) continue;
+                try
+                {
+                    Complete(h);
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                }
+            }
+            throw;
         }
         finally
         {

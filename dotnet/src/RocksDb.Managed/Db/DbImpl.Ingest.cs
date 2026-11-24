@@ -198,7 +198,15 @@ internal sealed partial class DbImpl
                                 // the MANIFEST is written must not get the ingested files' seqno before they are visible
                                 // (DBImpl::IngestExternalFiles updates the last seqno after LogAndApply for the same
                                 // reason).
-                                await Versions.LogAndApplyAsync(cfd, edit, exclusive, CancellationToken.None).ConfigureAwait(false);
+                                // The last sequence and the super version are installed in the mutex hold that installs
+                                // the version (DBImpl::IngestExternalFiles does all of it under one hold).
+                                ulong publish = consumed ? maxAssigned : 0;
+                                ColumnFamilyData target = cfd;
+                                await Versions.LogAndApplyAsync(cfd, edit, exclusive, () =>
+                                {
+                                    if (publish != 0) Versions.SetLastSequence(publish);
+                                    InstallSuperVersion(target);
+                                }, CancellationToken.None).ConfigureAwait(false);
                                 applied = true;
                             }
                             finally
@@ -208,8 +216,6 @@ internal sealed partial class DbImpl
                                     job.UnregisterRange(restoreCompactionCandidates: !applied);
                                     if (applied)
                                     {
-                                        if (consumed) Versions.SetLastSequence(maxAssigned);
-                                        InstallSuperVersion(cfd);
                                         foreach (ulong n in job.ReservedFileNumbers) _pendingOutputs.Remove(n);
                                     }
                                     else if (_compactionsEnabled)

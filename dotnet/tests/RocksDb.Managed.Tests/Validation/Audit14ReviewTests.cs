@@ -238,4 +238,83 @@ public sealed class Audit14ReviewTests
         foreach (Thread r in readers) Assert.IsTrue(r.Join(30_000));
         Assert.IsTrue(failures.IsEmpty, string.Join(" | ", failures.Take(3)));
     }
+
+    [TestMethod]
+    public void CompactionsKeepTheOptionsSnapshotTheyWerePickedWith()
+    {
+        // Compaction::mutable_cf_options_ is a copy taken when the compaction is picked; SetOptions installs a new
+        // MutableCFOptions and never edits one a job holds. The port's pickers (and so every Compaction) held the live
+        // options object, which SetOptions edits in place.
+        using RocksDatabase db = RocksDatabase.Open("/audit14snapshot", NewOptions(NewFs()));
+        ColumnFamilyData cfd = db.DefaultColumnFamily.Data;
+        ColumnFamilyOptions before = cfd.CompactionState.Picker.Options;
+        Assert.AreNotSame(cfd.Options, before, "the picker holds the live options object");
+        ulong old = before.MaxCompactionBytes;
+        db.DefaultColumnFamily.SetOptions([new KeyValuePair<string, string>("max_compaction_bytes", "123456789")]);
+        Assert.AreEqual(old, before.MaxCompactionBytes, "a snapshot a job may hold was edited");
+        Assert.AreNotSame(before, cfd.CompactionState.Picker.Options);
+        Assert.AreEqual(123456789UL, cfd.CompactionState.Picker.Options.MaxCompactionBytes);
+        Assert.AreEqual(123456789UL, cfd.Options.MaxCompactionBytes);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void AtomicFlushRacingADropStillInstallsTheOtherColumnFamilies()
+    {
+        // ProcessManifestWrites leaves the edits of a column family dropped meanwhile out of an atomic group and counts
+        // remaining_entries without them. The port failed the whole group with ColumnFamilyDropped: the other column
+        // families' memtables were rolled back and flushed again after the back-off, their first output orphaned.
+        DbOptions o = NewOptions(NewFs());
+        o.AtomicFlush = true;
+        using RocksDatabase db = RocksDatabase.Open("/audit14atomicdrop", o);
+        ColumnFamily a = db.CreateColumnFamily("a", new ColumnFamilyOptions());
+        ColumnFamily b = db.CreateColumnFamily("b", new ColumnFamilyOptions());
+        a.Put(B("ka"), B("1"));
+        b.Put(B("kb"), B("1"));
+        int hooked = 0;
+        TestHooks.Set("DBImpl::AtomicFlush:BeforeLogAndApply", () =>
+        {
+            if (Interlocked.Exchange(ref hooked, 1) != 0) return;
+            // The drop runs to completion on another thread while the flush is about to write its group.
+            Task.Factory.StartNew(() => db.DropColumnFamily(a), TaskCreationOptions.LongRunning).Wait();
+        });
+        try
+        {
+            b.Flush();
+        }
+        finally
+        {
+            TestHooks.ClearAll();
+        }
+        Assert.AreEqual(1, hooked);
+        Assert.AreEqual(0L, db.Impl.FlushRetryBackoffCount, "the group failed and was retried");
+        Assert.AreEqual("1", GetString(b, "kb"));
+        Assert.IsTrue(b.TryGetIntProperty("rocksdb.num-files-at-level0", out ulong l0) ? l0 == 1 : b.GetProperty("rocksdb.num-files-at-level0") == "1");
+        Assert.IsNull(db.BackgroundError);
+    }
+
+    [TestMethod]
+    public void ManualCompactionChecksTheSstFileManagerForRoom()
+    {
+        // BackgroundCompaction's manual branch: "First check if we have enough room to do the compaction"; without it
+        // the manual compaction ends with CompactionTooLarge. The port only checked automatic picks and CompactFiles.
+        var fs = NewFs();
+        var sfm = new SstFileManager(fs, 0, 0.25, 64UL << 20);
+        DbOptions o = NewOptions(fs);
+        o.SstFileManager = sfm;
+        var cfo = new ColumnFamilyOptions { DisableAutoCompactions = true };
+        using RocksDatabase db = RocksDatabase.Open("/audit14room", o, [new ColumnFamilyDescriptor(ColumnFamilyDescriptor.DefaultColumnFamilyName, cfo)]);
+        for (int f = 0; f < 3; f++)
+        {
+            for (int i = 0; i < 300; i++) db.Put(B("key" + i.ToString("D4")), B(new string((char)('a' + f), 200)));
+            db.Flush();
+        }
+        // The files fit, a compaction of them (which needs their size again while it runs) does not.
+        sfm.SetMaxAllowedSpaceUsage(sfm.TotalSize + 1024);
+        var e = Assert.ThrowsExactly<RocksDbException>(() => db.CompactRange(null, null));
+        Assert.AreEqual(StatusCode.CompactionTooLarge, e.Code, e.Message);
+        sfm.SetMaxAllowedSpaceUsage(0);
+        db.CompactRange(null, null);
+        Assert.AreEqual("ccc", GetString(db, "key0007")![..3]);
+    }
 }

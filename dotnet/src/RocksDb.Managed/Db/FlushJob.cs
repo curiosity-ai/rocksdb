@@ -79,6 +79,8 @@ internal static class FlushJob
         // BuildTable: OutputValidator(enable_hash = paranoid_file_checks); the read-back after the file is finished
         // compares the hash. The hash is kept by the CompactionIterator path and the timestamp-stripping path; the plain
         // copy loop has none (it is only taken with paranoid_file_checks when a snapshot checker is set).
+        // Read once for the whole job (written with a hash and verified against it, or neither): SetOptions edits the
+        // live options, and upstream's job holds the MutableCFOptions copy it started with.
         bool paranoid = cfd.Options.ParanoidFileChecks;
         bool paranoidHashKept = false;
         ulong paranoidHash = 0;
@@ -133,13 +135,13 @@ internal static class FlushJob
                 FragmentedRangeTombstoneList? tombstones = FragmentRangeTombstones(cfd, mems, stripTimestamps);
                 if (stripTimestamps)
                 {
-                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones, ref inputPayloadBytes, ref paranoidHash);
+                    AddPointEntriesWithMinTimestamp(builder, cfd, mems, meta, blobBuilder, snapshots, tombstones, ref inputPayloadBytes, ref paranoidHash, paranoid);
                     paranoidHashKept = true;
                 }
                 else if (snapshotChecker is null && (filter is not null || paranoid || NeedsCompactionIterator(cfd, mems, tombstones)))
                 {
                     smallestPreferredSeqno = AddPointEntriesThroughCompactionIterator(builder, cfd, mems, meta, snapshots, job, tombstones, filter,
-                        blobBuilder, blobOutflow, seqnoToTimeMapping, baseVersion, ref inputPayloadBytes, ref paranoidHash);
+                        blobBuilder, blobOutflow, seqnoToTimeMapping, baseVersion, ref inputPayloadBytes, ref paranoidHash, paranoid);
                     paranoidHashKept = true;
                 }
                 else
@@ -300,10 +302,9 @@ internal static class FlushJob
         FileMetaData meta, ulong[] snapshots, FlushJobContext job, FragmentedRangeTombstoneList? tombstones, CompactionFilter? filter,
         Blob.BlobFileBuilder? blobBuilder,
         Blob.BlobGarbageMeter? blobOutflow, SeqnoToTimeMapping? seqnoToTimeMapping, VersionStorageInfo? baseVersion, ref ulong inputPayloadBytes,
-        ref ulong paranoidHash)
+        ref ulong paranoidHash, bool hashOutput)
     {
         InternalKeyComparator icmp = cfd.Icmp;
-        bool hashOutput = cfd.Options.ParanoidFileChecks;
         Iterators.InternalIterator input;
         if (mems.Count == 1)
         {
@@ -622,9 +623,8 @@ internal static class FlushJob
     /// </summary>
     private static void AddPointEntriesWithMinTimestamp(TableBuilder builder, ColumnFamilyData cfd, IReadOnlyList<MemTable> mems,
         FileMetaData meta, Blob.BlobFileBuilder? blobBuilder, ulong[] snapshots, FragmentedRangeTombstoneList? tombstones, ref ulong inputPayloadBytes,
-        ref ulong paranoidHash)
+        ref ulong paranoidHash, bool hashOutput)
     {
-        bool hashOutput = cfd.Options.ParanoidFileChecks;
         InternalKeyComparator icmp = cfd.Icmp;
         int ts = cfd.TimestampSize;
         int n = mems.Count;
