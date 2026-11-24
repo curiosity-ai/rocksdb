@@ -284,4 +284,53 @@ public sealed class Audit13ReplicationThreadingTests
             await c.AssertConvergedAsync(leader);
         }
     }
+
+    // ---- loose ends ----------------------------------------------------------------------------------------
+
+    [TestMethod]
+    public async Task SingleNodeClusterCommitsItsOwnWrites()
+    {
+        // The commit index only advanced when a follower reported progress or acknowledged a heartbeat. A cluster of one
+        // has neither (its quorum is the leader itself), so nothing was ever committed and WriteCommittedAsync timed out.
+        await using var c = new ClusterHarness(1, null);
+        ClusterNodeHost n1 = await c.StartAsync("n1");
+        await WaitUntilAsync(() => n1.Node.Role == RaftRole.Leader, "n1 leads\n" + c.LogText);
+        Assert.IsTrue(await n1.WriteCommittedAsync(U(K(1)), U(V(1, 0)), TimeSpan.FromSeconds(10), CancellationToken.None), c.LogText);
+        using (var batch = Batch("b"))
+        {
+            Assert.AreEqual(ClusterWriteStatus.Committed, await n1.WriteCommittedAsync(batch, TimeSpan.FromSeconds(10), CancellationToken.None));
+        }
+        Assert.IsTrue(n1.TryUseDatabase(0, static (db, _) => db.GetLatestSequenceNumber(), out ulong latest));
+        // Observers of the commit index (status) see it too, without a waiting write.
+        await WaitUntilAsync(() => n1.Node.CommitSeq == latest, "commit index at the log end\n" + c.LogText);
+    }
+
+    [TestMethod]
+    public async Task ResyncGoesOnWhenStartingItThrowsAnUnexpectedException()
+    {
+        // PerformResyncAsync only expected IOException / RocksDbException from the step that puts the node into resync
+        // mode. Anything else (here: an event handler throwing while the node steps down for the resync) ended the
+        // resync task with the host marked as resyncing for good: no writes, no status, and no retry.
+        await using var c = new ClusterHarness(3, null);
+        ClusterNodeHost leader = await StartConvergedClusterAsync(c);
+        int thrown = 0;
+        leader.Node.RoleChanged += (_, e) =>
+        {
+            if (e.Role == RaftRole.Follower && Interlocked.Exchange(ref thrown, 1) == 0) throw new InvalidOperationException("injected failure while stepping down for the resync");
+        };
+        leader.TriggerResync("test");
+        try
+        {
+            await leader.WaitForResyncAsync().WaitAsync(TimeSpan.FromSeconds(60));
+        }
+        catch (InvalidOperationException)
+        {
+            // Before the fix the resync task ended with the injected exception.
+        }
+        Assert.AreEqual(1, Volatile.Read(ref thrown));
+        await WaitUntilAsync(() => !leader.IsResyncing, "the resync ended\n" + c.LogText);
+        ClusterNodeHost newLeader = await c.WaitForLeaderAsync(null);
+        for (int i = 100; i < 110; i++) Assert.IsTrue(await newLeader.WriteCommittedAsync(U(K(i)), U(V(i, 0)), TimeSpan.FromSeconds(20), CancellationToken.None), c.LogText);
+        await c.AssertConvergedAsync(newLeader);
+    }
 }

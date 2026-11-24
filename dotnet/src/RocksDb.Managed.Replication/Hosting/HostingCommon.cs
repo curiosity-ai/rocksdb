@@ -460,8 +460,10 @@ internal static class HostResync
         {
             await db.DisposeAsync().ConfigureAwait(false);
         }
-        catch (Exception e) when (e is RocksDbException or IOException)
+        catch (Exception e) when (e is not OutOfMemoryException)
         {
+            // Any exception, not only the expected RocksDbException / IOException: one that escaped ended the resync
+            // task with the node marked as resyncing for good (no writes, no status, no retry).
             log("closing the database for the resync reported an error (ignored, the snapshot replaces it): " + e.Message);
         }
     }

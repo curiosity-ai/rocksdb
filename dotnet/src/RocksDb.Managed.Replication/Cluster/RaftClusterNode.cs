@@ -200,6 +200,8 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         _cts.Cancel();
+        // The leader loop's source is not linked to _cts (StartLeaderLoopLocked).
+        Volatile.Read(ref _leaderCts)?.Cancel();
         _electionTimer.Dispose();
         // Without the gate (Dispose must not wait behind a leader awaiting a write): the exchange above is a full fence
         // before SignalAll reads its waiter list, and WaitForCommitAsync re-reads _disposed after registering (Register
@@ -606,6 +608,9 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
             try
             {
                 bool leading = _role == RaftRole.Leader && _state.CurrentTerm == term && Volatile.Read(ref _disposed) == 0;
+                // A cluster of one: no follower report or heartbeat answer ever advances the commit index, and the
+                // leader's own log is the quorum. The write waited for is in the log by now.
+                if (leading && _peers.Count == 0) TryAdvanceCommitLocked();
                 if (CommitSeq >= sequence) return leading || _state.Terms.GetTermForSeq(sequence) == term;
                 if (!leading) return false;
                 // Registered under _gate, where every signal but Dispose's is raised: none of those can be missed.
@@ -744,8 +749,14 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     {
         // Cancel any loop left over from a previous leadership so two loops never run concurrently.
         _leaderCts?.Cancel();
-        _leaderCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        CancellationToken token = _leaderCts.Token;
+        // Not linked to _cts: a linked source keeps a registration on the node's source until it is disposed, one per
+        // leadership for the life of the node, and heartbeats still in flight use its token after the loop ended.
+        // Dispose cancels the current one instead. Dekker with Dispose (it cancels _cts, then reads this field; here
+        // the field is written with a full fence, then _cts is read): one of the two cancels the new source.
+        var leaderCts = new CancellationTokenSource();
+        Interlocked.Exchange(ref _leaderCts, leaderCts);
+        if (_cts.IsCancellationRequested) leaderCts.Cancel();
+        CancellationToken token = leaderCts.Token;
         Task previous = _leaderLoop;
         _leaderLoop = Task.Run(async () =>
         {
@@ -773,6 +784,13 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 try
                 {
                     if (_role != RaftRole.Leader) break;
+                    if (_peers.Count == 0)
+                    {
+                        // A cluster of one (see WaitForCommitAsync): keeps the commit index and the mode current for
+                        // observers when no write waits for its commit.
+                        TryAdvanceCommitLocked();
+                        MaybePromoteToClusterLocked();
+                    }
                     commit = _commitSeq;
                     term = _state.CurrentTerm;
                     leaderMode = _state.Mode;

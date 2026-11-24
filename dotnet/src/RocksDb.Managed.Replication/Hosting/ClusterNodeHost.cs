@@ -653,7 +653,10 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             if (_resyncing || _cts.IsCancellationRequested) return;
             if (_following == leaderId && _followerTask is { IsCompleted: false }) return;
             _followerCts?.Cancel();
-            _followerCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            // Not linked to _cts: a linked source keeps a registration on the host's source until it is disposed, one
+            // per attach for the life of the host, and it cannot be disposed safely while another flow may still cancel
+            // it. DisposeAsync cancels the current one instead (under this lock, after _cts, which is checked above).
+            _followerCts = new CancellationTokenSource();
             _following = leaderId;
             CancellationToken ct = _followerCts.Token;
             Task previous = _followerTask ?? Task.CompletedTask;
@@ -886,10 +889,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             {
                 await _node.BeginResyncAsync(_cts.Token).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is IOException or RocksDbException)
+            catch (Exception ex) when (ex is not OperationCanceledException && _node.IsResyncing)
+            {
+                // The node is in resync mode already (the log end is recorded) and something after that threw, e.g. an
+                // event handler while the node stepped down. Going back is not possible (the node refuses votes and
+                // appends now), and stopping here left the host marked as resyncing for good: go on with the rebuild.
+                Log("resync: entering resync mode reported an error (continuing): " + ex.Message);
+                goto rebuild;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // The log end could not be recorded, so the log must not be dropped: keep the database and let the next
-                // divergence ask again.
+                // divergence ask again. Whatever the exception type: an unexpected one left the flag set for good.
                 Log("resync not started: recording the log end failed: " + ex.Message);
                 lock (_followerLock) _resyncing = false;
                 // The follower stream that asked for this resync has ended, and nothing else restarts one under a stable
@@ -901,6 +912,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 if (leaderId != null && leaderId != _cfg.NodeId) EnsureFollowerStream(leaderId);
                 return;
             }
+        rebuild:
             Task? follower;
             lock (_followerLock)
             {
@@ -1004,6 +1016,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         lock (_followerLock)
         {
             _leadershipCts.Cancel();
+            _followerCts?.Cancel(); // not linked to _cts (EnsureFollowerStream)
             follower = _followerTask;
         }
         if (_node != null) await _node.DisposeAsync().ConfigureAwait(false);
