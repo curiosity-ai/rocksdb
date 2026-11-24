@@ -693,7 +693,7 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
                     // An answer that arrives after this stream was told to stop (this node was promoted, or stops) is
                     // about a role it no longer has: it must not drop the database.
                     if (ct.IsCancellationRequested) return;
-                    TriggerResync("log at " + latest + " (epoch" + _node.GetEpochForSeq(latest) + ") is not a prefix of " + _cfg.PeerId + "'s");
+                    TriggerResync("log at " + latest + " (epoch " + _node.GetEpochForSeq(latest) + ") is not a prefix of " + _cfg.PeerId + "'s");
                     return;
                 }
                 if (!_node.AcceptStream(_cfg.PeerId, check.Epoch))

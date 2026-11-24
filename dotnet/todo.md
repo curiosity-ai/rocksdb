@@ -493,8 +493,9 @@ Still open from this round:
 - [x] WriteUnprepared + two_write_queues: transaction did not read its own unprepared batches
 - [x] WAL tailers not woken when an unbatched operation publishes WAL-only sequence numbers
 - [x] `PrimaryWriteGate`: two concurrent holds lost a wake-up; obsolete super version left in a shared processor slot; second commit write of two-queue transactions cancellable; cancel under the DB mutex; persistent cache I/O error filters
-- [ ] Close does not wait for foreground purges or an SstFileManager / manual recovery (CloseHelper waits on both upstream)
-- [ ] Background job accounting on unexpected exception types; write wake-up thread start failure while leading
+- [x] Close waits for foreground purges and for a manual / SstFileManager recovery in flight (CloseHelper)
+- [x] Background job accounting released on any exception; pool thread start failure no longer strands a write leader or a manual compaction
+- [x] HyperClock automatic table: callbacks re-entering the shard vs a grow; throwing eviction handler / Dispose; `BlockCacheTier.Close` racing inserts and lookups
+- [x] Replication: restarted pair primary waits for its role before admitting writes; cluster leader write gate; `ForcePromoteAsync` reattach; election timer re-armed; `ProgressReporter`; gate sealed at dispose
 - [ ] Thread-pool dependent sync waits left: `Dispose` on auto recovery, parallel backup, OCC parallel validation behind an async commit
-- [ ] HyperClock automatic table: eviction callbacks inside the mutator gate; `BlockCacheTier.Close` racing lookups
-- [ ] Replication: restarted pair primary admits writes before its role is settled; cluster host has no leader write gate; failed `ForcePromoteAsync` leaves no follower stream; election timer not re-armed after a failed campaign start
+- [ ] HyperClock automatic table: slow eviction callback stalls the shard during a grow; replication: sticky resync flag, linked CTS leaks, commit index with no peers

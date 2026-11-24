@@ -2652,26 +2652,35 @@ a `lock`, no lock held across an await by manual Enter/Exit, every semaphore Wai
 | 8 | Two-queue commit / rollback: the caller's cancellation token reached the second (commit-only) write (the test pins the behaviour; the stalled case is not reproduced) | no cancellation upstream | a cancellation during a stall left the first write prepared forever (visible only after a reopen) |
 | 9 | `DisableManualCompaction` cancelled the token source under the DB mutex (tokens are handed to a `CompactionService`); `SstFileManager.ClearErrorAsync` checked and cleared in two critical sections; `BlockCacheTier` caught `IOException` where the file systems throw `RocksDbException` (no new test) | atomic flags only; sst_file_manager_impl.cc ClearError; block_cache_tier.cc returns Status | user callbacks under the mutex; a just-recorded error lost; an I/O error on a cache file failed a user read or ended a cache thread |
 
-### Open (found by reading, not fixed, not reproduced)
+### Follow-up fixes (second pass; each with a test that fails without the fix unless noted)
 
-- Close does not wait for a foreground purge (iterator release, ingestion, column family drop) or for a recovery driven
-  by the SstFileManager or a manual `Resume` (upstream CloseHelper waits on `pending_purge_obsolete_files_` and
-  `IsRecoveryInProgress`). A purge finishing after close could scan a directory that was reopened.
-- Background job accounting is not exception-safe for exception types other than IOException / RocksDbException (a
-  custom `IFileSystem`): `_backgroundJobs` is not decremented and close waits forever; `FlushCommitInProgress` likewise.
-- A failed thread start in `WriteWakeup.SwitchTo` while leading leaves the write queue without a leader (thread
-  exhaustion / OOM only).
+| Area | Finding | Fix |
+|---|---|---|
+| Close | Close did not wait for a foreground purge (iterator release, ingestion, column family drop, recovery); upstream CloseHelper waits on `pending_purge_obsolete_files_` | `PurgeObsoleteFiles` counts itself under the mutex; the close waits for the count and purges alone once it has begun (`CloseWaitsForAForegroundPurge`) |
+| Close | Close joined only the automatic recovery task; a manual `Resume` or the SstFileManager's recovery went on after the close (upstream waits on `IsRecoveryInProgress`) | `ResumeImpl` calls are counted; the close refuses new ones and waits for those in flight before it takes the write queue, except when called from inside that recovery (a listener) (`CloseWaitsForARunningManualRecovery`) |
+| Exception safety | Flush, atomic flush and compaction skipped their job accounting when the cleanup threw anything but IOException / RocksDbException; the bottom-priority repick and `FlushCommitInProgress` likewise | accounting in an inner finally; the flag and counters are released on any exception (`UnexpectedExceptionInFlushCleanupDoesNotHangTheClose`; the compaction, repick and commit-flag sites have no test) |
+| Exception safety | A failed thread start in `SwitchTo` (write wake-up while leading) or for a manual compaction left the leader / the job registered forever | the continuation falls back to the .NET thread pool; the manual compaction runs from the calling flow (no test: needs thread exhaustion) |
+| HyperClock (automatic table) | A callback run under the mutator gate (eviction handler, a value's Dispose) that re-entered the shard deadlocked with a concurrent grow | the thread is marked while it runs such code; its re-entry does not wait for the grow, does not start one, and trusts its lookup miss (`EvictionHandlerReenteringTheShardDoesNotDeadlockWithAGrow`) |
+| HyperClock | A throwing eviction handler or Dispose left the slot under construction and its charge / occupancy accounted | the slot is always emptied and accounted (`ThrowingEvictionHandlerDoesNotLeakTheSlotOrItsCharge`) |
+| BlockCacheTier | `Close` racing inserts (disposed queue, cleared current file) and lookups (reader field re-read after `CloseFile`) threw into table reads | queue lock around add / quit / dispose, closed check in the insert, reader captured under the file lock (`BlockCacheTierCloseRacingInsertsAndLookupsOnlyMisses`) |
+| Replication, pair | A restarted primary admitted client writes before `StartAsync` had settled its role | `PairNodeHost.WriteAsync` waits for the start within the caller's hold timeout, else answers NotPrimary |
+| Replication, cluster | No leader write gate: a write admitted before a step-down was applied interleaved with follower ingest | client writes pass a gate that closes when leadership is lost and is drained before the follower reads its log end; chunks are applied under an ingest lock that a new leader waits for before its first entry |
+| Replication, smaller | failed / cancelled `ForcePromoteAsync` left no follower stream; election timer not re-armed when a campaign start threw; `ProgressReporter` faulted on a non-OperationCanceled cancellation; a cancelled follower loop could trigger a resync; a promotion could reopen the write gate after dispose; heartbeat answers after dispose | reattach in finally; timer reset and term persisted before the role; loop swallows exceptions once cancelled; cancellation checked before the resync; `PrimaryWriteGate.Seal`; disposed check under the gate (tests in `Audit13ReplicationThreadingTests`; the last three by reading only or a gate-level test) |
+
+Behaviour changes: a pair-host write arriving during startup waits or gets NotPrimary (it was applied before); a deposed
+cluster leader with a write in flight always rebuilds from a snapshot; a cluster follower's chunk ingest is not
+cancellable once started. New public members: `PrimaryWriteGate.Seal`, `PrimaryWriteGate.DrainAsync`,
+`RaftClusterNode.QuiesceLogBeforeLeadingAsync`.
+
+### Still open (found by reading, not fixed, not reproduced)
+
 - Synchronous `Dispose` waits for the auto-recovery task, and synchronous backup with `MaxBackgroundOperations > 1`
   and synchronous OCC commits behind an async commit (parallel validation) wait for thread-pool work: slow with a
   saturated pool, a deadlock with a capped one (the class audits #8 / #12 removed from the write path).
 - `FileSyncWorkers` can queue two syncs behind one idle worker; the DeleteScheduler worker and the SstFileManager
   recovery chain end on an unexpected exception type; `WriteBufferManager` stall: a late signal can end the next stall
   round early (after a cancellation); timed lock waits spin for the last sub-millisecond.
-- HyperClock automatic table (`EstimatedEntryCharge = 0`): eviction callbacks run inside the mutator gate, so a slow
-  callback stalls the shard during a grow, and a callback re-entering the same shard would deadlock (no in-tree
-  callback does). `BlockCacheTier.Close` racing lookups / inserts.
-- Replication: a restarted pair primary admits writes before `StartAsync` settled its role (`WriteAsync` does not check
-  `_serving`); the cluster host has no write gate, so a write that passed the leader check can be applied after
-  step-down, interleaved with follower ingest; a failed `ForcePromoteAsync` leaves the replica without a follower
-  stream; the election timer is not re-armed when starting a campaign throws; `ProgressReporter` faults on a
-  non-OperationCanceled cancellation exception.
+- HyperClock automatic table: a slow eviction callback still stalls the shard while another thread waits to grow it
+  (callbacks run inside the mutator gate; latency only).
+- Replication: the resync flag can stick on an unexpected exception type; linked CancellationTokenSources leak per
+  attach and per leadership; a cluster with no peers never advances its commit index.
