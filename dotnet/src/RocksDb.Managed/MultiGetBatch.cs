@@ -49,6 +49,8 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     private int[] _order = [];
     private int[] _sub = [];
     private bool[] _mayMatch = [];
+    // Built-in bytewise comparators: the first 8 bytes of each user key as a big-endian integer (sort key, see BytewiseKeyOrder).
+    private ulong[] _sortPrefixes = [];
     private bool _hasResults;
     // The last run was a MultiGetEntity: found values hold the serialized entity.
     private bool _entityResults;
@@ -319,6 +321,7 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
             _order = new int[cap];
             _sub = new int[cap];
             _mayMatch = new bool[cap];
+            _sortPrefixes = new ulong[cap];
             _ikeyOffsets = new int[cap + 1];
         }
         else
@@ -332,15 +335,28 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
             _ikeys = RocksArrayPool<byte>.Shared.Rent(ikeyBytes);
         }
         int off = 0;
+        bool bytewise = userComparator.Kind is ComparatorKind.Bytewise or ComparatorKind.ReverseBytewise;
         for (int i = 0; i < n; i++)
         {
             (_contexts[i] ??= new GetContext()).Reset(mergeOperator);
             _ikeyOffsets[i] = off;
-            off += DbFormat.AppendInternalKey(_ikeys.AsSpan(off), UserKey(i), sequence, DbFormat.ValueTypeForSeek);
+            ReadOnlySpan<byte> userKey = UserKey(i);
+            off += DbFormat.AppendInternalKey(_ikeys.AsSpan(off), userKey, sequence, DbFormat.ValueTypeForSeek);
             _order[i] = i;
+            if (bytewise) _sortPrefixes[i] = BytewiseKeyOrder.Prefix(userKey);
         }
         _ikeyOffsets[n] = off;
-        if (n > 1) SortOrder(_order.AsSpan(0, n), new KeyOrder(this, userComparator));
+        if (n > 1)
+        {
+            if (bytewise)
+            {
+                SortOrder(_order.AsSpan(0, n), new BytewiseKeyOrder(this, _sortPrefixes, userComparator.Kind == ComparatorKind.ReverseBytewise));
+            }
+            else
+            {
+                SortOrder(_order.AsSpan(0, n), new KeyOrder(this, userComparator));
+            }
+        }
     }
 
     /// <summary>
@@ -468,7 +484,7 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
     /// small ranges; unlike <see cref="MemoryExtensions.Sort{T, TComparer}(Span{T}, TComparer)"/> it does not box the
     /// comparer into a delegate.
     /// </summary>
-    private static void SortOrder(Span<int> a, KeyOrder cmp)
+    private static void SortOrder<TOrder>(Span<int> a, TOrder cmp) where TOrder : struct, IKeyOrder
     {
         while (a.Length > 16)
         {
@@ -513,12 +529,44 @@ public sealed class MultiGetBatch : IDisposable, ITableMultiGetBatch
         }
     }
 
-    private readonly struct KeyOrder(MultiGetBatch batch, Comparator comparator)
+    private interface IKeyOrder
+    {
+        int Compare(int x, int y);
+    }
+
+    private readonly struct KeyOrder(MultiGetBatch batch, Comparator comparator) : IKeyOrder
     {
         public int Compare(int x, int y)
         {
             int c = comparator.Compare(batch.UserKey(x), batch.UserKey(y));
             return c != 0 ? c : x.CompareTo(y);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="KeyOrder"/> for the built-in (reverse) bytewise comparators without a virtual call per comparison: keys
+    /// are ordered by their 8-byte big-endian prefixes (<see cref="Prefix"/>) and compared in full only when those are
+    /// equal. The prefix order agrees with memcmp order: when two prefixes differ, they differ first at a byte position
+    /// below 8 where either both keys have a byte (the prefixes hold those bytes) or only one has (the other's zero
+    /// padding sorts it first, as a shorter key that is a prefix of the other does; an equal zero byte is no difference).
+    /// </summary>
+    private readonly struct BytewiseKeyOrder(MultiGetBatch batch, ulong[] prefixes, bool reverse) : IKeyOrder
+    {
+        public int Compare(int x, int y)
+        {
+            ulong px = prefixes[x], py = prefixes[y];
+            int c = px != py ? (px < py ? -1 : 1) : ByteCompare.Compare(batch.UserKey(x), batch.UserKey(y));
+            if (reverse) c = -c;
+            return c != 0 ? c : x.CompareTo(y);
+        }
+
+        /// <summary>The first 8 bytes of <paramref name="key"/> as a big-endian integer, zero-padded when shorter.</summary>
+        public static ulong Prefix(ReadOnlySpan<byte> key)
+        {
+            if (key.Length >= sizeof(ulong)) return System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(key);
+            ulong v = 0;
+            for (int i = 0; i < key.Length; i++) v |= (ulong)key[i] << (56 - 8 * i);
+            return v;
         }
     }
 }

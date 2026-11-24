@@ -83,7 +83,19 @@ public readonly struct CacheValue
     internal void FreeForCache()
     {
         if (ReturnBufferToPool && Buffer is not null) RocksArrayPool<byte>.Shared.Return(Buffer);
-        (Object as IDisposable)?.Dispose();
+        DisposeObject(Object);
+    }
+
+    /// <summary>
+    /// Disposes a cached object if it is <see cref="IDisposable"/>. Parsed blocks (the common value) are checked with
+    /// an exact type test first: an interface cast of an object goes through the runtime's interface-map scan, which
+    /// showed up per eviction on block-cache-miss read paths.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void DisposeObject(object? obj)
+    {
+        if (obj is Table.Block block) block.Release();
+        else (obj as IDisposable)?.Dispose();
     }
 }
 
@@ -128,7 +140,7 @@ internal abstract class CacheEntry
         ReturnBufferToPool = false;
         Helper = null;
         if (toPool && buffer is not null) RocksArrayPool<byte>.Shared.Return(buffer);
-        (obj as IDisposable)?.Dispose();
+        CacheValue.DisposeObject(obj);
     }
 
     /// <summary>

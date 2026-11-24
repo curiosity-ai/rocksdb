@@ -190,6 +190,63 @@ public sealed class DbMultiGetTests
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => batch.GetStatus(0));
     }
 
+    /// <summary>
+    /// The batch is sorted with the built-in (reverse) bytewise comparators by 8-byte key prefixes first. Keys shorter
+    /// than 8 bytes, keys with zero bytes, keys that are prefixes of other keys and the empty key must still come out in
+    /// comparator order: the level and table lookups walk the batch in that order across many small files, so a key out
+    /// of order would be missed. Results are checked against Get, also for absent keys between present ones.
+    /// </summary>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ShortAndPrefixRelatedKeysWithBuiltinComparators(bool reverse)
+    {
+        int seed = Environment.TickCount;
+        var rnd = new Random(seed);
+        string trace = "seed=" + seed + " reverse=" + reverse;
+        byte[] alphabet = [0x00, 0x01, 0x30, 0x7F, 0x80, 0xFF];
+        byte[] RandomKey()
+        {
+            byte[] k = new byte[rnd.Next(13)];
+            for (int i = 0; i < k.Length; i++) k[i] = alphabet[rnd.Next(alphabet.Length)];
+            return k;
+        }
+        MemoryFileSystem fs = NewFs();
+        var cfo = new ColumnFamilyOptions
+        {
+            Comparator = reverse ? Comparator.ReverseBytewise : Comparator.Bytewise,
+            DisableAutoCompactions = true,
+            TargetFileSizeBase = 2 << 10,
+            Compression = RocksDb.Managed.Compression.CompressionType.None,
+        };
+        using RocksDatabase db = RocksDatabase.Open(DbPath, NewOptions(fs), cfo);
+        var keys = new List<byte[]>();
+        for (int i = 0; i < 3000; i++) keys.Add(RandomKey());
+        for (int i = 0; i < keys.Count; i += 2)
+        {
+            db.Put(keys[i], B("v" + i.ToString(System.Globalization.CultureInfo.InvariantCulture) + new string('x', 100)));
+            if (i % 600 == 598) db.Flush(); // overlapping L0 files, so the compaction rewrites (and splits) them
+        }
+        db.CompactRange(); // many small files in one level
+        for (int i = 1; i < keys.Count; i += 4) db.Put(keys[i], B("m" + i.ToString(System.Globalization.CultureInfo.InvariantCulture))); // and some in the memtable
+        using var batch = new MultiGetBatch();
+        for (int b = 0; b < 40; b++)
+        {
+            batch.Clear();
+            int n = 1 + rnd.Next(48);
+            for (int i = 0; i < n; i++) batch.Add(rnd.Next(4) == 0 ? RandomKey() : keys[rnd.Next(keys.Count)]);
+            db.MultiGet(batch);
+            AssertMatchesGet(db, null, batch);
+        }
+        int files = 0;
+        for (int level = 0; level < 7; level++)
+        {
+            files += int.Parse(db.GetProperty("rocksdb.num-files-at-level" + level.ToString(System.Globalization.CultureInfo.InvariantCulture)) ?? "0",
+                System.Globalization.CultureInfo.InvariantCulture);
+        }
+        Assert.IsTrue(files > 10, trace + " files=" + files);
+    }
+
     [TestMethod]
     public void MemtableTierDoesNotRestrictMultiGet()
     {
