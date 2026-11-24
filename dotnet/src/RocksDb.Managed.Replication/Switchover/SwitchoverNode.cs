@@ -651,14 +651,26 @@ public sealed class SwitchoverNode
             epoch = NextOwnEpoch(_state.PromisedEpoch);
             _state.Promise(epoch);
         }
-        await _detachFromPrimaryAsync(cancellationToken).ConfigureAwait(false);
-        lock (_gate)
+        bool promoted = false;
+        try
         {
-            // Checked again: the lock was released while the stream detached, and a resync (DetachDatabase) or a
-            // planned promotion may have run meanwhile.
-            if (_state.Role != ReplicationRole.Replica || _db == null)
-                throw new InvalidOperationException(_nodeId + " is " + _state.Role + ", not a replica with a database");
-            _state.BecomePrimary(_db.GetLatestSequenceNumber() + 1, epoch, _nodeId);
+            // The detach drops the host's stream before it waits (and that wait is what the caller's token cancels).
+            await _detachFromPrimaryAsync(cancellationToken).ConfigureAwait(false);
+            lock (_gate)
+            {
+                // Checked again: the lock was released while the stream detached, and a resync (DetachDatabase) or a
+                // planned promotion may have run meanwhile.
+                if (_state.Role != ReplicationRole.Replica || _db == null)
+                    throw new InvalidOperationException(_nodeId + " is " + _state.Role + ", not a replica with a database");
+                _state.BecomePrimary(_db.GetLatestSequenceNumber() + 1, epoch, _nodeId);
+                promoted = true;
+            }
+        }
+        finally
+        {
+            // Detached but not promoted (cancelled, or the role state could not be written): hand the stream back to
+            // the host, as RunPromotionAsync does - nothing else would make this replica follow again.
+            if (!promoted && _state.Role == ReplicationRole.Replica) RaiseRoleChanged();
         }
         Writes.OpenGate();
         RaiseRoleChanged();

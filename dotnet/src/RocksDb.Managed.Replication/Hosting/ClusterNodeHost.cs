@@ -125,6 +125,13 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     private readonly SemaphoreSlim _resyncGate = new(1, 1);
     private readonly Lock _followerLock = new();
     private readonly DatabaseUsageGate _dbGate = new();
+    // Client writes go through this gate. It is open only while this node leads: closed (under the node's gate, in
+    // OnRoleChanged) the moment the role is lost, and drained before this node reads the end of its log as a follower
+    // (the attach check) or as a new leader (the first entry of its term). Without it a write that passed the leader
+    // check could be applied after the step-down, between the follower's "my log ends at N" and the leader's entry N+1.
+    private readonly Switchover.PrimaryWriteGate _leaderWrites = new(open: false);
+    // Held while a chunk of the leader's stream is applied (and its term range recorded).
+    private readonly SemaphoreSlim _ingestLock = new(1, 1);
     private readonly IFileSystem _fs;
 
     private RocksDatabase _db = null!;
@@ -213,6 +220,13 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         _node.ModeChanged += (_, e) => Log("mode -> " + e.Mode);
         _node.ResyncRequired += (_, _) => TriggerResync("heartbeat term mismatch");
         _node.LeadershipFailed += (_, e) => Log("won the election of term " + e.Term + " but cannot write the log: " + e.Error.Message);
+        _node.QuiesceLogBeforeLeadingAsync = QuiesceLogBeforeLeadingAsync;
+        // A bootstrap primary leads from its constructor (no RoleChanged). Under _followerLock, like OnRoleChanged: the
+        // role is changed before that handler runs, so a step-down racing this either is seen here or closes afterwards.
+        lock (_followerLock)
+        {
+            if (_node.Role == RaftRole.Leader) _leaderWrites.OpenGate();
+        }
         _node.Start();
         Log("started as " + _node.Role + " in term " + _node.CurrentTerm + " (" + _node.Mode + ") at seq " + _db.GetLatestSequenceNumber());
 
@@ -256,7 +270,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> TryWriteAsLeaderAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken)
     {
-        if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
+        if (!TryEnterLeaderWrite()) return false;
         try
         {
             using WriteBatch b = _db.CreateWriteBatch();
@@ -266,7 +280,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         }
         finally
         {
-            _dbGate.Exit();
+            ExitLeaderWrite();
         }
     }
 
@@ -280,7 +294,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<bool> WriteCommittedAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return false;
+        if (!TryEnterLeaderWrite()) return false;
         ulong seq;
         // Read before the write: the commit wait accepts the entry only as one of this term.
         long term = _node.CurrentTerm;
@@ -293,7 +307,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         }
         finally
         {
-            _dbGate.Exit();
+            ExitLeaderWrite();
         }
         return await WaitForCommitAsync(seq, term, timeout, cancellationToken).ConfigureAwait(false) == ClusterWriteStatus.Committed;
     }
@@ -309,7 +323,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
     public async ValueTask<ClusterWriteStatus> WriteCommittedAsync(WriteBatch batch, TimeSpan timeout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
-        if (_resyncing || _node.Role != RaftRole.Leader || !_dbGate.TryEnter()) return ClusterWriteStatus.NotLeader;
+        if (!TryEnterLeaderWrite()) return ClusterWriteStatus.NotLeader;
         ulong seq;
         // Read before the write: the commit wait accepts the entry only as one of this term.
         long term = _node.CurrentTerm;
@@ -320,9 +334,42 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
         }
         finally
         {
-            _dbGate.Exit();
+            ExitLeaderWrite();
         }
         return await WaitForCommitAsync(seq, term, timeout, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Admits a client write: this node leads, is not rebuilding, and its database is not being closed.</summary>
+    private bool TryEnterLeaderWrite()
+    {
+        if (_resyncing || _node.Role != RaftRole.Leader) return false;
+        // With no hold timeout the gate answers synchronously (open: admitted; closed or holding: refused).
+        ValueTask<bool> admitted = _leaderWrites.TryEnterAsync(TimeSpan.Zero, CancellationToken.None);
+        if (!(admitted.IsCompletedSuccessfully ? admitted.Result : admitted.AsTask().GetAwaiter().GetResult())) return false;
+        if (_dbGate.TryEnter()) return true;
+        _leaderWrites.Exit();
+        return false;
+    }
+
+    private void ExitLeaderWrite()
+    {
+        _dbGate.Exit();
+        _leaderWrites.Exit();
+    }
+
+    /// <summary>
+    /// <see cref="RaftClusterNode.QuiesceLogBeforeLeadingAsync"/>: called with the node's gate held once this node won an
+    /// election. Returns when no chunk of the previous leader's stream is being applied any more (the stream was
+    /// cancelled when this node became a candidate; only a chunk already past its cancellation check can still be in
+    /// flight) and no client write admitted under an earlier leadership is. Waits only for database writes in flight,
+    /// none of which takes the node's gate.
+    /// </summary>
+    private async ValueTask QuiesceLogBeforeLeadingAsync()
+    {
+        CancelFollowerStream();
+        await _ingestLock.WaitAsync(_cts.Token).ConfigureAwait(false);
+        _ingestLock.Release();
+        await _leaderWrites.DrainAsync(_cts.Token).ConfigureAwait(false);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -564,10 +611,13 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
             if (e.Role == RaftRole.Leader)
             {
                 if (_leadershipCts.IsCancellationRequested) _leadershipCts = new CancellationTokenSource();
+                // Raised after the first entry of the term was written: client writes follow it.
+                _leaderWrites.OpenGate();
             }
             else
             {
                 _leadershipCts.Cancel();
+                _leaderWrites.Close();
             }
         }
     }
@@ -635,6 +685,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 // Raft's AppendEntries consistency check, done once at attach time: the leader confirms that our
                 // (latestSeq, term) tail exists identically in its log. A diverged tail cannot be truncated out of a
                 // RocksDB WAL, so the whole replica is rebuilt instead.
+                // First let the client writes this node admitted while it led reach its log (the gate closed when the role
+                // was lost): the log end read here must be final, or one of them lands where the leader's next entry goes.
+                await _leaderWrites.DrainAsync(ct).ConfigureAwait(false);
                 ulong myLatest = _db.GetLatestSequenceNumber();
                 ClusterAttachResult? check = await client.CheckLogConsistencyAsync(_cfg.NodeId, myLatest, _node.GetTermForSeq(myLatest), ct).ConfigureAwait(false);
                 if (check is null || !check.IsLeader)
@@ -644,6 +697,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 }
                 if (!check.Consistent)
                 {
+                    // An answer that arrives after this stream was cancelled (the leader changed, or this node won an
+                    // election) is about a leadership it no longer follows: it must not drop the log.
+                    if (ct.IsCancellationRequested) return;
                     TriggerResync("log at " + myLatest + " diverged from leader " + leaderId);
                     return;
                 }
@@ -703,15 +759,27 @@ public sealed class ClusterNodeHost : IAsyncDisposable, IReplicationChunkSizes
                         Log("dropping the stream from " + leaderId + " at " + (at + 1) + ": " + assembler.LastError);
                         break;
                     }
-                    if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
-                    // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or an
-                    // overlap diverges the copy.
-                    if (!await consumer.TryIngestChunkAsync(chunk, ct).ConfigureAwait(false))
+                    await _ingestLock.WaitAsync(ct).ConfigureAwait(false);
+                    try
                     {
-                        TriggerResync("WAL stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
-                        return;
+                        // Cancelled while waiting (this node is a candidate, or follows someone else): nothing of this
+                        // stream is applied any more. A node that won an election waits for this lock before it reads
+                        // the end of its log (QuiesceLogBeforeLeadingAsync).
+                        if (ct.IsCancellationRequested) return;
+                        if (m.EntryTerm > 0) _state.RecordTermRange(m.FirstSequence, m.EntryTerm);
+                        // A faithful replica ingests the leader's batches at exactly the same sequence numbers; a gap or
+                        // an overlap diverges the copy. Not cancellable once started: the chunk is applied whole.
+                        if (!await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false))
+                        {
+                            TriggerResync("WAL stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
+                            return;
+                        }
+                        progress.Report(_db.GetLatestSequenceNumber());
                     }
-                    progress.Report(_db.GetLatestSequenceNumber());
+                    finally
+                    {
+                        _ingestLock.Release();
+                    }
                 }
                 await Task.Delay(_cfg.RetryDelay, ct).ConfigureAwait(false);
             }

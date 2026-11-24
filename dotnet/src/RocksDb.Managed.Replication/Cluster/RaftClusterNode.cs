@@ -93,6 +93,16 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     /// </summary>
     public event EventHandler<LeadershipFailedEventArgs>? LeadershipFailed;
 
+    /// <summary>
+    /// Called (with the node's gate held) after this node won an election and before it reads the end of its log and
+    /// writes the first entry of its term there: the host returns once nothing else is appending to the database - a
+    /// chunk of the previous leader's stream still being applied, a client write admitted under an earlier leadership
+    /// of this node. Without it such a write can land between the two, at the sequence number the term was recorded
+    /// to start at. The callback must not call back into this node (the gate is not reentrant) and should only wait
+    /// for work that is already in flight. If it throws, the node does not lead this term. Set before <see cref="Start"/>.
+    /// </summary>
+    public Func<ValueTask>? QuiesceLogBeforeLeadingAsync { get; set; }
+
     public RaftClusterNode(RaftConfig config, RaftPersistentState state, RocksDatabase db, IPeerTransport transport)
     {
         ArgumentNullException.ThrowIfNull(config);
@@ -682,8 +692,9 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
     private void BecomeCandidateLocked()
     {
         bool wasLeader = _role == RaftRole.Leader;
-        _role = RaftRole.Candidate;
+        // Persisted first: if the write fails nothing has changed (the node is not left a candidate of the old term).
         _state.UpdateTermAndVote(_state.CurrentTerm + 1, _config.NodeId);
+        _role = RaftRole.Candidate;
         _currentLeaderId = null;
         if (wasLeader) SignalCommitWaitersLocked();
         RoleChanged?.Invoke(this, new RoleChangedEventArgs(_role, _state.CurrentTerm));
@@ -801,7 +812,10 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
                 try
                 {
-                    if (resp.Term > _state.CurrentTerm)
+                    // Heartbeats are sent without being awaited by the loop, so an answer can arrive after Dispose: it
+                    // must not rewrite the Raft state or raise events on a node whose host is gone (the directory may
+                    // have been reopened by a new instance).
+                    if (_disposed == 0 && resp.Term > _state.CurrentTerm)
                     {
                         _state.UpdateTermAndVote(resp.Term, null);
                         BecomeFollowerLocked(null);
@@ -818,7 +832,7 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 await _gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
                 try
                 {
-                    if (_role != RaftRole.Leader || _state.CurrentTerm != beat.Term) return;
+                    if (_disposed != 0 || _role != RaftRole.Leader || _state.CurrentTerm != beat.Term) return;
                     // Only the prefix ending at PrevLogSeq has been validated against our log; anything past it is
                     // confirmed by the WAL-stream progress reports, not by the heartbeat.
                     peer.OnAppendSucceeded(beat.PrevLogSeq);
@@ -879,7 +893,18 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
                 _electionTimer.Reset();
                 return;
             }
-            BecomeCandidateLocked();
+            try
+            {
+                BecomeCandidateLocked();
+            }
+            catch (Exception)
+            {
+                // The term could not be persisted (a transient I/O error) or an event handler threw. The timer is
+                // one-shot and has fired: without re-arming it here this node would never campaign again until a
+                // heartbeat or a granted vote happened to reset it.
+                if (!_resyncing && _role != RaftRole.Leader) _electionTimer.Reset();
+                throw;
+            }
             // The campaign is bound to the exact term in which we became candidate; capturing it outside this lock
             // would let a concurrent vote or heartbeat move the term and make us campaign where we already voted.
             electionTerm = _state.CurrentTerm;
@@ -956,7 +981,21 @@ public sealed class RaftClusterNode : IDisposable, IAsyncDisposable
         {
             // Still candidate for this term?
             if (_role == RaftRole.Candidate && _state.CurrentTerm == term && !_resyncing && _disposed == 0)
+            {
+                if (QuiesceLogBeforeLeadingAsync is { } quiesce)
+                {
+                    try
+                    {
+                        await quiesce().ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        // The log could not be quiesced: do not lead this term (the election timer runs on).
+                        return;
+                    }
+                }
                 await BecomeLeaderLockedAsync().ConfigureAwait(false);
+            }
         }
         finally
         {

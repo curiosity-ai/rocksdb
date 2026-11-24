@@ -343,6 +343,13 @@ public sealed class ProgressReporter : IAsyncDisposable
         catch (OperationCanceledException)
         {
         }
+        catch (Exception) when (ct.IsCancellationRequested)
+        {
+            // The send that was in flight when this reporter was disposed: a transport reports its cancelled call with
+            // an exception of its own (gRPC: RpcException with StatusCode.Cancelled), not an OperationCanceledException.
+            // Letting it fault the loop made DisposeAsync throw it, in place of whatever the owner was returning or
+            // throwing (a resync request, for instance).
+        }
     }
 
     public void Report(ulong sequence)
@@ -358,7 +365,14 @@ public sealed class ProgressReporter : IAsyncDisposable
         _completed = true;
         _signal.SignalAll();
         await _cts.CancelAsync().ConfigureAwait(false);
-        await _loop.ConfigureAwait(false);
+        try
+        {
+            await _loop.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Nothing the loop ends with is the owner's to handle; a failed report is a lost report.
+        }
         _cts.Dispose();
     }
 }
