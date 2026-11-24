@@ -465,13 +465,26 @@ internal sealed class ErrorHandler
         _recoveryInProgress = true;
         Task previous = _recoveryTask;
         var run = new ErrorRecoveryRun();
-        _recoveryTask = Task.Run(async () =>
+        // On a dedicated thread, with synchronous waits and I/O (upstream: recovery_thread_, joined by the close). As a
+        // thread-pool task the recovery needed pool threads to start, to continue after each wait and to observe the
+        // shutdown, and a synchronous Dispose blocks its thread until the recovery ended: with every pool thread
+        // blocked (in Dispose or in synchronous DB calls) that never happened.
+        Action<object?> body = _ =>
         {
-            try { await previous.ConfigureAwait(false); }
-            catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException or OperationCanceledException) { }
+            try { previous.GetAwaiter().GetResult(); }
+            catch (Exception e) when (e is not OutOfMemoryException) { }
             lock (_db.Mutex) _startedRecoveryRun = run;
-            await RecoverFromRetryableBgIoErrorAsync(run).ConfigureAwait(false);
-        });
+            RecoverFromRetryableBgIoErrorAsync(run, synchronous: true).GetAwaiter().GetResult();
+        };
+        try
+        {
+            _recoveryTask = BackgroundThreadPool.High.Run(body, null);
+        }
+        catch (Exception e) when (e is OutOfMemoryException or ThreadStartException or InvalidOperationException)
+        {
+            // No thread could be started: the thread pool runs it.
+            _recoveryTask = Task.Run(() => body(null));
+        }
         return false;
     }
 
@@ -480,7 +493,7 @@ internal sealed class ErrorHandler
     /// Every OnErrorRecoveryEnd it raises is its last DB operation besides statistics, logging and test hooks (a listener
     /// may close the DB there, see <see cref="EndAutoRecoveryAsync"/>).
     /// </summary>
-    private async Task RecoverFromRetryableBgIoErrorAsync(ErrorRecoveryRun run)
+    private async Task RecoverFromRetryableBgIoErrorAsync(ErrorRecoveryRun run, bool synchronous)
     {
         DbOptions o = _db.Options;
         int resumeCount = o.MaxBgErrorResumeCount;
@@ -510,7 +523,7 @@ internal sealed class ErrorHandler
             RocksDbException? s;
             try
             {
-                s = await _db.ResumeImplAsync(run, synchronous: false).ConfigureAwait(false);
+                s = await _db.ResumeImplAsync(run, synchronous).ConfigureAwait(false);
             }
             catch (Exception e) when (e is not OutOfMemoryException)
             {
@@ -536,12 +549,20 @@ internal sealed class ErrorHandler
             {
                 // A new retryable error happened during the recovery: wait and retry.
                 TestHooks.Invoke("RecoverFromRetryableBGIOError:BeforeWait");
-                try
+                if (synchronous)
                 {
-                    await Task.Delay(interval, _recoveryCancellation.Token).ConfigureAwait(false);
+                    // Ended early by the close (EndAutoRecoveryAsync cancels the token).
+                    _recoveryCancellation.Token.WaitHandle.WaitOne(interval < TimeSpan.FromMilliseconds(int.MaxValue) ? interval : TimeSpan.FromMilliseconds(int.MaxValue));
                 }
-                catch (OperationCanceledException)
+                else
                 {
+                    try
+                    {
+                        await Task.Delay(interval, _recoveryCancellation.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
                 }
             }
             else
@@ -775,6 +796,30 @@ internal sealed partial class DbImpl
     /// </summary>
     internal async ValueTask<RocksDbException?> ResumeImplAsync(ErrorRecoveryRun? run, bool synchronous)
     {
+        lock (_mutex)
+        {
+            if (_resumeClosed) return new RocksDbException(StatusCode.ShutdownInProgress, "Shutdown in progress");
+            _resumesInFlight++;
+        }
+        DbImpl? outer = s_insideResume.Value;
+        s_insideResume.Value = this;
+        try
+        {
+            return await ResumeImplCoreAsync(run, synchronous).ConfigureAwait(false);
+        }
+        finally
+        {
+            s_insideResume.Value = outer;
+            lock (_mutex)
+            {
+                _resumesInFlight--;
+                SignalBackgroundWork();
+            }
+        }
+    }
+
+    private async ValueTask<RocksDbException?> ResumeImplCoreAsync(ErrorRecoveryRun? run, bool synchronous)
+    {
         await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
         TestHooks.Invoke("DBImpl::ResumeImpl:Start");
         RocksDbException? s = null;
@@ -890,6 +935,7 @@ internal sealed partial class DbImpl
                     // Publish the reservation so later writes cannot reuse an ambiguous sequence; the recovery flush
                     // edits below persist it (their last_sequence covers it).
                     Versions.SetLastSequence(Versions.LastAllocatedSequence);
+                    NotifySequenceWaiters();
                 }
                 // One switch for all column families: the recovery flush below picks exactly these memtables.
                 BeginAtomicSwitch();

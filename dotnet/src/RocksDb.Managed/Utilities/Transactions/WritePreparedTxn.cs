@@ -195,7 +195,9 @@ internal class WritePreparedTxn : PessimisticTransaction
         if (doOneWrite) return;
         // else do the 2nd write for commit: an empty batch on the 2nd queue releases the commit sequence to readers.
         _commitEntry.Set(PrepareSequence, batchCnt, 0);
-        ValueTask c = WriteCommitOnlyAsync(s_commitOnlyNoWal, EmptyBatch(forWal: false), _commitEntry, synchronous, cancellationToken);
+        // Not cancellable: the first write is in the WAL and the memtables (and in the prepared heap); abandoning the
+        // commit here would leave it invisible until a reopen commits it, with the prepared heap's top stuck.
+        ValueTask c = WriteCommitOnlyAsync(s_commitOnlyNoWal, EmptyBatch(forWal: false), _commitEntry, synchronous, CancellationToken.None);
         if (!c.IsCompletedSuccessfully) await c.ConfigureAwait(false);
         // Note: RemovePrepared is called from within PreReleaseCallback
     }
@@ -285,7 +287,8 @@ internal class WritePreparedTxn : PessimisticTransaction
         _rollbackCommit.Set(prepareSeq, rollbackSeq, _prepareBatchCnt);
         try
         {
-            ValueTask c = WriteCommitOnlyAsync(_writeOptions, EmptyBatch(forWal: true), _rollbackCommit, synchronous, cancellationToken);
+            // Not cancellable: the rollback batch is already written (see CommitWithoutPrepareInternalAsync).
+            ValueTask c = WriteCommitOnlyAsync(_writeOptions, EmptyBatch(forWal: true), _rollbackCommit, synchronous, CancellationToken.None);
             if (!c.IsCompletedSuccessfully) await c.ConfigureAwait(false);
             _wpDb.RemovePrepared(prepareSeq, _prepareBatchCnt);
         }

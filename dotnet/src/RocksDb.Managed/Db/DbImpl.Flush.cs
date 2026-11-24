@@ -337,23 +337,31 @@ internal sealed partial class DbImpl
                     MaybeScheduleFlush();
                 }
             }
-            TestHooks.Invoke("DBImpl::BackgroundCallFlush:FlushFinish:0");
-            if (discarded is not null) DeleteDiscardedFlushOutputs(cfd, discarded);
             try
             {
-                // Before the job is accounted as finished (like BackgroundCallFlush: bg_flush_scheduled_-- after
-                // PurgeObsoleteFiles): CloseAsync waits for _backgroundJobs to drain, so a purge running after close
-                // could delete files of a new DB created in the same directory.
-                PurgeObsoleteFiles();
+                TestHooks.Invoke("DBImpl::BackgroundCallFlush:FlushFinish:0");
+                if (discarded is not null) DeleteDiscardedFlushOutputs(cfd, discarded);
+                try
+                {
+                    // Before the job is accounted as finished (like BackgroundCallFlush: bg_flush_scheduled_-- after
+                    // PurgeObsoleteFiles): CloseAsync waits for _backgroundJobs to drain, so a purge running after close
+                    // could delete files of a new DB created in the same directory.
+                    PurgeObsoleteFiles();
+                }
+                catch (Exception e) when (e is IOException or RocksDbException)
+                {
+                    // Deleting obsolete files is best effort.
+                }
             }
-            catch (Exception e) when (e is IOException or RocksDbException)
+            finally
             {
-                // Deleting obsolete files is best effort.
-            }
-            lock (_mutex)
-            {
-                _backgroundJobs--;
-                SignalBackgroundWork();
+                // Whatever the cleanup above threw (upstream has no exceptions here; a custom file system may throw
+                // anything): a job that is never accounted as finished makes the close wait forever.
+                lock (_mutex)
+                {
+                    _backgroundJobs--;
+                    SignalBackgroundWork();
+                }
             }
         }
     }
@@ -613,32 +621,41 @@ internal sealed partial class DbImpl
             VersionEdit walDeletion;
             lock (_mutex)
             {
-                // "The back is the oldest; if flush_completed_ is not set to it, it means that we were assigned a more
-                // recent memtable. The memtables' flushes must be recorded in manifest in order."
-                List<ImmutableMemTable> imm = cfd.Imm;
-                if (imm.Count == 0 || !imm[0].FlushCompleted)
+                try
                 {
-                    cfd.FlushCommitInProgress = false;
-                    return;
+                    // "The back is the oldest; if flush_completed_ is not set to it, it means that we were assigned a more
+                    // recent memtable. The memtables' flushes must be recorded in manifest in order."
+                    List<ImmutableMemTable> imm = cfd.Imm;
+                    if (imm.Count == 0 || !imm[0].FlushCompleted)
+                    {
+                        cfd.FlushCommitInProgress = false;
+                        return;
+                    }
+                    batch = imm[0].FlushResult!;
+                    System.Diagnostics.Debug.Assert(ReferenceEquals(batch.Picked[0], imm[0]) && imm.Count >= batch.Picked.Count);
+                    ulong logNumber = batch.Edit.LogNumber!.Value;
+                    ulong minWalToKeep = Options.Allow2Pc
+                        // PrecomputeMinLogNumberToKeep2PC: the WALs holding outstanding prepared sections (or prepared sections of
+                        // committed data still in memtables) must survive.
+                        ? PrecomputeMinLogNumberToKeep2PC(cfd, logNumber, batch.Picked)
+                        // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's.
+                        : Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), logNumber);
+                    // GetDBRecoveryEditForObsoletingMemTables (db/memtable_list.cc): a separate edit of the same MANIFEST write
+                    // records min_log_number_to_keep for every flush (also with a single column family; it keeps
+                    // versions_->min_log_number_to_keep, "rocksdb.min-log-number-to-keep", current) and, with
+                    // track_and_verify_wals_in_manifest, the WALs the flush makes obsolete as deleted.
+                    // LogAndApplyHelper: "if (!edit->HasPrevLogNumber()) edit->SetPrevLogNumber(prev_log_number_)".
+                    walDeletion = new VersionEdit { MinLogNumberToKeep = minWalToKeep, PrevLogNumber = Versions.PrevLogNumber };
+                    if (Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep) walDeletion.WalDeletionBefore = minWalToKeep;
+                    // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
+                    if (batch.BlobBuilder is not null) batch.BlobBuilder.Committed = true;
                 }
-                batch = imm[0].FlushResult!;
-                System.Diagnostics.Debug.Assert(ReferenceEquals(batch.Picked[0], imm[0]) && imm.Count >= batch.Picked.Count);
-                ulong logNumber = batch.Edit.LogNumber!.Value;
-                ulong minWalToKeep = Options.Allow2Pc
-                    // PrecomputeMinLogNumberToKeep2PC: the WALs holding outstanding prepared sections (or prepared sections of
-                    // committed data still in memtables) must survive.
-                    ? PrecomputeMinLogNumberToKeep2PC(cfd, logNumber, batch.Picked)
-                    // PrecomputeMinLogNumberToKeepNon2PC: minimum of the other CFs' log numbers and this edit's.
-                    : Math.Min(Versions.MinLogNumberWithUnflushedData(cfd), logNumber);
-                // GetDBRecoveryEditForObsoletingMemTables (db/memtable_list.cc): a separate edit of the same MANIFEST write
-                // records min_log_number_to_keep for every flush (also with a single column family; it keeps
-                // versions_->min_log_number_to_keep, "rocksdb.min-log-number-to-keep", current) and, with
-                // track_and_verify_wals_in_manifest, the WALs the flush makes obsolete as deleted.
-                // LogAndApplyHelper: "if (!edit->HasPrevLogNumber()) edit->SetPrevLogNumber(prev_log_number_)".
-                walDeletion = new VersionEdit { MinLogNumberToKeep = minWalToKeep, PrevLogNumber = Versions.PrevLogNumber };
-                if (Options.TrackAndVerifyWalsInManifest && minWalToKeep > Versions.MinWalNumberToKeep) walDeletion.WalDeletionBefore = minWalToKeep;
-                // From here on a failure may still have made the edit durable: leave the blob files to the obsolete-file scan.
-                if (batch.BlobBuilder is not null) batch.BlobBuilder.Committed = true;
+                catch
+                {
+                    // No flush of this column family would ever be committed again (and Flush(wait) would hang).
+                    cfd.FlushCommitInProgress = false;
+                    throw;
+                }
             }
             // Removes the flushed memtables and installs the super version (which recalculates the write stall); runs in the
             // critical section that installs the new version, like upstream's RemoveMemTablesOrRestoreFlags (the
@@ -974,7 +991,32 @@ internal sealed partial class DbImpl
             Task signal;
             lock (_mutex)
             {
-                if (_backgroundJobs == 0) return;
+                if (_backgroundJobs == 0 && _pendingPurges == 0) return;
+                signal = _bgSignal.Task;
+            }
+            if (synchronous) signal.Wait();
+            else await signal.ConfigureAwait(false);
+        }
+    }
+
+    // ResumeImpl calls in flight (error recoveries: automatic, SstFileManager driven and manual). Guarded by mutex.
+    private int _resumesInFlight;
+    // Set by the close: a ResumeImpl that starts later ends with ShutdownInProgress. Guarded by mutex.
+    private bool _resumeClosed;
+    // The DB whose ResumeImpl the current flow runs in: a close called from there (a listener) must not wait for it.
+    private static readonly AsyncLocal<DbImpl?> s_insideResume = new();
+
+    /// <summary>Refuses new error recoveries and waits for the ones in flight (close).</summary>
+    private async ValueTask WaitForResumesAsync(bool synchronous)
+    {
+        bool inside = ReferenceEquals(s_insideResume.Value, this);
+        while (true)
+        {
+            Task signal;
+            lock (_mutex)
+            {
+                _resumeClosed = true;
+                if (_resumesInFlight == 0 || inside) return;
                 signal = _bgSignal.Task;
             }
             if (synchronous) signal.Wait();

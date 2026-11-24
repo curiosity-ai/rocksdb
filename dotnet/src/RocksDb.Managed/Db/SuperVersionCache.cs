@@ -63,6 +63,12 @@ internal sealed class SuperVersionCache
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPut(int slot, SuperVersion sv) => Interlocked.CompareExchange(ref _slots[slot].Value, sv, InUse) == InUse;
 
+    /// <summary>
+    /// Takes <paramref name="sv"/> back out of <paramref name="slot"/> after a <see cref="TryPut"/> that turned out to
+    /// store an obsolete super version; false if a reset or another reader already took it (and releases it).
+    /// </summary>
+    public bool TryTakeBack(int slot, SuperVersion sv) => ReferenceEquals(Interlocked.CompareExchange(ref _slots[slot].Value, null, sv), sv);
+
     /// <summary>Gives up a slot taken with <see cref="Take"/> without storing a super version (error paths).</summary>
     public void Abandon(int slot) => Interlocked.CompareExchange(ref _slots[slot].Value, null, InUse);
 

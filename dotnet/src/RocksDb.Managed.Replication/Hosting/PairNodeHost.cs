@@ -190,6 +190,8 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     // False until StartAsync has settled this node's role: a restarted primary does not answer the replica's attach
     // check or stream before it decided whether to continue (a replica that is ahead would rebuild on the answer).
     private volatile bool _serving;
+    // Completed when _serving is set (or the host is disposed first): client writes that arrive earlier wait on it.
+    private readonly TaskCompletionSource _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     // PairWriteAck.Replica: the highest sequence number the replica reported holding (0 after this node was a replica).
     private readonly Lock _ackLock = new();
     private readonly RocksDb.Managed.Util.AsyncBroadcastSignal _replicaProgress = new();
@@ -285,6 +287,7 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         if (_node.Role == ReplicationRole.Replica) _primaryCts.Cancel();
         Log("started as " + _node.Role + " in epoch " + _node.Epoch + " at seq " + _db.GetLatestSequenceNumber());
         _serving = true;
+        _started.TrySetResult();
         if (_node.Role == ReplicationRole.Replica) EnsureFollowerStream();
         _resolveTask = Task.Run(ResolveLoopAsync);
     }
@@ -354,6 +357,18 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     public async ValueTask<PairWriteResult> WriteAsync(WriteBatch batch, TimeSpan holdTimeout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
+        if (!_serving)
+        {
+            // Not before StartAsync has settled this node's role: a node restarting as primary first asks the other
+            // node whether it was replaced, and whether to hand over to a replica that is ahead of the recovered log
+            // (YieldToReplicaAheadAsync); a write applied meanwhile would be acknowledged in the old epoch at a sequence
+            // number the replica holds another entry for. Such a write waits like one held by a handoff.
+            long deadline = Environment.TickCount64 + (long)Math.Min(holdTimeout.TotalMilliseconds, int.MaxValue);
+            if (!await WaitUntilServingAsync(holdTimeout, cancellationToken).ConfigureAwait(false))
+                return new PairWriteResult(PairWriteStatus.NotPrimary, null, 0);
+            long remaining = deadline - Environment.TickCount64;
+            holdTimeout = remaining > 0 ? TimeSpan.FromMilliseconds(remaining) : TimeSpan.Zero;
+        }
         if (!await _node.Writes.TryEnterAsync(holdTimeout, cancellationToken).ConfigureAwait(false))
             return new PairWriteResult(PairWriteStatus.NotPrimary, _node.PrimaryId == _cfg.NodeId ? null : _node.PrimaryId, 0);
         try
@@ -370,6 +385,21 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             _node.Writes.Exit();
         }
+    }
+
+    private async ValueTask<bool> WaitUntilServingAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (timeout <= TimeSpan.Zero) return false;
+        try
+        {
+            await _started.Task.WaitAsync(TimeSpan.FromMilliseconds(Math.Min(timeout.TotalMilliseconds, int.MaxValue)), cancellationToken).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+        // False when the host was disposed before it ever served.
+        return _serving;
     }
 
     /// <summary>
@@ -587,7 +617,10 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             if (_resyncing || _cts.IsCancellationRequested) return;
             if (_followerCts != null && _followerTask is { IsCompleted: false }) return;
-            _followerCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            // Not linked to _cts: a linked source keeps a registration on the host's source until it is disposed, one
+            // per attach for the life of the host, and it cannot be disposed safely while another flow may still cancel
+            // it. DisposeAsync cancels the current one instead (under this lock, after _cts, which is checked above).
+            _followerCts = new CancellationTokenSource();
             CancellationToken ct = _followerCts.Token;
             Task previous = _followerTask ?? Task.CompletedTask;
             _followerTask = Task.Run(async () =>
@@ -660,6 +693,9 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
                 }
                 if (!check.Consistent)
                 {
+                    // An answer that arrives after this stream was told to stop (this node was promoted, or stops) is
+                    // about a role it no longer has: it must not drop the database.
+                    if (ct.IsCancellationRequested) return;
                     TriggerResync("log at " + latest + " (epoch " + _node.GetEpochForSeq(latest) + ") is not a prefix of " + _cfg.PeerId + "'s");
                     return;
                 }
@@ -832,12 +868,15 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
             {
                 _node.DetachDatabase();
             }
-            catch (InvalidOperationException e)
+            catch (Exception e) when (e is not OperationCanceledException)
             {
-                // Promoted between the trigger and here: a primary keeps its database. Leaving the flag set would make
-                // this node answer "no status" for good.
+                // InvalidOperationException: promoted between the trigger and here; a primary keeps its database.
+                // Anything else is as unexpected as it is final for this attempt. Either way the database stays
+                // attached, and leaving the flag set would make this node answer "no status" for good.
                 lock (_followerLock) _resyncing = false;
                 Log("resync abandoned: " + e.Message);
+                // A replica follows again, so that a divergence still there is seen again and the resync retried.
+                if (e is not InvalidOperationException && _node.Role == ReplicationRole.Replica) EnsureFollowerStream();
                 return;
             }
             await StopFollowerStreamAsync().ConfigureAwait(false);
@@ -877,11 +916,20 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     public async ValueTask DisposeAsync()
     {
         await _cts.CancelAsync().ConfigureAwait(false);
-        lock (_followerLock) _primaryCts.Cancel();
+        lock (_followerLock)
+        {
+            _primaryCts.Cancel();
+            _followerCts?.Cancel(); // not linked to _cts (EnsureFollowerStream)
+        }
         // Writes waiting for the replica's report give up (NotReplicated).
         lock (_ackLock) _replicaProgress.SignalAll();
+        // Writes still waiting for the start give up (NotPrimary: _serving stays false).
+        _started.TrySetResult();
         if (_node != null)
         {
+            // Sealed first: a promotion or a handoff being settled right now (ResumeAsPrimary, RunPromotionAsync,
+            // ForcePromoteAsync) must not reopen the gate once it is closed here.
+            _node.Writes.Seal();
             // Let admitted client writes finish, refuse new ones.
             await _node.Writes.HoldAsync(CancellationToken.None).ConfigureAwait(false);
             _node.Writes.Close();

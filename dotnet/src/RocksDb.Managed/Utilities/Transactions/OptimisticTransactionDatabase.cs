@@ -116,6 +116,16 @@ public sealed class OptimisticTransactionDatabase : IDisposable, IAsyncDisposabl
 
     internal int BucketCount => _bucketCount;
 
+    private volatile bool _synchronousCommitterSeen;
+
+    /// <summary>A synchronous commit with parallel validation has run on this DB (see CommitWithParallelValidateAsync).</summary>
+    internal bool SynchronousCommitterSeen => _synchronousCommitterSeen;
+
+    internal void NoteSynchronousCommitter()
+    {
+        if (!_synchronousCommitterSeen) _synchronousCommitterSeen = true;
+    }
+
     public void Dispose() => _db.Dispose();
 
     public ValueTask DisposeAsync() => _db.DisposeAsync();
@@ -224,6 +234,13 @@ internal sealed class OptimisticTransaction : Transaction, IWriteCallback
             foreach (PooledKey key in c.Keys.Keys) buckets.Add(ByteKeyComparer.Bucket(key.Span, seed, n));
         }
         buckets.Sort();
+        // Once the DB has had a synchronous committer, asynchronous commits take their buckets and write synchronously
+        // too (the audit #12 rule for the write path): a synchronous committer blocks its thread on a bucket, so
+        // releasing that bucket must not depend on a thread-pool continuation (of an asynchronous holder's bucket wait
+        // or write) - its own thread may be the pool's last one. Residual: an asynchronous commit already waiting or
+        // writing when the first synchronous committer arrives still finishes on the pool.
+        if (synchronous) _owner.NoteSynchronousCommitter();
+        else synchronous = _owner.SynchronousCommitterSeen;
         int taken = 0;
         try
         {

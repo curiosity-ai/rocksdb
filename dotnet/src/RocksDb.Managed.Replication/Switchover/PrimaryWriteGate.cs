@@ -26,6 +26,7 @@ public sealed class PrimaryWriteGate
     private readonly Lock _transition = new();
     private int _state;
     private int _inFlight;
+    private bool _sealed; // guarded by _transition
     private TaskCompletionSource _changed = NewSignal();
     private TaskCompletionSource _drained = NewSignal();
 
@@ -79,12 +80,45 @@ public sealed class PrimaryWriteGate
     /// <summary>Marks a write admitted by <see cref="TryEnterAsync"/> as applied.</summary>
     public void Exit()
     {
-        if (Interlocked.Decrement(ref _inFlight) == 0 && Volatile.Read(ref _state) == Holding) Volatile.Read(ref _drained).TrySetResult();
+        // Signalled while holding and while closed (DrainAsync); an open gate has nobody waiting for the drain.
+        if (Interlocked.Decrement(ref _inFlight) == 0 && Volatile.Read(ref _state) != Open) Volatile.Read(ref _drained).TrySetResult();
     }
 
+    /// <summary>Admits writes again. Ignored once the gate was sealed (<see cref="Seal"/>).</summary>
     public void OpenGate() => Transition(Open);
 
     public void Close() => Transition(Closed);
+
+    /// <summary>
+    /// From now on <see cref="OpenGate"/> does nothing: the gate can still hold and close, but never admits a write
+    /// again. For the owner's shutdown, so that a role change still in progress (a promotion, a handoff being settled)
+    /// cannot reopen the gate of a node whose database is being closed. Does not change the current state.
+    /// </summary>
+    public void Seal()
+    {
+        lock (_transition) _sealed = true;
+    }
+
+    /// <summary>
+    /// Completes once no admitted write is in flight, without changing the state. Meaningful on a gate that is not
+    /// open (closed or holding: nothing new is admitted, so the count only falls); on an open gate it returns at the
+    /// first instant the gate is idle.
+    /// </summary>
+    public async Task DrainAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            TaskCompletionSource drained = Volatile.Read(ref _drained);
+            if (drained.Task.IsCompleted)
+            {
+                // Consumed (by a transient enter/exit or an earlier drain); arm a fresh one before re-checking the count.
+                Interlocked.CompareExchange(ref _drained, NewSignal(), drained);
+                continue;
+            }
+            if (Interlocked.CompareExchange(ref _inFlight, 0, 0) == 0) return;
+            await drained.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
 
     /// <summary>
     /// Stops admitting writes - new ones wait - and completes once every write admitted before the hold has called
@@ -111,13 +145,18 @@ public sealed class PrimaryWriteGate
     private void Transition(int state)
     {
         TaskCompletionSource previous;
+        TaskCompletionSource? previousDrained = null;
         lock (_transition)
         {
-            if (state == Holding) Volatile.Write(ref _drained, NewSignal());
+            if (_sealed && state == Open) return;
+            if (state == Holding) previousDrained = Interlocked.Exchange(ref _drained, NewSignal());
             Interlocked.Exchange(ref _state, state);
             previous = Interlocked.Exchange(ref _changed, NewSignal());
         }
         previous.TrySetResult();
+        // An earlier HoldAsync still waiting (two holders, e.g. a dispose racing a handoff) waits on the signal just
+        // replaced, which the last Exit no longer completes: wake it so that it re-checks and waits on the new one.
+        previousDrained?.TrySetResult();
     }
 
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);

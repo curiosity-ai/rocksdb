@@ -98,14 +98,21 @@ public sealed class BlockCacheTier : PersistentCacheTier
         {
             // Queued inserts are processed first (as upstream). The insert thread waits for free write buffers, which the
             // writer threads release; if they cannot make progress for 30 s, stop waiting and drop the remaining inserts.
-            _insertOps.Add(new InsertOp(null, null, true));
+            // Under the queue lock: an Insert that saw the tier open has queued its op before the quit marker (it is
+            // processed), a later one sees the tier closed. Without it an Insert racing the close added to a disposed
+            // queue (ObjectDisposedException into a table read) or behind the marker (never processed, its bytes
+            // counted as pending forever).
+            lock (_insertQueueLock) _insertOps.Add(new InsertOp(null, null, true));
             if (!_insertThread!.Join(TimeSpan.FromSeconds(30)))
             {
                 _bufferAllocator.Shutdown();
                 _insertThread.Join();
             }
-            _insertOps.Dispose();
-            _insertOps = null;
+            lock (_insertQueueLock)
+            {
+                _insertOps.Dispose();
+                _insertOps = null;
+            }
         }
         _writer?.Stop();
         _lock.EnterWriteLock();
@@ -138,11 +145,21 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 Interlocked.Increment(ref _insertDropped);
                 return false;
             }
-            q.Add(new InsertOp(key.ToArray(), data.ToArray(), false));
+            lock (_insertQueueLock)
+            {
+                if (Volatile.Read(ref _opened) == 0 || _insertOps is null)
+                {
+                    Interlocked.Add(ref _pendingBytes, -opSize);
+                    return false; // closed meanwhile
+                }
+                q.Add(new InsertOp(key.ToArray(), data.ToArray(), false));
+            }
             return true;
         }
         return InsertImpl(key, data);
     }
+
+    private readonly Lock _insertQueueLock = new();
 
     private void InsertMain()
     {
@@ -158,7 +175,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 {
                     if (InsertImpl(op.Key, op.Data)) { ok = true; break; }
                 }
-                catch (IOException)
+                catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
                 {
                     break;
                 }
@@ -179,7 +196,8 @@ public sealed class BlockCacheTier : PersistentCacheTier
             // The key already exists: duplicate insert.
             if (_blockIndex.GetAlternateLookup<ReadOnlySpan<byte>>().ContainsKey(key)) return true;
             Lba lba;
-            while (!_cacheFile!.Append(key, data, out lba))
+            if (_cacheFile is null) return false; // closed (an insert racing Close)
+            while (!_cacheFile.Append(key, data, out lba))
             {
                 if (!_cacheFile.Eof) return false;
                 NewCacheFile();
@@ -226,7 +244,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 ok = file.Read(lba, scratch) && ParseRecord(scratch.AsSpan(0, lba.Size), key, out int valOffset, out int valSize)
                     && CopyOut(scratch.AsSpan(valOffset, valSize), out data, out length);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
             {
                 ok = false;
                 data = [];
@@ -282,7 +300,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
             {
                 ok = file.TryReadBuffered(lba, scratch, out reader);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
             {
                 ok = false;
                 reader = null;
@@ -322,7 +340,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
             }
             ok = total == lba.Size;
         }
-        catch (Exception e) when (e is IOException or ObjectDisposedException)
+        catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)
         {
             ok = false;
         }
@@ -744,9 +762,14 @@ public sealed class BlockCacheTier : PersistentCacheTier
 
         public bool Read(in Lba lba, byte[] scratch)
         {
+            // The reader is taken under the lock and used outside it: CloseFile (the tier's Close, an eviction) clears
+            // the field, and a second read of it here was a NullReferenceException. A reader disposed meanwhile fails
+            // the read with ObjectDisposedException, which the lookups count as an error miss.
+            Env.IRandomAccessFile? reader;
             lock (_rw)
             {
-                if (_reader is null)
+                reader = _reader;
+                if (reader is null)
                 {
                     // Still being written: read from the write buffers (WriteableCacheFile::ReadBuffer).
                     if (_bufs.Count == 0) return false;
@@ -765,7 +788,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                     return pending == 0;
                 }
             }
-            return Table.BlockFetcher.ReadFully(_reader, lba.Offset, scratch.AsSpan(0, lba.Size)) == lba.Size;
+            return Table.BlockFetcher.ReadFully(reader, lba.Offset, scratch.AsSpan(0, lba.Size)) == lba.Size;
         }
 
         public void CloseFile()
@@ -776,7 +799,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 {
                     _file?.Dispose();
                 }
-                catch (IOException)
+                catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
                 {
                 }
                 _file = null;
@@ -799,7 +822,7 @@ public sealed class BlockCacheTier : PersistentCacheTier
                 size = fs.GetFileSize(_path);
                 fs.DeleteFile(_path);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
             {
             }
             return size;

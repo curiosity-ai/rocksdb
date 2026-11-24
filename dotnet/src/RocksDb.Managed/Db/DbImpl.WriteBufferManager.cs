@@ -230,7 +230,11 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
                 wbm.RemoveDbFromQueue(stall);
                 ThrowDisposed();
             }
-            if (!retryLocalFlush || !wbm.ShouldStall()) break;
+            if (!wbm.ShouldStall()) break;
+            // Woken while the stall conditions hold and with no local flush to retry: the signal was meant for an earlier
+            // round (MaybeEndWriteStall signals outside the manager's lock, and a canceled leader's follower may have
+            // started the next round in between). Stall again, as the next write would.
+            if (!retryLocalFlush) continue;
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
             await HandleWriteBufferManagerFlushAsync(synchronous, cancellationToken).ConfigureAwait(false);

@@ -816,7 +816,44 @@ public class BackupEngineReadOnly : IDisposable
         }
         int next = -1;
         Exception? failure = null;
-        // Synchronous callers block on thread-pool workers doing synchronous I/O; async callers get async workers.
+        if (synchronous)
+        {
+            // The calling thread is one of the workers and the others are dedicated threads (upstream: the copy engine's
+            // own threads). As thread-pool tasks they needed free pool threads while the caller blocked on them: with the
+            // pool's threads all blocked in such calls nothing ran (a deadlock with a capped pool).
+            Action<object?> body = _ =>
+            {
+                while (Volatile.Read(ref failure) is null)
+                {
+                    int i = Interlocked.Increment(ref next);
+                    if (i >= count) return;
+                    try
+                    {
+                        SyncValueTask.GetResult(work(i, true, ct));
+                    }
+                    catch (Exception e)
+                    {
+                        Interlocked.CompareExchange(ref failure, e, null);
+                    }
+                }
+            };
+            var helpers = new List<Task>(workers - 1);
+            for (int w = 1; w < workers; w++)
+            {
+                try
+                {
+                    helpers.Add(Db.BackgroundThreadPool.Low.Run(body, null));
+                }
+                catch (Exception e) when (e is OutOfMemoryException or ThreadStartException or InvalidOperationException)
+                {
+                    break; // no more threads: the workers that exist (at least the caller) do all the items
+                }
+            }
+            body(null);
+            Task.WaitAll(helpers.ToArray(), CancellationToken.None);
+            if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failure);
+            return;
+        }
         var tasks = new Task[workers];
         for (int w = 0; w < workers; w++)
         {
@@ -837,8 +874,7 @@ public class BackupEngineReadOnly : IDisposable
                 }
             }, CancellationToken.None);
         }
-        if (synchronous) Task.WaitAll(tasks, CancellationToken.None);
-        else await Task.WhenAll(tasks).ConfigureAwait(false);
+        await Task.WhenAll(tasks).ConfigureAwait(false);
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failure);
     }
 

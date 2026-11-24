@@ -802,25 +802,34 @@ internal sealed partial class DbImpl
             {
                 // ResetBottomPriCompactionIntent
                 CompactionPicker picker = cfd.CompactionState.Picker;
-                picker.ReleaseCompactionFiles(c, succeeded: true);
-                c = null;
-                if (!cfd.Dropped && cfd.Current is not null)
+                try
                 {
-                    cfd.Current.Storage.ComputeCompactionScore();
-                    if (!cfd.Options.DisableAutoCompactions && !_shuttingDown && !IsBgWorkStopped && !_bgCancellation.IsCancellationRequested
-                        && _exclusiveManualCompactions == 0)
+                    picker.ReleaseCompactionFiles(c, succeeded: true);
+                    c = null;
+                    if (!cfd.Dropped && cfd.Current is not null)
                     {
-                        TestHooks.Invoke("DBImpl::BackgroundCompaction():BeforePickCompaction");
-                        snapshots = SnapshotsForCompaction();
-                        c = picker.PickCompaction(cfd.Current.Storage, snapshots, CurrentSnapshotChecker, requireMaxOutputLevel: true);
-                        if (c is not null)
+                        cfd.Current.Storage.ComputeCompactionScore();
+                        if (!cfd.Options.DisableAutoCompactions && !_shuttingDown && !IsBgWorkStopped && !_bgCancellation.IsCancellationRequested
+                            && _exclusiveManualCompactions == 0)
                         {
-                            c.InputVersion = cfd.Current;
-                            cfd.Current.Ref();
+                            TestHooks.Invoke("DBImpl::BackgroundCompaction():BeforePickCompaction");
+                            snapshots = SnapshotsForCompaction();
+                            c = picker.PickCompaction(cfd.Current.Storage, snapshots, CurrentSnapshotChecker, requireMaxOutputLevel: true);
+                            if (c is not null)
+                            {
+                                c.InputVersion = cfd.Current;
+                                cfd.Current.Ref();
+                            }
                         }
                     }
+                    TestHooks.Invoke("DBImpl::BackgroundCompaction():AfterPickCompactionBottomPri");
                 }
-                TestHooks.Invoke("DBImpl::BackgroundCompaction():AfterPickCompactionBottomPri");
+                catch
+                {
+                    // The job must not stay accounted as running (the close waits for it).
+                    FinishBottomPriorityCompaction(cfd);
+                    throw;
+                }
                 if (c is null)
                 {
                     FinishBottomPriorityCompaction(cfd);
@@ -1113,92 +1122,100 @@ internal sealed partial class DbImpl
         }
         finally
         {
-            manualCancellation?.Dispose();
-            if (jobId != 0)
-            {
-                // CompactFilesImpl: BuildCompactionJobInfo for the caller's compaction_job_info.
-                if (c.BuildJobInfo) c.JobInfo = NewCompactionJobInfo(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
-                try
-                {
-                    // BackgroundCompaction's safety net before ReleaseCompactionFiles: OnCompactionPreCommit with the
-                    // failure when the paths above did not raise it (idempotent).
-                    if (!ok) NotifyOnCompactionPreCommit(cfd, c, job, jobId, failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
-                    NotifyOnCompactionCompleted(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
-                }
-                catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)
-                {
-                }
-            }
-            lock (_mutex)
-            {
-                if (job is not null)
-                {
-                    foreach (ulong n in job.CreatedFileNumbers) _pendingOutputs.Remove(n);
-                }
-                if (remote is not null)
-                {
-                    foreach (ulong n in remote.CreatedFileNumbers) _pendingOutputs.Remove(n);
-                }
-                if (copiedFiles is not null)
-                {
-                    foreach (ulong n in copiedFiles) _pendingOutputs.Remove(n);
-                }
-                cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
-                ReleaseCompactionRoom(c);
-                if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
-                if (!cfd.Dropped && cfd.Current is not null)
-                {
-                    cfd.Current.Storage.ComputeCompactionScore();
-                }
-            }
-            // LogAndApply can also fail before writing anything (dropped column family, a refused edit): only a MANIFEST
-            // I/O error (VersionSet::io_status_) leaves the record's fate unknown.
-            bool deleteOutputs = !ok && !(editSubmitted && Versions.IoStatus is not null);
-            if (deleteOutputs && job is not null)
-            {
-                foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
-            }
-            if (deleteOutputs && remote is not null)
-            {
-                foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
-            }
-            if (deleteOutputs && copiedFiles is not null)
-            {
-                foreach (ulong n in copiedFiles) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
-            }
-            if (job is not null)
-            {
-                foreach (Blob.BlobFileBuilder blobBuilder in job.BlobBuilders)
-                {
-                    // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
-                    ReleaseBlobOutputs(blobBuilder);
-                    blobBuilder.Dispose();
-                }
-            }
             try
             {
-                // Before the job is accounted as finished, so shutdown does not race with file deletion.
-                PurgeObsoleteFiles();
-            }
-            catch (Exception e) when (e is IOException or RocksDbException)
-            {
-                // Deleting obsolete files is best effort.
-            }
-            lock (_mutex)
-            {
-                if (thread == CompactionThread.Bottom)
+                manualCancellation?.Dispose();
+                if (jobId != 0)
                 {
-                    FinishBottomPriorityCompaction(cfd);
+                    // CompactFilesImpl: BuildCompactionJobInfo for the caller's compaction_job_info.
+                    if (c.BuildJobInfo) c.JobInfo = NewCompactionJobInfo(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
+                    try
+                    {
+                        // BackgroundCompaction's safety net before ReleaseCompactionFiles: OnCompactionPreCommit with the
+                        // failure when the paths above did not raise it (idempotent).
+                        if (!ok) NotifyOnCompactionPreCommit(cfd, c, job, jobId, failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
+                        NotifyOnCompactionCompleted(cfd, c, job, jobId, ok ? null : failure ?? new RocksDbException(StatusCode.Incomplete, "Incomplete"));
+                    }
+                    catch (Exception e) when (e is IOException or RocksDbException or ObjectDisposedException)
+                    {
+                    }
                 }
-                else
+                lock (_mutex)
                 {
-                    if (isManual) _manualCompactionsRunning--;
-                    else _bgCompactionScheduled--;
-                    _backgroundJobs--;
-                    if (!cfd.Dropped) SchedulePendingCompaction(cfd);
-                    MaybeStartBottomPriorityCompactions();
-                    MaybeScheduleCompaction();
-                    SignalBackgroundWork();
+                    if (job is not null)
+                    {
+                        foreach (ulong n in job.CreatedFileNumbers) _pendingOutputs.Remove(n);
+                    }
+                    if (remote is not null)
+                    {
+                        foreach (ulong n in remote.CreatedFileNumbers) _pendingOutputs.Remove(n);
+                    }
+                    if (copiedFiles is not null)
+                    {
+                        foreach (ulong n in copiedFiles) _pendingOutputs.Remove(n);
+                    }
+                    cfd.CompactionState.Picker.ReleaseCompactionFiles(c, ok);
+                    ReleaseCompactionRoom(c);
+                    if (c.InputVersion is not null) Versions.UnrefVersion(c.InputVersion);
+                    if (!cfd.Dropped && cfd.Current is not null)
+                    {
+                        cfd.Current.Storage.ComputeCompactionScore();
+                    }
+                }
+                // LogAndApply can also fail before writing anything (dropped column family, a refused edit): only a MANIFEST
+                // I/O error (VersionSet::io_status_) leaves the record's fate unknown.
+                bool deleteOutputs = !ok && !(editSubmitted && Versions.IoStatus is not null);
+                if (deleteOutputs && job is not null)
+                {
+                    foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+                }
+                if (deleteOutputs && remote is not null)
+                {
+                    foreach (ulong n in remote.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+                }
+                if (deleteOutputs && copiedFiles is not null)
+                {
+                    foreach (ulong n in copiedFiles) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+                }
+                if (job is not null)
+                {
+                    foreach (Blob.BlobFileBuilder blobBuilder in job.BlobBuilders)
+                    {
+                        // Unregisters the pending blob outputs; a job that failed before its MANIFEST write deletes its blob files.
+                        ReleaseBlobOutputs(blobBuilder);
+                        blobBuilder.Dispose();
+                    }
+                }
+                try
+                {
+                    // Before the job is accounted as finished, so shutdown does not race with file deletion.
+                    PurgeObsoleteFiles();
+                }
+                catch (Exception e) when (e is IOException or RocksDbException)
+                {
+                    // Deleting obsolete files is best effort.
+                }
+            }
+            finally
+            {
+                // Always accounted, whatever the cleanup above threw (upstream has no exceptions here): a job that is
+                // never accounted as finished makes the close and WaitForCompact wait forever.
+                lock (_mutex)
+                {
+                    if (thread == CompactionThread.Bottom)
+                    {
+                        FinishBottomPriorityCompaction(cfd);
+                    }
+                    else
+                    {
+                        if (isManual) _manualCompactionsRunning--;
+                        else _bgCompactionScheduled--;
+                        _backgroundJobs--;
+                        if (!cfd.Dropped) SchedulePendingCompaction(cfd);
+                        MaybeStartBottomPriorityCompactions();
+                        MaybeScheduleCompaction();
+                        SignalBackgroundWork();
+                    }
                 }
             }
         }
@@ -1692,8 +1709,7 @@ internal sealed partial class DbImpl
             }
             else
             {
-                var run = new ManualRun(this, cfd, c, snapshots);
-                await BackgroundThreadPool.Low.RunAsync(static s => ((ManualRun)s!).RunAsync(), run).ConfigureAwait(false);
+                await new ManualRun(this, cfd, c, snapshots).StartAsync().ConfigureAwait(false);
             }
             if (compactionEnd is null) return baseLevel;
             beginKey = compactionEnd;
@@ -1703,6 +1719,22 @@ internal sealed partial class DbImpl
     private sealed class ManualRun(DbImpl db, ColumnFamilyData cfd, Compaction c, ulong[] snapshots)
     {
         public ValueTask RunAsync() => db.RunCompactionAsync(cfd, c, snapshots, CompactionThread.Manual, synchronous: false);
+
+        /// <summary>
+        /// Runs the compaction on the LOW pool. The compaction is registered (input files, counters) before this is
+        /// called and only the job releases that, so when no pool thread can be started it runs from the calling flow.
+        /// </summary>
+        public Task StartAsync()
+        {
+            try
+            {
+                return BackgroundThreadPool.Low.RunAsync(static s => ((ManualRun)s!).RunAsync(), this);
+            }
+            catch (Exception e) when (e is OutOfMemoryException or ThreadStartException or InvalidOperationException)
+            {
+                return RunAsync().AsTask();
+            }
+        }
     }
 
     /// <summary>
@@ -1803,9 +1835,8 @@ internal sealed partial class DbImpl
         }
         else
         {
-            var run = new ManualRun(this, cfd, c, snapshots);
             // Not cancellable once registered: the compaction must run (or fail) to release its input files.
-            await BackgroundThreadPool.Low.RunAsync(static s => ((ManualRun)s!).RunAsync(), run).ConfigureAwait(false);
+            await new ManualRun(this, cfd, c, snapshots).StartAsync().ConfigureAwait(false);
         }
         var names = new List<string>();
         if (c.InstalledFiles is { } files)

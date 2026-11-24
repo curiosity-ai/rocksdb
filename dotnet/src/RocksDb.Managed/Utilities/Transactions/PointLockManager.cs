@@ -246,7 +246,10 @@ internal sealed class PointLockManager : LockManager
                     {
                         // Timed waits take at most int.MaxValue ms; a longer timeout (or holder expiration) waits again
                         // after a clamped wait, as the loop re-checks the end time.
-                        var wait = TimeSpan.FromTicks(Math.Min(cvEnd - now, MaxTimedWaitMicros) * 10);
+                        // At least 1 ms: Task.Wait / WaitAsync truncate to whole milliseconds, so the last sub-millisecond
+                        // of a timeout returned at once and the loop spun (stripe lock, AcquireLocked, a new waiter)
+                        // until the deadline. Upstream's condvar waits with microsecond resolution.
+                        var wait = TimeSpan.FromTicks(Math.Clamp(cvEnd - now, 1000, MaxTimedWaitMicros) * 10);
                         if (synchronous) waiter.Task.Wait(wait, cancellationToken);
                         else await waiter.Task.WaitAsync(wait, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
                         cancellationToken.ThrowIfCancellationRequested();

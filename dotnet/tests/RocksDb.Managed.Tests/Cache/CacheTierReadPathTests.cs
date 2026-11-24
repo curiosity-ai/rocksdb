@@ -478,4 +478,68 @@ public sealed class CacheTierReadPathTests
             if (Directory.Exists(dir)) Directory.Delete(dir, true);
         }
     }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public void BlockCacheTierCloseRacingInsertsAndLookupsOnlyMisses(bool pipelineWrites)
+    {
+        // Audit #13: a Close under readers (a DB still reading through the tier) made an Insert add to a disposed queue
+        // (ObjectDisposedException) or dereference the cleared current file, and a lookup re-read the reader field that
+        // CloseFile had just cleared (NullReferenceException). Upstream's lookups use the file captured under the lock.
+        var failures = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        for (int round = 0; round < 25 && failures.IsEmpty; round++)
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "pcache-" + Guid.NewGuid().ToString("N"));
+            var tier = new BlockCacheTier(new PersistentCacheConfig(LocalFileSystem.Instance, dir, 4L << 20, writeBufferSize: 16 * 1024)
+            {
+                CacheFileSize = 64 * 1024, PipelineWrites = pipelineWrites,
+            });
+            try
+            {
+                tier.Open();
+                using var start = new ManualResetEventSlim();
+                int stop = 0;
+                var threads = new Thread[4];
+                for (int t = 0; t < threads.Length; t++)
+                {
+                    int id = t;
+                    threads[t] = new Thread(() =>
+                    {
+                        var rnd = new Random(id + 1);
+                        var value = new byte[700];
+                        var key = new byte[12];
+                        start.Wait();
+                        try
+                        {
+                            while (Volatile.Read(ref stop) == 0)
+                            {
+                                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(key, rnd.Next(2000));
+                                if ((id & 1) == 0) tier.Insert(key, value);
+                                else if (tier.TryLookup(key, out byte[] data, out int length) && length != value.Length) failures.Enqueue("length " + length);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            failures.Enqueue(e.GetType().Name + ": " + e.Message);
+                        }
+                    }) { IsBackground = true };
+                    threads[t].Start();
+                }
+                start.Set();
+                Thread.SpinWait(200_000 * (1 + round % 5));
+                tier.Close();
+                Thread.SpinWait(100_000);
+                Volatile.Write(ref stop, 1);
+                foreach (Thread t in threads) Assert.IsTrue(t.Join(30_000));
+            }
+            finally
+            {
+                tier.Close();
+                if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            }
+        }
+        Assert.IsTrue(failures.IsEmpty, string.Join(" | ", failures.Take(5)));
+    }
 }

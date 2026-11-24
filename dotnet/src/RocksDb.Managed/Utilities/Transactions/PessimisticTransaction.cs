@@ -26,6 +26,9 @@ internal class PessimisticTransaction : Transaction
     private int _nameLength;
     private protected ulong _logNumber;
     private long _expirationTime; // µs (PointLockManager.NowMicros); 0 = none
+    // In TransactionDatabase's expirable map. Stays set after Prepare zeroes _expirationTime: the lock entries keep the
+    // expiration recorded when the keys were locked, and a transaction missing from the map reads as "gone, steal".
+    private bool _inExpirableMap;
     private long _lockTimeout;    // µs; < 0 = infinite
     private bool _deadlockDetect;
     private int _deadlockDetectDepth;
@@ -82,7 +85,18 @@ internal class PessimisticTransaction : Transaction
         EnableIndexing();
         _batch.Batch.TrackTimestampSize = options.WriteBatchTrackTimestampSize;
         if (options.SetSnapshot) SetSnapshot();
-        if (_expirationTime > 0) _txnDb.InsertExpirableTransaction(_id, this);
+        if (_expirationTime > 0)
+        {
+            _txnDb.InsertExpirableTransaction(_id, this);
+            _inExpirableMap = true;
+        }
+    }
+
+    private void RemoveFromExpirableMap()
+    {
+        if (!_inExpirableMap) return;
+        _inExpirableMap = false;
+        _txnDb.RemoveExpirableTransaction(_id);
     }
 
     internal static long ToMicros(TimeSpan t) => t < TimeSpan.Zero ? -1 : t.Ticks / 10;
@@ -91,7 +105,6 @@ internal class PessimisticTransaction : Transaction
     {
         ThrowIfDisposed();
         if (_name is not null && State != TransactionState.Committed) _txnDb.UnregisterTransaction(this);
-        if (_expirationTime > 0) _txnDb.RemoveExpirableTransaction(_id);
         Clear();
         ReleaseSnapshots();
         _writeOptions = writeOptions ?? new WriteOptions();
@@ -495,8 +508,8 @@ internal class PessimisticTransaction : Transaction
                 _ => Invalid("Transaction is not in state for commit."),
             };
         }
-        // transaction can't expire after preparation
-        if (_expirationTime > 0) _txnDb.RemoveExpirableTransaction(_id);
+        // transaction can't expire after preparation. It stays in the expirable map (as upstream, which only zeroes
+        // expiration_time_): its lock entries still carry their expiration, and TryStealingLocks fails on Prepared.
         _expirationTime = 0;
 
         ValueTask p = PrepareInternalAsync(synchronous, cancellationToken);
@@ -599,11 +612,7 @@ internal class PessimisticTransaction : Transaction
             finally
             {
                 if (_name is not null) _txnDb.UnregisterTransaction(this);
-                if (_expirationTime > 0)
-                {
-                    _txnDb.RemoveExpirableTransaction(_id);
-                    _expirationTime = 0;
-                }
+                _expirationTime = 0;
                 Clear();
             }
             SetState(TransactionState.Committed);
@@ -768,6 +777,9 @@ internal class PessimisticTransaction : Transaction
     private protected override void Clear()
     {
         _txnDb.LockManager.UnLockAll(this, _tracked);
+        // After the locks are gone (commit, rollback, reinitialize): a transaction missing from the map while it
+        // still holds locks could be stolen from.
+        RemoveFromExpirableMap();
         base.Clear();
     }
 
@@ -898,7 +910,7 @@ internal class PessimisticTransaction : Transaction
     {
         DisposeWritePolicy();
         _txnDb.LockManager.UnLockAll(this, _tracked);
-        if (_expirationTime > 0) _txnDb.RemoveExpirableTransaction(_id);
+        RemoveFromExpirableMap();
         if (_name is not null && State != TransactionState.Committed) _txnDb.UnregisterTransaction(this);
         _markerBatch?.Dispose();
     }

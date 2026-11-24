@@ -35,12 +35,28 @@ internal sealed partial class DbImpl
     public async ValueTask DisableManualCompactionAsync(bool synchronous, CancellationToken ct)
     {
         ThrowIfDisposed();
+        CancellationTokenSource cancel;
         lock (_mutex)
         {
             _manualCompactionPaused++;
-            // Mark the running and queued manual compactions canceled, and wake the ones waiting to start.
-            _manualCompactionCancel.Cancel();
+            cancel = _manualCompactionCancel;
             SignalBackgroundWork();
+        }
+        // Mark the running and queued manual compactions canceled. Outside the mutex: Cancel runs the callbacks
+        // registered on the linked tokens synchronously, and those tokens are handed to user code (a
+        // CompactionService), which must not run under the DB mutex (upstream only sets atomic flags). A compaction
+        // that starts in between links to the same source, or sees manual_compaction_paused_.
+        try
+        {
+            cancel.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // A concurrent EnableManualCompaction replaced the source: nothing left to cancel.
+        }
+        catch (AggregateException)
+        {
+            // A callback threw; the cancellation itself took effect.
         }
         // Wait for any pending manual compactions to finish (typically through failing with Status::Incomplete).
         while (true)

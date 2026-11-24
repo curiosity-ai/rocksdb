@@ -114,7 +114,9 @@ internal sealed partial class DbImpl
     {
         if (options?.Snapshot is not null) return Math.Max(snapshot, cb.MaxVisibleSeq);
         cb.Refresh(snapshot);
-        return snapshot;
+        // "The unprep_seqs are not published for write unprepared, so it could be that max_visible_seq is larger. Seek
+        // to the std::max of the two." (Refresh keeps max_visible_seq >= snapshot.)
+        return Math.Max(snapshot, cb.MaxVisibleSeq);
     }
 
     /// <summary>

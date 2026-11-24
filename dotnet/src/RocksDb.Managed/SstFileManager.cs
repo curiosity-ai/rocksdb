@@ -290,7 +290,10 @@ public sealed class SstFileManager : IDisposable
                 Task previous = _recoveryTask;
                 _recoveryTask = Task.Run(async () =>
                 {
-                    await previous.ConfigureAwait(false);
+                    // Whatever ended the previous run (an unexpected exception from a file system or a listener): a
+                    // faulted link must not stop every later recovery from running.
+                    try { await previous.ConfigureAwait(false); }
+                    catch (Exception e) when (e is not OutOfMemoryException) { }
                     await ClearErrorAsync().ConfigureAwait(false);
                 });
             }
@@ -345,8 +348,10 @@ public sealed class SstFileManager : IDisposable
                 {
                     s = await handler.RecoverFromBgErrorAsync(isManual: false, run, synchronous: false).ConfigureAwait(false);
                 }
-                catch (Exception e) when (e is RocksDbException or IOException or ObjectDisposedException)
+                catch (Exception e) when (e is not OutOfMemoryException)
                 {
+                    // Any failure is this recovery's status (upstream returns a Status): an exception leaving here would
+                    // end the polling loop with this DB still marked as the one being recovered.
                     s = RocksDbException.FromException(e);
                 }
                 finally
@@ -370,12 +375,15 @@ public sealed class SstFileManager : IDisposable
                     }
                 }
             }
-            bool empty;
-            lock (_lock) empty = _errorHandlers.Count == 0;
-            if (empty)
+            // One critical section, as in SstFileManagerImpl::ClearError: a StartErrorRecovery between the check and
+            // the reset would lose the error it just recorded.
+            lock (_lock)
             {
-                lock (_lock) _bgError = null;
-                return;
+                if (_errorHandlers.Count == 0)
+                {
+                    _bgError = null;
+                    return;
+                }
             }
             try
             {
@@ -464,7 +472,10 @@ public sealed class SstFileManager : IDisposable
         public void DeleteFile(string path, string dirToSync, bool forceBackground)
         {
             ulong totalSize = _sfm.TotalSize;
-            if (!IsTrashFile(path) && (RateBytesPerSecond <= 0 ||
+            bool disposed;
+            lock (_lock) disposed = _disposed;
+            // After Dispose nobody empties the trash (and a WaitForEmptyTrash would never return): delete now.
+            if (disposed || !IsTrashFile(path) && (RateBytesPerSecond <= 0 ||
                                        (!forceBackground && TotalTrashSize > totalSize * MaxTrashDbRatio)))
             {
                 DeleteFileImmediately(path);
@@ -548,10 +559,19 @@ public sealed class SstFileManager : IDisposable
                             _fs.DeleteFile(item.TrashPath);
                             if (item.Dir.Length != 0) _fs.SyncDirectory(item.Dir);
                         }
-                        catch (Exception e) when (e is IOException or RocksDbException)
+                        catch (Exception e) when (e is not OutOfMemoryException)
+                        {
+                            // Best effort, whatever the file system throws (upstream: a Status that is logged). An
+                            // exception leaving this loop ended the worker for good: no trash was deleted any more and
+                            // WaitForEmptyTrash never returned.
+                        }
+                        try
+                        {
+                            _sfm.OnDeleteFile(item.TrashPath);
+                        }
+                        catch (Exception e) when (e is not OutOfMemoryException)
                         {
                         }
-                        _sfm.OnDeleteFile(item.TrashPath);
                         Interlocked.Add(ref _totalTrashSize, -(long)item.Size);
                     }
                     finally

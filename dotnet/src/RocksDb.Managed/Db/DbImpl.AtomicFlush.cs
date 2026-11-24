@@ -219,41 +219,48 @@ internal sealed partial class DbImpl
                     ScheduleFlushRetryAfterBackoff(null);
                 }
             }
-            TestHooks.Invoke("DBImpl::BackgroundCallFlush:FlushFinish:0");
-            if (toDelete is not null) DiscardAtomicFlushOutputs(toDelete);
-            // Need to undo atomic flush if something went wrong: the error is recorded (a failure found while waiting to
-            // install is the background error, the MANIFEST error or shutdown, already recorded).
-            if (s is not null && !skipSetBgError && !waitFailed && !IsColumnFamilyDropped(s) && s is not ObjectDisposedException)
-            {
-                SetBackgroundError(s, Versions.IoStatus is not null ? BackgroundErrorReason.ManifestWriteNoWal : BackgroundErrorReason.FlushNoWal,
-                    walRelated: false);
-            }
-            if (members is not null)
-            {
-                // Release the blob builders of the results (committed ones keep their files).
-                foreach (AtomicFlushMember m in members)
-                {
-                    if (m.Result?.BlobBuilder is { } b)
-                    {
-                        ReleaseBlobOutputs(b);
-                        b.Dispose();
-                    }
-                }
-            }
             try
             {
-                PurgeObsoleteFiles();
+                TestHooks.Invoke("DBImpl::BackgroundCallFlush:FlushFinish:0");
+                if (toDelete is not null) DiscardAtomicFlushOutputs(toDelete);
+                // Need to undo atomic flush if something went wrong: the error is recorded (a failure found while waiting to
+                // install is the background error, the MANIFEST error or shutdown, already recorded).
+                if (s is not null && !skipSetBgError && !waitFailed && !IsColumnFamilyDropped(s) && s is not ObjectDisposedException)
+                {
+                    SetBackgroundError(s, Versions.IoStatus is not null ? BackgroundErrorReason.ManifestWriteNoWal : BackgroundErrorReason.FlushNoWal,
+                        walRelated: false);
+                }
+                if (members is not null)
+                {
+                    // Release the blob builders of the results (committed ones keep their files).
+                    foreach (AtomicFlushMember m in members)
+                    {
+                        if (m.Result?.BlobBuilder is { } b)
+                        {
+                            ReleaseBlobOutputs(b);
+                            b.Dispose();
+                        }
+                    }
+                }
+                try
+                {
+                    PurgeObsoleteFiles();
+                }
+                catch (Exception e) when (e is IOException or RocksDbException)
+                {
+                    // Deleting obsolete files is best effort.
+                }
             }
-            catch (Exception e) when (e is IOException or RocksDbException)
+            finally
             {
-                // Deleting obsolete files is best effort.
-            }
-            lock (_mutex)
-            {
-                // BackgroundCallFlush: MaybeScheduleFlushOrCompaction; atomic_flush_install_cv_.SignalAll(); bg_cv_.SignalAll().
-                MaybeScheduleFlush();
-                if (counted) _backgroundJobs--;
-                SignalBackgroundWork();
+                // Always accounted, whatever the cleanup above threw: the close waits for _backgroundJobs.
+                lock (_mutex)
+                {
+                    // BackgroundCallFlush: MaybeScheduleFlushOrCompaction; atomic_flush_install_cv_.SignalAll(); bg_cv_.SignalAll().
+                    MaybeScheduleFlush();
+                    if (counted) _backgroundJobs--;
+                    SignalBackgroundWork();
+                }
             }
         }
         return s is null || IsColumnFamilyDropped(s) ? null : RocksDbException.FromException(s);

@@ -2617,3 +2617,82 @@ Residuals (documented in architecture.md, README, `RocksDatabase` remarks):
 - Close (`DisposeAsync`) is unchanged: sync writes racing it wait for the pool, then fail with ObjectDisposed.
 - `UnlockWAL` (sync only) waits for an async FlushWAL's I/O in a DB that never had a sync writer (pre-existing, no
   writers involved).
+
+## Audit #13: multi-threading (2026-11-23)
+
+Scope: locks, signals, semaphores, wait/notify ports and lock-free structures of the whole port, read side by side with
+the C++ they port: the write path (write_thread.cc, db_impl_write.cc, write_controller.cc, write_buffer_manager.cc), DB
+state and background work (db_impl*.cc, version_set.cc, column_family.cc, error_handler.cc, table_cache.cc,
+threadpool_imp.cc), memtable and caches (inlineskiplist.h, concurrent_arena.cc, lru_cache.cc, clock_cache.cc,
+utilities/persistent_cache), transactions (lock/point, lock/range, pessimistic_transaction*.cc, write_prepared_txn_db.cc,
+write_unprepared_txn*.cc, optimistic_transaction*.cc), env / table / blob / backup, and the replication layer (no C++
+original). A tree-wide sweep covered every `SemaphoreSlim`, `Monitor.Wait/Pulse`, `TaskCompletionSource`, blocking
+`.Wait()` / `GetResult()`, thread-static and lazy-init site of the core library.
+
+Found correct (no change): the writer state machine and pooled `IValueTaskSource` writers, group / parallel / pipelined
+/ two-queue protocols and their lock order, `_bgSignal` (bg_cv_) waits, SuperVersion / Version / MemTable reference
+counts, `LogAndApply`, pending outputs, flush commit ordering, `BackgroundThreadPool` accounting, `TableCacheStore`,
+InlineSkipList publication order and barriers, ConcurrentArena, LRU cache, the fixed HyperClock table's meta word
+protocol, block / handle reference counts, the range tombstone cache, point and range lock wake-ups and deadlock
+detection, the WritePrepared commit cache / snapshot cache / prepared heap protocols (line for line with upstream),
+OCC bucket ordering, GenericRateLimiter, AsyncBroadcastSignal, parallel compression, BlobSource. No blocking call inside
+a `lock`, no lock held across an await by manual Enter/Exit, every semaphore Wait paired with a Release in finally.
+
+### Fixed (regression tests in `Validation/Audit13ThreadingTests.cs` unless noted)
+
+| # | Finding | C++ reference | Effect before the fix |
+|---|---|---|---|
+| 1 | `unordered_write`: a writer that counted `pending_memtable_writes_` down to 0 and was preempted before signalling completed a waiter that had registered for a later group's inserts (`SignalPendingWritesDrained` did not re-check the count) | db_impl.h WaitForPendingWrites: `switch_cv_.wait(guard, [&]{ return pending_memtable_writes_.load() == 0; })` | a memtable switch, flush, close or column family change ran with an insert in flight: the entry could land in the new memtable with its WAL record in the old WAL (lost after a crash once that WAL is released) |
+| 2 | Prepare removed an expirable transaction from the expirable map; the lock entries keep their expiration, and "not in the map" reads as "gone" | pessimistic_transaction.cc Prepare only zeroes `expiration_time_`; `TryStealingLocks` fails on PREPARED | another transaction took the keys of a prepared transaction after its expiration; both committed |
+| 3 | Point reads racing close: a `Get` past the disposed check reads through table readers that only its version pins; close disposed them (index / filter blocks back to the pools) | closing under a read is undefined upstream; the port promises the value or ObjectDisposedException | `ArgumentOutOfRangeException` (reproduced), possibly a wrong result. Readers are now closed with the last referenced super version |
+| 4 | WriteUnprepared, unbacked read with a callback read at the published sequence | db_impl.cc GetImpl: `snapshot = callback->max_visible_seq()` after Refresh | with `two_write_queues` a transaction did not read its own flushed (unprepared) batches |
+| 5 | `WaitForSequenceAsync` (WAL tailers) not signalled where LastSequence is raised outside a write group (`SyncLastSequenceWithAllocated`, `WriteRecoverableState`, resume after a WAL error) | none (managed addition) | a tailer slept until the next main-queue write |
+| 6 | `PrimaryWriteGate.HoldAsync`: a second holder replaced the drain signal the first waited on (test in `BuildingBlockTests`) | none | `PairNodeHost.DisposeAsync` racing a handoff never returned |
+| 7 | A processor's super version slot shared by two readers could be left holding an obsolete super version (was a recorded deviation) | column_family.cc: slots are per thread | memtables and files pinned until the next read on that slot; after close, never released |
+| 8 | Two-queue commit / rollback: the caller's cancellation token reached the second (commit-only) write (the test pins the behaviour; the stalled case is not reproduced) | no cancellation upstream | a cancellation during a stall left the first write prepared forever (visible only after a reopen) |
+| 9 | `DisableManualCompaction` cancelled the token source under the DB mutex (tokens are handed to a `CompactionService`); `SstFileManager.ClearErrorAsync` checked and cleared in two critical sections; `BlockCacheTier` caught `IOException` where the file systems throw `RocksDbException` (no new test) | atomic flags only; sst_file_manager_impl.cc ClearError; block_cache_tier.cc returns Status | user callbacks under the mutex; a just-recorded error lost; an I/O error on a cache file failed a user read or ended a cache thread |
+
+### Follow-up fixes (second pass; each with a test that fails without the fix unless noted)
+
+| Area | Finding | Fix |
+|---|---|---|
+| Close | Close did not wait for a foreground purge (iterator release, ingestion, column family drop, recovery); upstream CloseHelper waits on `pending_purge_obsolete_files_` | `PurgeObsoleteFiles` counts itself under the mutex; the close waits for the count and purges alone once it has begun (`CloseWaitsForAForegroundPurge`) |
+| Close | Close joined only the automatic recovery task; a manual `Resume` or the SstFileManager's recovery went on after the close (upstream waits on `IsRecoveryInProgress`) | `ResumeImpl` calls are counted; the close refuses new ones and waits for those in flight before it takes the write queue, except when called from inside that recovery (a listener) (`CloseWaitsForARunningManualRecovery`) |
+| Exception safety | Flush, atomic flush and compaction skipped their job accounting when the cleanup threw anything but IOException / RocksDbException; the bottom-priority repick and `FlushCommitInProgress` likewise | accounting in an inner finally; the flag and counters are released on any exception (`UnexpectedExceptionInFlushCleanupDoesNotHangTheClose`; the compaction, repick and commit-flag sites have no test) |
+| Exception safety | A failed thread start in `SwitchTo` (write wake-up while leading) or for a manual compaction left the leader / the job registered forever | the continuation falls back to the .NET thread pool; the manual compaction runs from the calling flow (no test: needs thread exhaustion) |
+| HyperClock (automatic table) | A callback run under the mutator gate (eviction handler, a value's Dispose) that re-entered the shard deadlocked with a concurrent grow | the thread is marked while it runs such code; its re-entry does not wait for the grow, does not start one, and trusts its lookup miss (`EvictionHandlerReenteringTheShardDoesNotDeadlockWithAGrow`) |
+| HyperClock | A throwing eviction handler or Dispose left the slot under construction and its charge / occupancy accounted | the slot is always emptied and accounted (`ThrowingEvictionHandlerDoesNotLeakTheSlotOrItsCharge`) |
+| BlockCacheTier | `Close` racing inserts (disposed queue, cleared current file) and lookups (reader field re-read after `CloseFile`) threw into table reads | queue lock around add / quit / dispose, closed check in the insert, reader captured under the file lock (`BlockCacheTierCloseRacingInsertsAndLookupsOnlyMisses`) |
+| Replication, pair | A restarted primary admitted client writes before `StartAsync` had settled its role | `PairNodeHost.WriteAsync` waits for the start within the caller's hold timeout, else answers NotPrimary |
+| Replication, cluster | No leader write gate: a write admitted before a step-down was applied interleaved with follower ingest | client writes pass a gate that closes when leadership is lost and is drained before the follower reads its log end; chunks are applied under an ingest lock that a new leader waits for before its first entry |
+| Replication, smaller | failed / cancelled `ForcePromoteAsync` left no follower stream; election timer not re-armed when a campaign start threw; `ProgressReporter` faulted on a non-OperationCanceled cancellation; a cancelled follower loop could trigger a resync; a promotion could reopen the write gate after dispose; heartbeat answers after dispose | reattach in finally; timer reset and term persisted before the role; loop swallows exceptions once cancelled; cancellation checked before the resync; `PrimaryWriteGate.Seal`; disposed check under the gate (tests in `Audit13ReplicationThreadingTests`; the last three by reading only or a gate-level test) |
+
+Behaviour changes: a pair-host write arriving during startup waits or gets NotPrimary (it was applied before); a deposed
+cluster leader with a write in flight always rebuilds from a snapshot; a cluster follower's chunk ingest is not
+cancellable once started. New public members: `PrimaryWriteGate.Seal`, `PrimaryWriteGate.DrainAsync`,
+`RaftClusterNode.QuiesceLogBeforeLeadingAsync`.
+
+### Third pass: the remaining open items
+
+| Area | Finding | Fix | Test |
+|---|---|---|---|
+| Thread pool | Synchronous `Dispose` waited for the automatic recovery, a thread-pool task that needed pool threads to observe the shutdown | the recovery runs on a dedicated thread with synchronous waits (upstream: recovery_thread_) | `Audit13ThreadPoolTests.DisposeDuringAutoRecoveryDoesNotNeedThePool` |
+| Thread pool | Synchronous backup / verify / restore with `MaxBackgroundOperations > 1` blocked on thread-pool workers | the caller is one worker, the others are dedicated threads | `SynchronousParallelBackupDoesNotNeedThePool` |
+| Thread pool | OCC parallel validation: an asynchronous committer got its bucket or finished its write through a pool continuation while synchronous committers blocked on the bucket | once the DB has had a synchronous committer, asynchronous commits take buckets and write synchronously (the audit #12 rule) | `OptimisticParallelValidationMixedCommitsDoNotNeedThePool` |
+| HyperClock (automatic table) | A slow eviction handler under the mutator gate stalled every insert, erase and lookup miss of the shard during a grow | the evicted value is moved out of the slot and the handler runs after the thread left the gate | `HyperClockCacheTests.SlowEvictionHandlerDoesNotStallTheShard` |
+| Env | `FileSyncWorkers` started a worker only when none was idle, so two requests could queue behind one idle worker | a worker is started when queued requests outnumber idle workers | none |
+| SstFileManager | The trash worker and the recovery chain ended for good on an unexpected exception type; a delete after Dispose queued trash nobody empties | any exception is the operation's status; deletes after Dispose are immediate | none |
+| Write buffer manager | A wake-up meant for an earlier stall round could end the next one | the stall conditions are re-checked after a wake-up | none |
+| Lock managers | Timed lock waits spun for the last sub-millisecond (the waits truncate to whole milliseconds) | the wait is at least 1 ms | none |
+| Replication | Resync flag stuck on an unexpected exception; linked CancellationTokenSources leaked per attach and per leadership; a cluster with no peers never advanced its commit index | flag released / rebuild continued on any exception; the sources are no longer linked (dispose cancels the current one); a leader without peers commits from its own log | `Audit13ReplicationThreadingTests` (resync on the cluster host, single-node commit); the rest by reading |
+
+Behaviour changes: with parallel validation, an asynchronous optimistic commit blocks its caller for the commit once the
+DB has had a synchronous committer; the automatic HyperClock table allocates one small object per eviction when an
+eviction handler (a secondary cache) is installed, and the handler sees the entry after its slot was emptied; a
+single-node cluster commits its writes.
+
+### Still open
+
+- First-synchronous-committer window (OCC parallel validation), as for the write path in audit #12: an asynchronous
+  commit already waiting or writing when the first synchronous committer arrives still finishes on the pool.
+- The four fixes without a test above were made from reading only.

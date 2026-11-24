@@ -490,3 +490,21 @@ Still open from this round:
 - [x] Restart-point binary search fast path with next-probe prefetch (index seek 151 -> ~105 ns), merging-heap sift fetches each child key once, MultiGet sorts bytewise keys by 8-byte prefixes (absent-key batch -18%), exact-type dispose of evicted blocks
 - [x] New benchmarks: `MemTableFlushScanBenchmarks` (flush read pattern), `MultiGetFilterBenchmarks` (2M-key SST, absent / present batches)
 - [ ] Not kept / open: MultiGet filter prefetch (slower on this CPU), huge pages for memtable arenas (1 MiB slabs; needs advised superblocks), deeper skiplist-iterator prefetch (no change)
+
+## Audit #13 (2026-11-23; docs/validation.md "Audit #13: multi-threading")
+
+- [x] unordered_write: stale "pending writes drained" wake-up released a memtable switch / close under an insert in flight
+- [x] Locks of a prepared expirable transaction could be stolen
+- [x] Point reads racing close read through disposed table readers (readers now close with the last super version)
+- [x] WriteUnprepared + two_write_queues: transaction did not read its own unprepared batches
+- [x] WAL tailers not woken when an unbatched operation publishes WAL-only sequence numbers
+- [x] `PrimaryWriteGate`: two concurrent holds lost a wake-up; obsolete super version left in a shared processor slot; second commit write of two-queue transactions cancellable; cancel under the DB mutex; persistent cache I/O error filters
+- [x] Close waits for foreground purges and for a manual / SstFileManager recovery in flight (CloseHelper)
+- [x] Background job accounting released on any exception; pool thread start failure no longer strands a write leader or a manual compaction
+- [x] HyperClock automatic table: callbacks re-entering the shard vs a grow; throwing eviction handler / Dispose; `BlockCacheTier.Close` racing inserts and lookups
+- [x] Replication: restarted pair primary waits for its role before admitting writes; cluster leader write gate; `ForcePromoteAsync` reattach; election timer re-armed; `ProgressReporter`; gate sealed at dispose
+- [x] Thread-pool dependent sync waits: `Dispose` on auto recovery (dedicated thread), synchronous parallel backup (dedicated threads), OCC parallel validation behind an async commit (synchronous once a sync committer exists)
+- [x] HyperClock automatic table: eviction handler runs outside the mutator gate
+- [x] FileSyncWorkers start rule, trash worker / recovery chain exception types, write buffer manager stall re-check, sub-millisecond lock wait spin
+- [x] Replication: resync flag on unexpected exceptions, linked CTS leaks, single-node commit index
+- [ ] OCC parallel validation: first-synchronous-committer window (async commits in flight finish on the pool)

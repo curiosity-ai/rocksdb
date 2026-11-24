@@ -91,8 +91,11 @@ internal sealed partial class DbImpl
     /// </summary>
     private void SyncPublishedSequenceWhileUnbatched()
     {
+        ulong before = Versions.LastSequence;
         Versions.SyncLastSequenceWithAllocated();
         if (!_lastSeqSameAsPublishSeq && Versions.LastPublishedSequence < Versions.LastSequence) Versions.SetLastPublishedSequence(Versions.LastSequence);
+        // WaitForSequenceAsync waits on LastSequence: every site that raises it signals.
+        if (Versions.LastSequence != before) NotifySequenceWaiters();
     }
 
     /// <summary>Releases what EnterUnbatched took: the main queue and, with two write queues, the second one.</summary>
@@ -410,6 +413,7 @@ internal sealed partial class DbImpl
             Versions.SetLastPublishedSequence(lastSeq);
         }
         Versions.SetLastSequence(lastSeq);
+        NotifySequenceWaiters();
         if (RecoverableStatePreReleaseCallback is { } cb)
         {
             for (ulong subBatchSeq = seq + 1; subBatchSeq < nextSeq; subBatchSeq++) cb.Callback(subBatchSeq, isMemDisabled: false, logNumber: 0, 0, 1);
