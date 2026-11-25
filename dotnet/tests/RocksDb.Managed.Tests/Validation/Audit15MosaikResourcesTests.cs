@@ -160,6 +160,69 @@ public sealed class Audit15MosaikResourcesTests
         CollectionAssert.AreEquivalent(archived, Directory.GetFiles(dir.Path + "/wal/archive", "*.log"));
     }
 
+    /// <summary>
+    /// FindObsoleteFiles frees the alive WALs below job_context->log_number = MinLogNumberToKeep() =
+    /// versions_->min_log_number_to_keep() (db_impl_files.cc), the value the last flush commit recorded
+    /// (PrecomputeMinLogNumberToKeepNon2PC), not the current minimum over the column families' log numbers. The two
+    /// differ when an idle column family's log number is advanced in memory by a WAL switch (SwitchMemtable: "if CF is
+    /// empty ... advance its log number", no MANIFEST write) after the last commit: the WAL it held stays until the next
+    /// flush commit records a larger minimum. The port freed it at once from the live minimum, which under Mosaik's
+    /// low-resource 1 MiB max_total_wal_size released the oldest WAL earlier and started the next SwitchWAL round of all
+    /// 31 families sooner: 1277-1860 flush jobs for a 100 MiB burst against native's 121-204 (audit #15).
+    /// </summary>
+    [TestMethod]
+    [DoNotParallelize] // TestHooks are process-wide
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public void WalsAreFreedOnlyBelowTheRecordedMinLogNumberToKeep()
+    {
+        const string hook = "DBImpl::FlushMemTables:Start";
+        using var gate = new ManualResetEventSlim(false);
+        int armed = 0;
+        TestHooks.Set(hook, () =>
+        {
+            if (Interlocked.Exchange(ref armed, 0) == 1) Assert.IsTrue(gate.Wait(30_000), "flush gate not released");
+        });
+        try
+        {
+            MemoryFileSystem fs = Db.DbTestUtil.NewFs();
+            var o = new DbOptions { CreateIfMissing = true, CreateMissingColumnFamilies = true, FileSystem = fs, MaxBackgroundFlushes = 1, MaxBackgroundCompactions = 1 };
+            var cfs = new List<ColumnFamilyDescriptor> { new("default", new ColumnFamilyOptions()) };
+            foreach (string n in new[] { "x", "y", "z" }) cfs.Add(new ColumnFamilyDescriptor(n, new ColumnFamilyOptions()));
+            using RocksDatabase db = RocksDatabase.Open("/a15-minlog", o, cfs);
+            ColumnFamily x = db.GetColumnFamily("x"), y = db.GetColumnFamily("y"), z = db.GetColumnFamily("z");
+            var noWait = new FlushOptions { Wait = false };
+            x.Put(Key(1), new byte[10]);
+            y.Put(Key(2), new byte[10]);
+            // x's switch starts WAL 2 (its flush held); y's switch starts WAL 3 with x's flush still pending, so x's commit
+            // leaves x at WAL 2 below the current WAL, and y's commit records min_log_number_to_keep = 2 (x's).
+            Interlocked.Exchange(ref armed, 1);
+            x.Flush(noWait);
+            ulong wal2 = db.Impl.CurrentWalNumber;
+            y.Put(Key(3), new byte[10]);
+            y.Flush(noWait);
+            gate.Set();
+            db.WaitForCompact();
+            gate.Reset();
+            Assert.AreEqual(wal2.ToString(System.Globalization.CultureInfo.InvariantCulture), db.GetProperty("rocksdb.min-log-number-to-keep"));
+            // z's switch starts WAL 4 and advances the idle x past WAL 2 in memory; with z's flush held nothing records it.
+            z.Put(Key(4), new byte[10]);
+            Interlocked.Exchange(ref armed, 1);
+            z.Flush(noWait);
+            db.Impl.PurgeObsoleteFiles();
+            bool kept = false;
+            foreach (WalFileInfo w in db.GetSortedWalFiles()) kept |= w.LogNumber == wal2;
+            gate.Set();
+            db.WaitForCompact();
+            Assert.IsTrue(kept, "WAL " + wal2 + " was freed before a flush recorded min_log_number_to_keep past it");
+            db.Impl.PurgeObsoleteFiles();
+            foreach (WalFileInfo w in db.GetSortedWalFiles()) Assert.IsTrue(w.LogNumber > wal2, "WAL " + w.LogNumber + " left after z's flush commit");
+        }
+        finally
+        {
+            TestHooks.Set(hook, null);
+        }
+    }
+
     private sealed class FlushConcurrencyListener : EventListener
     {
         private int _running;

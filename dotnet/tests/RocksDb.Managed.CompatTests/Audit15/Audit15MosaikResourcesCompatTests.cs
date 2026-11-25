@@ -497,6 +497,8 @@ public sealed class Audit15MosaikResourcesCompatTests
         string ns = p.NativeProfile.DbOptions.GetStatisticsString();
         long nAdds = TickerCount(ns, "rocksdb.block.cache.data.add");
         long mAdds = (long)p.ManagedProfile.DbOptions.Statistics!.GetTickerCount(Ticker.BlockCacheDataAdd);
-        Assert.AreEqual(nAdds, mAdds, nAdds / 50, t);
+        // Cache keys derive from each DB's random session id, so which blocks share a shard (and are evicted together
+        // while shrunk) differs from run to run: within 5%.
+        Assert.AreEqual(nAdds, mAdds, nAdds / 20, t);
     }
 }
