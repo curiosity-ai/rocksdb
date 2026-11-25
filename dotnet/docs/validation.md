@@ -2918,7 +2918,7 @@ Unless noted, these behave the same on both engines.
   fault-injecting file system with kSkipAnyCorruptedRecords: no phantoms, batches whole across families, writes
   covered by a completed flush or full compaction survive. 160 short runs with fresh seeds and 60 s runs of every
   configuration passed; `SoakChecksReportInjectedDefects` shows the checks catch torn batches and values, stale values
-  and unknown keys.
+  and unknown keys. Again on the merged tree (all audit #15 fixes): 25 unit and 4 compat runs of 10 s, all passed.
 - Resources: write buffer manager reservation per arena block and release with the memtable, ShouldFlushNow, the
   inline and shard blocks, the oldest-memtable choice skipping pending flushes; the content memtable cut at 64,378
   entries on both engines with cur-size-active-mem-table 134,223,856 (native) and 134,219,776 (managed); `CreateLru`

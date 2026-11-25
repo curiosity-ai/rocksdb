@@ -2091,7 +2091,7 @@ side on the 4-core VM (ext4), medians:
 | fillrandom | 1.142 us/op | 1.091 us/op | 0.96 |
 | overwrite | 1.250 us/op | 1.244 us/op | 0.99 |
 
-Run-to-run spread was 1.06-1.33 / 1.10-1.18 (fillrandom) and 1.16-1.32 / 1.19-1.32 (overwrite): no regression, and
+Run-to-run spread (with / without) was 1.06-1.33 / 1.10-1.18 (fillrandom) and 1.16-1.32 / 1.19-1.32 (overwrite): no regression, and
 no gain beyond noise either. An earlier 3-round run at 500k ops including fillseq (0.78 / 0.75 us/op medians) was too
 noisy to separate.
 
