@@ -54,6 +54,6 @@ internal sealed class BlockReadAmpBitmap
     private bool GetAndSet(uint bitIdx)
     {
         int mask = 1 << (int)(bitIdx % BitsPerEntry);
-        return (Interlocked.Or(ref _bitmap[bitIdx / BitsPerEntry], mask) & mask) != 0;
+        return (Util.AtomicBits.Or(ref _bitmap[bitIdx / BitsPerEntry], mask) & mask) != 0;
     }
 }

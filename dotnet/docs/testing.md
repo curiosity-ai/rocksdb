@@ -51,6 +51,9 @@ Add `--no-build` after a solution build to skip the per-project build. A test pr
 `dotnet run --project tests/RocksDb.Managed.Tests -f net10.0 -- --filter ...` works too.
 
 Before committing, the solution must build with zero warnings on both TFMs, and the unit and compat tests must pass.
+`dotnet test` builds Debug IL, whose Tier0 code differs from a Release build's. A JIT bug that only a Release build on
+one runtime hits stays invisible there (audit #15: .NET 11.0.0's Tier0 `Interlocked.Or` / `And`, see `AtomicBitsTests`),
+so run the unit tests once with `-c Release -f net11.0` after changing atomics or other low-level code.
 The round-trip and replication suites take longer. Run them when you change formats, recovery, the WAL, compaction
 or the replication layer.
 
