@@ -109,6 +109,97 @@ public sealed class Audit15MosaikSoakCompatTests
         Assert.IsTrue(managed[0] > 128L << 20, "the content arena block is charged at open: " + managed[0]);
     }
 
+    /// <summary>
+    /// Mosaik's CleanOldWalArchive deletes archived WALs behind the engine's back (RocksDbBase.cs:1078). A checkpoint
+    /// (and a backup: both go through GetLiveFilesStorageInfo) lists the WALs with GetSortedWalFilesImpl, which includes
+    /// the archive; upstream's WalManager::GetSortedWalsOfType returns the GetFileSize error of an archived file deleted
+    /// between GetChildren and the size read (only an alive WAL moved to the archive is retried), so the native checkpoint
+    /// fails. The port does not list the archive for a checkpoint (only alive WALs are copied, upstream too) and skips an
+    /// archived WAL that vanished while listing: its checkpoints never fail this way. Archived WALs are created and deleted
+    /// in a loop while checkpoints are taken; native failures are printed (upstream behaviour), managed ones fail the test.
+    /// </summary>
+    [TestMethod]
+    public void CheckpointsWhileArchivedWalsAreDeletedBehindTheEngine()
+    {
+        string Run(Action<string> checkpoint, string dir, string wal)
+        {
+            string archive = Path.Combine(wal, "archive");
+            Directory.CreateDirectory(archive);
+            using var stop = new CancellationTokenSource();
+            // About 200 archived files at any time, each deleted and written again in turn: a listing sees many files, and
+            // any of them may be gone before its size is read.
+            for (int n = 0; n < 200; n++) File.WriteAllBytes(Path.Combine(archive, (10 + n).ToString("D6") + ".log"), new byte[16]);
+            var churn = new Thread(() =>
+            {
+                for (int n = 0; !stop.IsCancellationRequested; n = (n + 1) % 200)
+                {
+                    string f = Path.Combine(archive, (10 + n).ToString("D6") + ".log");
+                    try
+                    {
+                        File.Delete(f);
+                        File.WriteAllBytes(f, new byte[16]);
+                    }
+                    catch (IOException)
+                    {
+                    }
+                }
+            });
+            churn.Start();
+            int failures = 0, taken = 0;
+            string? first = null;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                for (int i = 0; sw.Elapsed < TimeSpan.FromSeconds(3); i++)
+                {
+                    string cp = Path.Combine(dir, "cp-" + i);
+                    try
+                    {
+                        checkpoint(cp);
+                        taken++;
+                    }
+                    catch (Exception e) when (e is RocksDbSharp.RocksDbException or RocksDbException)
+                    {
+                        failures++;
+                        first ??= e.Message;
+                    }
+                    if (Directory.Exists(cp)) Directory.Delete(cp, recursive: true);
+                }
+            }
+            finally
+            {
+                stop.Cancel();
+                churn.Join();
+            }
+            return taken + " checkpoints, " + failures + " failed" + (first is null ? "" : " (first: " + first + ")");
+        }
+
+        string managedResult, nativeResult;
+        using (var dir = new TempDir("a15-archive-m"))
+        {
+            string wal = Path.Combine(dir.Path, "wal");
+            var p = new MosaikProfile(wal, lowMemoryMode: true, processorCount: 2);
+            using RocksDatabase db = p.Open(Path.Combine(dir.Path, "db"));
+            db.GetColumnFamily("nodes").Put([1], [2]);
+            managedResult = Run(cp => db.CreateCheckpoint(cp, 0), dir.Path, wal);
+        }
+        using (var dir = new TempDir("a15-archive-n"))
+        {
+            string wal = Path.Combine(dir.Path, "wal");
+            var p = new NativeMosaikProfile(wal, lowMemoryMode: true, processorCount: 2);
+            using RocksDbSharp.RocksDb db = p.Open(Path.Combine(dir.Path, "db"));
+            db.Put(new byte[] { 1 }, new byte[] { 2 }, db.GetColumnFamily("nodes"));
+            nativeResult = Run(cp =>
+            {
+                using RocksDbSharp.Checkpoint c = db.Checkpoint();
+                c.Save(cp, 0);
+            }, dir.Path, wal);
+        }
+        Console.WriteLine("managed: " + managedResult);
+        Console.WriteLine("native: " + nativeResult);
+        StringAssert.Contains(managedResult, " 0 failed", managedResult);
+    }
+
     private static SoakDump NativeDump(SoakSettings settings, string db, string wal)
     {
         var profile = new NativeMosaikProfile(wal, settings.LowMemoryMode, settings.ProcessorCount, settings.CacheBytes, settings.WriteBufferBytes);

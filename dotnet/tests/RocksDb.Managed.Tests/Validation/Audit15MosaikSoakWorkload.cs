@@ -2997,8 +2997,9 @@ internal sealed class FlushThreadWorker : SoakWorker
         Status = "Flush(default family, wait)";
         S.Db.Flush(new FlushOptions { Wait = true });
         Status = "MemoryUtil.GetApproximateMemoryUsageByType";
-        MemoryUsageByType usage = MemoryUtil.GetApproximateMemoryUsageByType([S.Db], []);
-        if (usage.MemTableUnflushed > usage.MemTableTotal) S.Violation(Name + " memtable unflushed " + usage.MemTableUnflushed + " > total " + usage.MemTableTotal);
+        // Not checked against each other: like upstream (memory_util.cc), the two memtable sums are separate property reads,
+        // so a write between them can make "unflushed" exceed "total".
+        MemoryUtil.GetApproximateMemoryUsageByType([S.Db], []);
         long now = Stopwatch.GetTimestamp();
         if (now > Volatile.Read(ref _keepArchiveUntil) && now - _lastArchiveClean > Stopwatch.Frequency / 4)
         {
