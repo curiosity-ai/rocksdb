@@ -78,9 +78,25 @@ public sealed class WritableFileOptions
 
     /// <summary>
     /// When &gt; 0, space is reserved ahead of the write position in chunks of this size using
-    /// fallocate(FALLOC_FL_KEEP_SIZE) (PosixWritableFile::PrepareWrite). Linux only; ignored elsewhere.
+    /// fallocate(FALLOC_FL_KEEP_SIZE) (PosixWritableFile::PrepareWrite), and what is left of it past the end of the file
+    /// is released when the file is closed (PosixWritableFile::Close). Linux only; ignored elsewhere.
     /// </summary>
-    public long PreallocationBlockSize { get; init; }
+    public long PreallocationBlockSize
+    {
+        get => _preallocationBlockSize;
+        init => _preallocationBlockSize = value;
+    }
+
+    private long _preallocationBlockSize;
+
+    /// <summary>A copy of these options with <see cref="PreallocationBlockSize"/> set (FSWritableFile::SetPreallocationBlockSize).</summary>
+    internal WritableFileOptions WithPreallocationBlockSize(long size)
+    {
+        if (size == _preallocationBlockSize) return this;
+        var copy = (WritableFileOptions)MemberwiseClone();
+        copy._preallocationBlockSize = size;
+        return copy;
+    }
 
     /// <summary>
     /// When &gt; 0, written data is incrementally pushed to the device every this many bytes using

@@ -2076,3 +2076,26 @@ Investigated and not kept:
 - Prefetching the second and third cache line of the next memtable node in the skiplist iterator (flush scan, new
   `MemTableFlushScanBenchmarks`: 84 ms per 500k-entry scan, ~168 ns per entry = one serial miss per node): no
   measurable change; the level-0 pointer chase, not the value lines, is the bottleneck.
+
+## Audit #15: WAL, MANIFEST and compaction output preallocation (2026-11-25)
+
+Audit #15 ported upstream's preallocation (WALs: write_buffer_size + 10%, capped by max_total_wal_size, the write
+buffer manager and db_write_buffer_size; MANIFESTs: manifest_preallocation_size; compaction outputs:
+OutputFilePreallocationSize; fallocate KEEP_SIZE, trimmed at close). A/B on the same tree with only that commit
+reverted: Release, net10.0, `dbbench --engine managed --benchmarks fillrandom,overwrite --num 1000000 --value_size 100
+--write_buffer_size 4194304 --target_file_size_base 4194304 --max_bytes_for_level_base 16777216`, 6 alternating runs per
+side on the 4-core VM (ext4), medians:
+
+| benchmark | without | with | ratio |
+|---|---:|---:|---:|
+| fillrandom | 1.142 us/op | 1.091 us/op | 0.96 |
+| overwrite | 1.250 us/op | 1.244 us/op | 0.99 |
+
+Run-to-run spread (with / without) was 1.06-1.33 / 1.10-1.18 (fillrandom) and 1.16-1.32 / 1.19-1.32 (overwrite): no regression, and
+no gain beyond noise either. An earlier 3-round run at 500k ops including fillseq (0.78 / 0.75 us/op medians) was too
+noisy to separate.
+
+Audit #15's other write-path change (SwitchWAL marking an obsolete oldest WAL) was measured in its slice: with file
+deletions disabled and 200 obsolete WALs alive, 94-98 B and 1.63-1.76 us per Put before, 52 B and 1.43-1.49 us after.
+Mosaik's hot paths (point Get, single Put, a 10-op batch over 5 families, content Get, a 20-entry bounded prefix scan)
+show no change between e749664 and the audit's start (docs/validation.md, audit #15 "Verified").

@@ -33,6 +33,7 @@ internal static partial class UnixNative
     private const short F_WRLCK = 1;
     private const short F_UNLCK = 2;
     private const int FALLOC_FL_KEEP_SIZE = 1;
+    private const int FALLOC_FL_PUNCH_HOLE = 2;
     private const uint SYNC_FILE_RANGE_WRITE = 2;
     private const int O_RDONLY = 0;
     private const int O_CLOEXEC = 0x80000;
@@ -196,14 +197,24 @@ internal static partial class UnixNative
     /// fallocate(FALLOC_FL_KEEP_SIZE) like PosixWritableFile::Allocate. Returns false when unsupported (the
     /// caller simply stops trying).
     /// </summary>
-    public static bool TryAllocate(SafeFileHandle handle, long offset, long length)
+    public static bool TryAllocate(SafeFileHandle handle, long offset, long length) => TryFallocate(handle, FALLOC_FL_KEEP_SIZE, offset, length);
+
+    /// <summary>
+    /// fallocate(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE) like PosixWritableFile::Close: releases blocks reserved past
+    /// the end of the file, on file systems where ftruncate to the same size keeps them. Best effort (false when it
+    /// failed or is unsupported).
+    /// </summary>
+    public static bool TryPunchHole(SafeFileHandle handle, long offset, long length) =>
+        TryFallocate(handle, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, offset, length);
+
+    private static bool TryFallocate(SafeFileHandle handle, int mode, long offset, long length)
     {
         if (!IsLinux || !Environment.Is64BitProcess) return false;
         bool addRef = false;
         try
         {
             handle.DangerousAddRef(ref addRef);
-            int rc = fallocate((int)handle.DangerousGetHandle(), FALLOC_FL_KEEP_SIZE, offset, length);
+            int rc = fallocate((int)handle.DangerousGetHandle(), mode, offset, length);
             return rc == 0;
         }
         catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)

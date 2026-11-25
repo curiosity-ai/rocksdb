@@ -1358,11 +1358,14 @@ internal sealed partial class DbImpl
         LogWriter? newLog = null;
         ulong newLogNumber;
         bool walFailed;
+        long preallocateBlockSize;
         lock (_mutex)
         {
             newLogNumber = _logNumber;
             // A WAL whose write or sync failed is replaced and never written or synced again (WAL write error recovery).
             walFailed = _log is not null && _logNumber <= _failedWalNumber;
+            // SwitchMemtable: GetWalPreallocateBlockSize(mutable_cf_options_copy.write_buffer_size) under the mutex.
+            preallocateBlockSize = GetWalPreallocateBlockSize(cfd.Options.WriteBufferSize);
         }
         ulong recycleLogNumber = 0;
         if (!_logEmpty || _log is null || walFailed)
@@ -1383,7 +1386,7 @@ internal sealed partial class DbImpl
                     : null;
                 try
                 {
-                    newLog = CreateWal(newLogNumber, predecessor, recycleLogNumber);
+                    newLog = CreateWal(newLogNumber, predecessor, recycleLogNumber, preallocateBlockSize);
                 }
                 finally
                 {
@@ -1646,6 +1649,28 @@ internal sealed partial class DbImpl
         return 4 * Volatile.Read(ref _maxTotalInMemoryState);
     }
 
+    /// <summary>
+    /// Port of DBImpl::GetWalPreallocateBlockSize: the fallocate block of a new WAL, write_buffer_size plus 10%, at most
+    /// max_total_wal_size, db_write_buffer_size and the write buffer manager's size (when they are set).
+    /// </summary>
+    internal long GetWalPreallocateBlockSize(ulong writeBufferSize)
+    {
+        ulong bsize = writeBufferSize / 10 + writeBufferSize;
+        // Some users might set very high write_buffer_size and rely on max_total_wal_size or other parameters to control
+        // the WAL size.
+        if (Options.MaxTotalWalSize > 0) bsize = Math.Min(bsize, Options.MaxTotalWalSize);
+        if (Options.DbWriteBufferSize > 0) bsize = Math.Min(bsize, Options.DbWriteBufferSize);
+        WriteBufferManager wbm = WriteBufferManager;
+        if (wbm.Enabled) bsize = Math.Min(bsize, (ulong)wbm.BufferSize);
+        return (long)Math.Min(bsize, long.MaxValue);
+    }
+
+    /// <summary>
+    /// The fallocate block of a new MANIFEST: manifest_preallocation_size (VersionSet::CreateManifestWriter, DBImpl::NewDB),
+    /// 0 without allow_fallocate (PosixWritableFile reserves nothing then).
+    /// </summary>
+    internal long ManifestPreallocationBlockSize => Options.AllowFallocate ? (long)Math.Min(Options.ManifestPreallocationSize, long.MaxValue) : 0;
+
     /// <summary>max_total_in_memory_state_ (kept up to date on column family add/drop and SetOptions).</summary>
     private ulong _maxTotalInMemoryState;
 
@@ -1671,22 +1696,24 @@ internal sealed partial class DbImpl
     private async ValueTask SwitchWalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         ulong oldest;
-        var cfds = new List<ColumnFamilyData>();
+        List<ColumnFamilyData> cfds;
         lock (_mutex)
         {
             if (_aliveWals.Count == 0) return;
             oldest = ulong.MaxValue;
             foreach (ulong n in _aliveWals) oldest = Math.Min(oldest, n);
             if (_walGettingFlushed == oldest) return;
+            // "if (!flush_wont_release_oldest_log) alive_wal_files_.begin()->getting_flushed = true" (outside 2PC always):
+            // also when no column family needs the oldest WAL any more. Such a WAL is obsolete and only waits for a purge,
+            // which file deletions disabled (a registered replica) can hold back indefinitely; without the mark every
+            // write over max_total_wal_size scanned the column families again until then.
+            _walGettingFlushed = oldest;
+            cfds = new List<ColumnFamilyData>();
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
             {
                 if (cfd.Dropped) continue;
                 if (cfd.LogNumber <= oldest) cfds.Add(cfd);
             }
-            // "we only mark this log as getting flushed if we have successfully flushed all data in this log": not when
-            // there is nothing to switch for it (the next write looks again).
-            if (cfds.Count == 0 && !Options.AtomicFlush) return;
-            _walGettingFlushed = oldest;
         }
         LogInfo("Flushing all column families with data in WAL number " + oldest + ". Total log size is " + Volatile.Read(ref _walsTotalSize) +
                 " while max_total_wal_size is " + GetMaxTotalWalSize());
@@ -1720,11 +1747,14 @@ internal sealed partial class DbImpl
     /// track_and_verify_wals the predecessor-WAL-info record when <paramref name="predecessor"/> is known
     /// (Writer::MaybeAddPredecessorWALInfo). Like upstream, the first WAL of an open has no predecessor record.
     /// </summary>
-    private LogWriter CreateWal(ulong number, PredecessorWalInfo? predecessor, ulong recycleLogNumber)
+    private LogWriter CreateWal(ulong number, PredecessorWalInfo? predecessor, ulong recycleLogNumber, long preallocateBlockSize)
     {
         string path = FileNames.LogFileName(WalDir, number);
         var fileOptions = new WritableFileOptions
         {
+            // CreateWAL: lfile->SetPreallocationBlockSize(preallocate_block_size); PosixWritableFile reserves the blocks
+            // only with allow_fallocate, and trims what is left of them when the WAL is closed.
+            PreallocationBlockSize = Options.AllowFallocate ? preallocateBlockSize : 0,
             // The WAL is fdatasync'ed when a memtable switch closes it (SwitchMemtableAsync), on the write path. Without
             // wal_bytes_per_sync, its writeback is still started every WalWritebackBytes (sync_file_range WRITE, which
             // does not wait) so that this sync only has to wait for the last chunk instead of the whole file.

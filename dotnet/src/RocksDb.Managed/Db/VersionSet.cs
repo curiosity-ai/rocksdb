@@ -667,7 +667,7 @@ internal sealed class VersionSet : IAsyncDisposable
                 {
                     manifestNumber = NewFileNumber();
                     snapshot!.NextFileNumber = CurrentNextFileNumber;
-                    newLog = ManifestLogWriter.Create(_fs, FileNames.DescriptorFileName(_dbname, manifestNumber));
+                    newLog = ManifestLogWriter.Create(_fs, FileNames.DescriptorFileName(_dbname, manifestNumber), _db.ManifestPreallocationBlockSize);
                     Wal.LogWriter sizeOf = newLog.Log;
                     var writer = new ManifestWriter(newLog) { FileSizeProvider = () => (ulong)sizeOf.File!.Size };
                     // WriteCurrentStateToManifest (synced at the end).

@@ -521,3 +521,16 @@ Still open from this round:
 - [x] `LockWalAsync` holder flow; rollback reads at the max snapshot; failed commit timestamp check clears the transaction; WriteUnprepared rollback forgets its WAL
 - [ ] Cluster soak cannot cover restore-then-swap (fault file system tracks files by name); swap with an external `WalDir`
 - [ ] Identities: separate operator secret, secret rotation; `FollowerFault` in the gRPC status DTOs; remove unused term / epoch map RPCs
+
+## Audit #15 (2026-11-25; docs/validation.md "Audit #15: the database as Mosaik drives it, after audits #7-#14")
+
+- [x] Mosaik's database calls traced again through the engine as audits #7-#14 left it (error contract, concurrent mix, resources at Mosaik's sizes, entry points through the changed code); earlier Mosaik tests still pass; no wrong read result; hot paths unchanged against e749664
+- [x] `MosaikProfile` / `NativeMosaikProfile`: Mosaik's exact options on each engine, both resource branches (tests/Shared, CompatTests/Infrastructure)
+- [x] WALs, MANIFESTs and compaction outputs preallocated like upstream (full disk: writes go on into the reserved WAL block like native); ENOTDIR is a plain IOError, not PathNotFound
+- [x] WALs freed only below the recorded min_log_number_to_keep (low-resource Mosaik: 8-10x native's flush jobs before), recorded by recovery too; SwitchWAL marks an obsolete oldest WAL; per-family super version numbers
+- [x] .NET 11.0.0 JIT bug: Tier0 `Interlocked.Or` / `And` with a used result wrote through a garbage address (every first HyperClock insert in a Release build failed); `Util.AtomicBits` compare-exchange loops, source scan in `AtomicBitsTests`
+- [x] Mosaik soak: Mosaik's whole concurrent mix with model checks, power loss, native cross-checks (`Audit15MosaikSoak*`, `AUDIT15_SOAK_SECONDS` / `AUDIT15_SOAK_SEED`)
+- [ ] Low-resource flush counts 1.5-2x native's (timing dependent, unexplained); checkpoint WAL minimum is the live one; alive-WAL scan per write with deletions disabled
+- [ ] ArenaSlabPool trimming under memory pressure (a held 128 MiB content slab: 285 MiB idle RSS against native's 136 MiB)
+- [ ] Not ported: sync_file_range errors (ignored), strict_bytes_per_sync (parsed only); first stats_dump at open; flush_started memory_usage
+- [ ] Mosaik side (reported, not changed): 128 MiB content arena overfills the write buffer manager below ~3 GB available; flush thread dies on non-NoSpace background errors and flushes only the default family; Dispose / iterator errors escape on the managed build; empty-value stream deserializer; tracker version key can go backwards; MigrateDatabases vs the tracker family; overridden low-resource file-opening threads; database-wide properties summed per family

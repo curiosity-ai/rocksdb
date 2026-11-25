@@ -888,7 +888,7 @@ internal sealed class ClockShard
         ulong initialCountdown, bool takeRef, ref bool alreadyMatches)
     {
         // Optimistically transition the slot from "empty" to "under construction" (no effect on other states).
-        ulong oldMeta = unchecked((ulong)Interlocked.Or(ref h.Meta, unchecked((long)(ClockSlot.StateOccupiedBit << ClockSlot.StateShift))));
+        ulong oldMeta = unchecked((ulong)Util.AtomicBits.Or(ref h.Meta, unchecked((long)(ClockSlot.StateOccupiedBit << ClockSlot.StateShift))));
         ulong oldState = ClockSlot.State(oldMeta);
         if (oldState == ClockSlot.StateEmpty)
         {
@@ -1266,7 +1266,7 @@ internal sealed class ClockShard
                     found = true;
                     // Match. Set invisible.
                     const ulong visibleMask = ClockSlot.StateVisibleBit << ClockSlot.StateShift;
-                    oldMeta = unchecked((ulong)Interlocked.And(ref h.Meta, unchecked((long)~visibleMask))) & ~visibleMask;
+                    oldMeta = unchecked((ulong)Util.AtomicBits.And(ref h.Meta, unchecked((long)~visibleMask))) & ~visibleMask;
                     while (true)
                     {
                         ulong refcount = ClockSlot.Refcount(oldMeta);
