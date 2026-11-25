@@ -423,7 +423,6 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
     }
 
-    private ulong _superVersionNumber;
     // Super versions installed and not yet cleaned up, over all column families. Guarded by mutex.
     private int _liveSuperVersions;
     // Set by a close that found super versions still referenced (reads or iterators in flight): the column families
@@ -457,7 +456,8 @@ internal sealed partial class DbImpl : IAsyncDisposable
         }
         cfd.Mem.Ref();
         cfd.Current.Ref();
-        var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++_superVersionNumber, cfd.OptionsSnapshot);
+        // ColumnFamilyData::InstallSuperVersion: ++super_version_number_, per column family.
+        var sv = new SuperVersion(cfd.Mem, imm, cfd.Current, ++cfd.SuperVersionNumber, cfd.OptionsSnapshot);
         _liveSuperVersions++;
         SuperVersion? old = cfd.SuperOrNull();
         // ColumnFamilyData::InstallSuperVersion: the write stall is recalculated only if the version or the memtables

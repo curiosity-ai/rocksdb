@@ -247,6 +247,12 @@ internal sealed class ColumnFamilyData
     public int LiveVersions;
 
     /// <summary>
+    /// ColumnFamilyData::super_version_number_ (db/column_family.cc): 0 for a new column family, incremented by each
+    /// InstallSuperVersion of this column family ("rocksdb.current-super-version-number"). Guarded by the DB mutex.
+    /// </summary>
+    public ulong SuperVersionNumber;
+
+    /// <summary>
     /// Size of the distinct table files referenced by any live version of this column family
     /// (ColumnFamilyData::GetTotalSstFilesSize, "rocksdb.total-sst-files-size"). Maintained by VersionSet's file
     /// reference counts; guarded by the DB mutex.
