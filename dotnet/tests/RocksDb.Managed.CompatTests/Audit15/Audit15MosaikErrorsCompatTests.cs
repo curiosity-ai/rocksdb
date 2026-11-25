@@ -167,6 +167,8 @@ public sealed class Audit15MosaikErrorsCompatTests
         Exception? Backup(string dir, out int backups);
         /// <summary>RocksDbStorage / SafeRocksDb.Checkpoint().Save(dir).</summary>
         Exception? Checkpoint(string dir);
+        /// <summary>RocksDbStorage.ClearDeprecatedChangeLog: DeleteFilesInRange then DeleteRange over the whole "changelog" family.</summary>
+        Exception? ClearChangeLog();
     }
 
     private sealed class ManagedDb(RocksDatabase db) : IMosaikDb
@@ -226,6 +228,14 @@ public sealed class Audit15MosaikErrorsCompatTests
             return e;
         }
         public Exception? Checkpoint(string dir) => Catch(() => db.CreateCheckpoint(dir, 0));
+        public Exception? ClearChangeLog() => Catch(() =>
+        {
+            byte[] start = new byte[8], end = new byte[8];
+            Array.Fill(end, byte.MaxValue);
+            ColumnFamily changelog = Cf("changelog");
+            changelog.DeleteFilesInRange(start, end, includeEnd: true);
+            changelog.DeleteRange(new WriteOptions(), start, end);
+        });
         public string WriteReaction(Exception? e) => e switch
         {
             null => "ok",
@@ -317,6 +327,17 @@ public sealed class Audit15MosaikErrorsCompatTests
             backups = n;
             return e;
         }
+        public Exception? ClearChangeLog() => Catch(() =>
+        {
+            byte[] start = new byte[8], end = new byte[8];
+            Array.Fill(end, byte.MaxValue);
+            RocksDbSharp.ColumnFamilyHandle changelog = Cf("changelog");
+            N.rocksdb_delete_file_in_range_cf(db.Handle, changelog.Handle, start, (nuint)start.Length, end, (nuint)end.Length, out IntPtr errptr);
+            if (errptr != IntPtr.Zero) throw new RocksDbSharp.RocksDbException(errptr);
+            var wo = new RocksDbSharp.WriteOptions();
+            N.rocksdb_delete_range_cf(db.Handle, wo.Handle, changelog.Handle, start, (nuint)start.Length, end, (nuint)end.Length, out errptr);
+            if (errptr != IntPtr.Zero) throw new RocksDbSharp.RocksDbException(errptr);
+        });
         public Exception? Checkpoint(string dir) => Catch(() =>
         {
             using RocksDbSharp.Checkpoint cp = db.Checkpoint();
@@ -466,6 +487,7 @@ public sealed class Audit15MosaikErrorsCompatTests
             log.Write("delete (db stopped)", d.Delete("nodes", U("a")));
             log.FlushThread("flush thread (db stopped)", d.FlushDefault());
             log.Compact("compact range (db stopped)", d.CompactRange("nodes"));
+            log.Plain("clear change log (db stopped)", d.ClearChangeLog());
             log.Plain("get (db stopped)", d.Get("nodes", U("a"), out _));
             fs.Free();
             log.Write("put after the space is freed", PutWhenRecovered(() => d.Put("nodes", U("b"), U("v-b"))));
@@ -688,6 +710,7 @@ public sealed class Audit15MosaikErrorsCompatTests
             log.Write("write after the failed flush", d.Write("edges", U("c"), U("v-c")));
             log.FlushThread("flush thread", d.FlushDefault());
             log.Compact("compact range", d.CompactRange("nodes"));
+            log.Plain("clear change log", d.ClearChangeLog());
             log.Plain("get", d.Get("nodes", U("a"), out _));
             log.Close("close");
             return log.Steps;
@@ -781,6 +804,7 @@ public sealed class Audit15MosaikErrorsCompatTests
             log.Compact("compact range", d.CompactRange("nodes"));
             log.Write("put", d.Put("nodes", U("b"), U("v-b")));
             log.Write("write", d.Write("edges", U("b"), U("v-b")));
+            log.Plain("clear change log", d.ClearChangeLog());
             log.FlushThread("flush thread", d.FlushDefault());
             log.Close("close");
             return log.Steps;

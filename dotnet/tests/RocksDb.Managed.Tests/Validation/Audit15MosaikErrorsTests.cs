@@ -3,6 +3,7 @@ using System.Diagnostics;
 using RocksDb.Managed.Db;
 using RocksDb.Managed.Env;
 using RocksDb.Managed.TestShared;
+using RocksDb.Managed.Tests.Db;
 using static RocksDb.Managed.Tests.Db.DbTestUtil;
 
 namespace RocksDb.Managed.Tests.Validation;
@@ -134,6 +135,144 @@ public sealed class Audit15MosaikErrorsTests
             edges.Flush();
         }
         foreach ((string path, long block) in noFallocate.Created) Assert.AreEqual(0, block, path + " without allow_fallocate");
+    }
+
+    // RocksDbBase.UpdateStats and Server/src/TemporaryMemoryCapture.cs.
+    private static readonly string[] s_mosaikProperties =
+    [
+        "rocksdb.num-immutable-mem-table", "rocksdb.mem-table-flush-pending", "rocksdb.num-running-flushes", "rocksdb.compaction-pending",
+        "rocksdb.num-running-compactions", "rocksdb.background-errors", "rocksdb.cur-size-active-mem-table", "rocksdb.cur-size-all-mem-tables",
+        "rocksdb.size-all-mem-tables", "rocksdb.num-entries-active-mem-table", "rocksdb.num-entries-imm-mem-tables",
+        "rocksdb.num-deletes-active-mem-table", "rocksdb.num-deletes-imm-mem-tables", "rocksdb.estimate-num-keys",
+        "rocksdb.estimate-table-readers-mem", "rocksdb.num-snapshots", "rocksdb.oldest-snapshot-time", "rocksdb.num-live-versions",
+        "rocksdb.current-super-version-number", "rocksdb.estimate-live-data-size", "rocksdb.live-sst-files-size",
+        "rocksdb.obsolete-sst-files-size", "rocksdb.base-level", "rocksdb.estimate-pending-compaction-bytes",
+        "rocksdb.actual-delayed-write-rate", "rocksdb.is-write-stopped", "rocksdb.total-sst-files-size", "rocksdb.num-files-at-level0",
+        "rocksdb.block-cache-capacity", "rocksdb.block-cache-usage", "rocksdb.dbstats",
+    ];
+
+    /// <summary>
+    /// Mosaik's calls (SafeRocksDb, RocksDbBase's flush thread, RocksDbStorage / RocksDbIndexStorage), each wrapped so that
+    /// only the exception types Mosaik's handlers expect may leave it: a RocksDbException (any code). Returns the
+    /// descriptions of anything else that escaped.
+    /// </summary>
+    private static void RunMosaikCalls(RocksDatabase db, List<string> escaped, string label)
+    {
+        void Call(string name, Action a)
+        {
+            try
+            {
+                a();
+            }
+            catch (RocksDbException)
+            {
+            }
+            catch (Exception e)
+            {
+                escaped.Add(label + ": " + name + " threw " + e.GetType().Name + ": " + e.Message);
+            }
+        }
+        Dictionary<string, ColumnFamily> cfs = MosaikProfile.Handles(db);
+        ColumnFamily nodes = cfs["nodes"], edges = cfs["edges"], changelog = cfs["changelog"], queue = cfs["to-index-queue"];
+        byte[] value = new byte[300];
+        for (int i = 0; i < 40; i++)
+        {
+            string k = "key" + i.ToString("D4", System.Globalization.CultureInfo.InvariantCulture);
+            Call("put", () => nodes.Put(B(k), value));
+            Call("write", () =>
+            {
+                using var wb = new WriteBatch();
+                wb.Put(edges, B(k), value).Delete(nodes, B("gone" + k));
+                db.Write(null, wb);
+            });
+            Call("delete", () => queue.Delete(B("01234567" + k)));
+            if (i % 10 == 9) Call("flush of a family", () => nodes.Flush());
+        }
+        Call("flush thread flush", () => db.Flush(new FlushOptions { Wait = true }));
+        Call("flush thread properties", () =>
+        {
+            foreach (string p in s_mosaikProperties)
+            {
+                _ = db.GetProperty(p);
+                foreach (ColumnFamily cf in cfs.Values) _ = cf.GetProperty(p);
+            }
+        });
+        Call("flush thread memory usage", () => MemoryUtil.GetApproximateMemoryUsageByType([db], []));
+        Call("get", () => nodes.Get(B("key0007")));
+        Call("iterator loop", () =>
+        {
+            using Iterator it = nodes.NewIterator();
+            it.SeekToFirst();
+            while (it.Valid) it.Next();
+        });
+        Call("SafeRocksDb.CompactRange", () => edges.CompactRange(null, null));
+        Call("RocksDbIndexStorage compaction", () =>
+            queue.CompactRange(new CompactRangeOptions { ExclusiveManualCompaction = false, TargetLevel = -1 }, B("0"), B("z")));
+        Call("ClearDeprecatedChangeLog", () =>
+        {
+            byte[] start = new byte[8], end = new byte[8];
+            Array.Fill(end, byte.MaxValue);
+            changelog.DeleteFilesInRange(start, end, includeEnd: true);
+            changelog.DeleteRange(new WriteOptions(), start, end);
+        });
+        Call("checkpoint", () => db.CreateCheckpoint("/a15/checkpoint-" + label, 0));
+        Call("live files", () => db.GetLiveFileNames());
+    }
+
+    /// <summary>
+    /// A transient I/O error (plain, retryable, out of space) at every mutating file operation of a Mosaik-shaped
+    /// workload in turn (writes, family flushes, the flush thread's calls, both CompactRange shapes, DeleteFilesInRange +
+    /// DeleteRange, a checkpoint, the close): Mosaik catches RocksDbException only (SafeRocksDb.TryRecoverException, the
+    /// flush thread, SafeRocksDb.CompactRange), so any other exception type ends a Mosaik thread or request where native
+    /// returns a status. Nothing else escapes.
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000)]
+    public void MosaikCallsThrowOnlyRocksDbExceptionUnderFileErrors()
+    {
+        var escaped = new List<string>();
+        long total;
+        {
+            var fs = new FaultInjectionFileSystem(NewFs());
+            using RocksDatabase db = new MosaikProfile("/a15/journal", lowMemoryMode: true, 2, fs, cacheBytes: 8L << 20, writeBufferBytes: 32L << 20).Open("/a15/db");
+            long start = fs.Operations;
+            RunMosaikCalls(db, escaped, "clean");
+            total = fs.Operations - start;
+        }
+        Assert.AreEqual(0, escaped.Count, string.Join("\n", escaped));
+        InjectedFaultKind[] kinds = [InjectedFaultKind.IOError, InjectedFaultKind.Retryable, InjectedFaultKind.NoSpace];
+        var sw = Stopwatch.StartNew();
+        int runs = 0;
+        // Every operation once (+ the close), cut short at 60 s on a slow machine (the operations are visited in a
+        // stride so a cut-short run still spreads over the whole workload).
+        const int Stride = 7;
+        for (int phase = 0; phase < Stride && sw.Elapsed < TimeSpan.FromSeconds(60); phase++)
+        {
+            for (long n = 1 + phase; n <= total + 8 && sw.Elapsed < TimeSpan.FromSeconds(60); n += Stride)
+            {
+                var fs = new FaultInjectionFileSystem(NewFs());
+                RocksDatabase db = new MosaikProfile("/a15/journal", lowMemoryMode: true, 2, fs, cacheBytes: 8L << 20, writeBufferBytes: 32L << 20).Open("/a15/db");
+                fs.ErrorKind = kinds[n % kinds.Length];
+                fs.TransientFailure = true;
+                fs.CrashAtOperation = fs.Operations + n;
+                string label = "op " + n + " (" + fs.ErrorKind + ")";
+                RunMosaikCalls(db, escaped, label);
+                try
+                {
+                    db.Dispose();
+                }
+                catch (RocksDbException)
+                {
+                }
+                catch (Exception e)
+                {
+                    escaped.Add(label + ": close threw " + e.GetType().Name + ": " + e.Message);
+                }
+                runs++;
+            }
+        }
+        Console.WriteLine(runs + " runs over " + total + " operations");
+        Assert.AreEqual(0, escaped.Count, string.Join("\n", escaped));
     }
 
     /// <summary>The blocks a file has allocated (stat %b, 512-byte units), or -1 when stat is not available.</summary>
