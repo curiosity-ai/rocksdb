@@ -30,11 +30,14 @@ public sealed class Audit15MosaikResourcesCompatTests
         public readonly RocksDbSharp.RocksDb Native;
         public readonly Dictionary<string, ColumnFamily> MCf;
 
-        public Pair(string name, bool lowMemoryMode, int processorCount, long cacheBytes, long writeBufferBytes, Action<MosaikProfile, NativeMosaikProfile>? adjust = null)
+        public Pair(string name, bool lowMemoryMode, int processorCount, long cacheBytes, long writeBufferBytes, Action<MosaikProfile, NativeMosaikProfile>? adjust = null,
+            ulong contentArenaBlockSize = 0)
         {
             Dir = new TempDir(name);
-            ManagedProfile = new MosaikProfile(Path.Combine(Dir.Path, "mwal"), lowMemoryMode, processorCount, cacheBytes: cacheBytes, writeBufferBytes: writeBufferBytes);
-            NativeProfile = new NativeMosaikProfile(Path.Combine(Dir.Path, "nwal"), lowMemoryMode, processorCount, cacheBytes: cacheBytes, writeBufferBytes: writeBufferBytes);
+            ManagedProfile = new MosaikProfile(Path.Combine(Dir.Path, "mwal"), lowMemoryMode, processorCount, cacheBytes: cacheBytes, writeBufferBytes: writeBufferBytes,
+                contentArenaBlockSize: contentArenaBlockSize);
+            NativeProfile = new NativeMosaikProfile(Path.Combine(Dir.Path, "nwal"), lowMemoryMode, processorCount, cacheBytes: cacheBytes, writeBufferBytes: writeBufferBytes,
+                contentArenaBlockSize: contentArenaBlockSize);
             adjust?.Invoke(ManagedProfile, NativeProfile);
             M = ManagedProfile.Open(Path.Combine(Dir.Path, "m"));
             Native = NativeProfile.Open(Path.Combine(Dir.Path, "n"));
@@ -185,7 +188,8 @@ public sealed class Audit15MosaikResourcesCompatTests
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // 2. Normal branch: the content family's 128 MiB arena block under the shared write buffer manager
+    // 2. Normal branch before curiosity-ai/mosaik#2776: the content family's 128 MiB arena block under the shared write
+    //    buffer manager (Mosaik now uses the engine's default block; these pin that both engines behaved the same)
     // ---------------------------------------------------------------------------------------------------------------
 
     /// <summary>
@@ -204,7 +208,8 @@ public sealed class Audit15MosaikResourcesCompatTests
     [DataRow(256L, false)]
     public void ContentArenaBlockKeepsSmallWriteBufferManagersFlushingLikeNative(long writeBufferMiB, bool expectFlushPerWrite)
     {
-        using var p = new Pair("a15-wbm", lowMemoryMode: false, processorCount: 8, cacheBytes: 32L << 20, writeBufferBytes: writeBufferMiB << 20);
+        using var p = new Pair("a15-wbm", lowMemoryMode: false, processorCount: 8, cacheBytes: 32L << 20, writeBufferBytes: writeBufferMiB << 20,
+            contentArenaBlockSize: MosaikProfile.ContentArenaBlockSizeBefore2776(lowMemoryMode: false));
         long nOpen = p.NativeWbmUsage, mOpen = p.ManagedWbmUsage;
         string ctx = "native open=" + nOpen + " managed open=" + mOpen;
         Assert.IsTrue(nOpen > 128L << 20, ctx);
@@ -235,7 +240,8 @@ public sealed class Audit15MosaikResourcesCompatTests
     {
         try
         {
-            using var p = new Pair("a15-content", lowMemoryMode: false, processorCount: 8, cacheBytes: 32L << 20, writeBufferBytes: 1L << 30);
+            using var p = new Pair("a15-content", lowMemoryMode: false, processorCount: 8, cacheBytes: 32L << 20, writeBufferBytes: 1L << 30,
+                contentArenaBlockSize: MosaikProfile.ContentArenaBlockSizeBefore2776(lowMemoryMode: false));
             long idle = p.NativeWbmUsage;
             var trace = new StringBuilder();
             ulong id = 0;

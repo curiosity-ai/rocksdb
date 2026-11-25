@@ -1913,7 +1913,18 @@ internal sealed partial class DbImpl
     /// A recovered batch hit an existing key+seq without seq_per_batch (MemTable::Add's TryAgain, twice in a row in
     /// WriteBatch::Iterate). Thrown by <see cref="MemTableInserter"/> with <see cref="MemTableInserter.FailOnDuplicateKeySeq"/>.
     /// </summary>
-    private sealed class DuplicateKeySeqException() : Exception("two consecutive TryAgain in WriteBatch handler; this is either a software bug or data corruption.");
+    private sealed class DuplicateKeySeqException() : Exception(DuplicateKeySeqMessage);
+
+    /// <summary>WriteBatchInternal::Iterate's status for a second TryAgain on the same entry (write_batch.cc).</summary>
+    private const string DuplicateKeySeqMessage = "two consecutive TryAgain in WriteBatch handler; this is either a software bug or data corruption.";
+
+    /// <summary>
+    /// A live write hit an existing key+seq without seq_per_batch: Corruption, as WriteBatch::Iterate's second TryAgain is
+    /// upstream. The write group's caller makes it a background error (HandleMemTableInsertFailure, upstream
+    /// MemTableInsertStatusCheck): the entry is in the WAL and not in the memtable.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowDuplicateKeySeqOnLiveWrite() => throw new InsertRejectedException(StatusCode.Corruption, DuplicateKeySeqMessage);
 
     /// <summary>
     /// A non-OK status of a MemTableInserter handler for an entry the DB refuses (an inverted DeleteRange, a Merge
@@ -1931,6 +1942,11 @@ internal sealed partial class DbImpl
         public bool IgnoreMissingColumnFamilies;
         /// <summary>WAL recovery: an existing key+seq fails the batch (<see cref="DuplicateKeySeqException"/>) instead of being skipped.</summary>
         public bool FailOnDuplicateKeySeq;
+        /// <summary>
+        /// A secondary's WAL catch-up: an existing key+seq is an entry this replay applied before, and is skipped. Every other
+        /// caller fails a live write on it (Corruption, <see cref="ThrowDuplicateKeySeqOnLiveWrite"/>).
+        /// </summary>
+        public bool IgnoreDuplicateKeySeq;
         /// <summary>log_number_ref_: WAL with the prepared section of the data being inserted (0 = none).</summary>
         public ulong LogRef;
         // rebuilding_trx_ / rebuilding_trx_seq_ / unprepared_batch_ (recovery only).
@@ -2071,15 +2087,17 @@ internal sealed partial class DbImpl
             MemTable mem = c.Mem;
             while (!AddToMemTable(c, mem, type, key, value, hasProt, kvo))
             {
-                // key+seq exists (TryAgain). Without seq_per_batch this can only come from replaying an already applied
-                // batch. WAL recovery fails the batch like upstream: MaybeAdvanceSeq(kBatchBoundary) does not advance,
-                // and WriteBatch::Iterate's retry of the entry hits the second TryAgain ("two consecutive TryAgain"); the
-                // sequence stays at this entry. Other callers ignore it. With seq_per_batch the key starts a new
-                // sub-batch: advance and retry.
+                // key+seq exists (TryAgain). Without seq_per_batch, as upstream: MaybeAdvanceSeq(kBatchBoundary) does not
+                // advance and WriteBatch::Iterate's retry of the entry hits the second TryAgain ("two consecutive TryAgain").
+                // WAL recovery fails the batch with it, the sequence staying at this entry; a live write fails with
+                // Corruption, which its write group makes a background error (the entry is in the WAL, not in the
+                // memtable); a secondary's catch-up skips an entry it applied before. With seq_per_batch the key starts a
+                // new sub-batch: advance and retry.
                 if (!_seqPerBatch)
                 {
                     if (FailOnDuplicateKeySeq) throw new DuplicateKeySeqException();
-                    break;
+                    if (IgnoreDuplicateKeySeq) break;
+                    ThrowDuplicateKeySeqOnLiveWrite();
                 }
                 MaybeAdvanceSeq(batchBoundary: true);
             }
@@ -2348,7 +2366,8 @@ internal sealed partial class DbImpl
                 if (!_seqPerBatch)
                 {
                     if (FailOnDuplicateKeySeq) throw new DuplicateKeySeqException();
-                    break;
+                    if (IgnoreDuplicateKeySeq) break;
+                    ThrowDuplicateKeySeqOnLiveWrite();
                 }
                 MaybeAdvanceSeq(batchBoundary: true);
             }

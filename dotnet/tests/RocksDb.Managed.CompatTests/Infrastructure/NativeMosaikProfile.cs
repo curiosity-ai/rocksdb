@@ -32,6 +32,8 @@ internal sealed class NativeMosaikProfile
     }
 
     public bool LowMemoryMode { get; }
+    /// <summary>As <see cref="MosaikProfile.ContentArenaBlockSize"/>: 0 = the engine default, as Mosaik.</summary>
+    public ulong ContentArenaBlockSize { get; }
     public int ProcessorCount { get; }
     public bool LowResources => LowMemoryMode || ProcessorCount < 4;
 
@@ -42,9 +44,11 @@ internal sealed class NativeMosaikProfile
     /// <summary>rocksdb-sharp's ColumnFamilies: "default" with default options first, then Mosaik's families.</summary>
     public RocksDbSharp.ColumnFamilies Families { get; }
 
-    public NativeMosaikProfile(string walDir, bool lowMemoryMode, int processorCount, long cacheBytes = 0, long writeBufferBytes = 0)
+    public NativeMosaikProfile(string walDir, bool lowMemoryMode, int processorCount, long cacheBytes = 0, long writeBufferBytes = 0,
+        ulong contentArenaBlockSize = 0)
     {
         LowMemoryMode = lowMemoryMode;
+        ContentArenaBlockSize = contentArenaBlockSize;
         ProcessorCount = processorCount;
         if (cacheBytes == 0) cacheBytes = lowMemoryMode ? 8L * 1024 * 1024 : 256L * 1024 * 1024 * processorCount;
         if (writeBufferBytes == 0) writeBufferBytes = lowMemoryMode ? 32L * 1024 * 1024 : 64L * 1024 * 1024;
@@ -70,8 +74,8 @@ internal sealed class NativeMosaikProfile
                 o = PointLookupColumnFamilyOptions();
                 break;
             case MosaikProfile.Shape.Content:
-                o = PointLookupColumnFamilyOptions().SetCompression(RocksDbSharp.Compression.Lz4)
-                    .SetArenaBlockSize(LowMemoryMode ? 1UL * 1024 * 1024 : 128UL * 1024 * 1024);
+                o = PointLookupColumnFamilyOptions().SetCompression(RocksDbSharp.Compression.Lz4);
+                if (ContentArenaBlockSize != 0) o.SetArenaBlockSize(ContentArenaBlockSize);
                 break;
             case MosaikProfile.Shape.Prefix8NoFilter:
                 o = ColumnFamilyOptions().SetPrefixExtractor(RocksDbSharp.SliceTransform.CreateFixedPrefix((ulong)f.PrefixLength));

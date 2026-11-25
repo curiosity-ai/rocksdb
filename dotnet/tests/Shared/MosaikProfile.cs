@@ -40,7 +40,7 @@ internal sealed class MosaikProfile
         Plain,
         /// <summary>CreatePointLookupColumnFamilyOptions: + Bloom 10, data block hash index 0.75, memtable whole-key bloom 0.02.</summary>
         PointLookup,
-        /// <summary>"content": PointLookup + LZ4 + arena block size 128 MiB (1 MiB in low-memory mode).</summary>
+        /// <summary>"content": PointLookup + LZ4, with the engine's default arena block size (see <see cref="ContentArenaBlockSize"/>).</summary>
         Content,
         /// <summary>CreateColumnFamilyOptions + fixed 8-byte prefix extractor, no filter policy (data-vectors*).</summary>
         Prefix8NoFilter,
@@ -101,6 +101,16 @@ internal sealed class MosaikProfile
 
     public bool LowMemoryMode { get; }
 
+    /// <summary>
+    /// The content family's arena_block_size, or 0 for the engine's default (min(1 MiB, write_buffer_size / 8)), which is
+    /// what Mosaik uses since curiosity-ai/mosaik#2776. The tests of the configuration before it (audit #15's write buffer
+    /// manager findings) pass <see cref="ContentArenaBlockSizeBefore2776"/> explicitly.
+    /// </summary>
+    public ulong ContentArenaBlockSize { get; }
+
+    /// <summary>Mosaik's content arena block before curiosity-ai/mosaik#2776: 128 MiB, 1 MiB in low-memory mode.</summary>
+    public static ulong ContentArenaBlockSizeBefore2776(bool lowMemoryMode) => lowMemoryMode ? 1UL * 1024 * 1024 : 128UL * 1024 * 1024;
+
     /// <summary>Environment.ProcessorCount as SetRockDbDefaultOptions sees it (fewer than 4 forces the low-resource branch).</summary>
     public int ProcessorCount { get; }
 
@@ -123,9 +133,12 @@ internal sealed class MosaikProfile
     /// <param name="fileSystem">Null for the local file system.</param>
     /// <param name="cacheBytes">Shared LRU cache capacity; 0 = Mosaik's value for the mode (8 MiB, or 256 MiB per processor).</param>
     /// <param name="writeBufferBytes">Shared write buffer manager size; 0 = Mosaik's low-memory value (32 MiB) or its floor (64 MiB).</param>
-    public MosaikProfile(string walDir, bool lowMemoryMode, int processorCount, IFileSystem? fileSystem = null, long cacheBytes = 0, long writeBufferBytes = 0)
+    /// <param name="contentArenaBlockSize">See <see cref="ContentArenaBlockSize"/>; 0 = the engine default, as Mosaik.</param>
+    public MosaikProfile(string walDir, bool lowMemoryMode, int processorCount, IFileSystem? fileSystem = null, long cacheBytes = 0, long writeBufferBytes = 0,
+        ulong contentArenaBlockSize = 0)
     {
         LowMemoryMode = lowMemoryMode;
+        ContentArenaBlockSize = contentArenaBlockSize;
         ProcessorCount = processorCount;
         if (cacheBytes == 0) cacheBytes = lowMemoryMode ? 8L * 1024 * 1024 : 256L * 1024 * 1024 * processorCount;
         if (writeBufferBytes == 0) writeBufferBytes = lowMemoryMode ? 32L * 1024 * 1024 : 64L * 1024 * 1024;
@@ -149,7 +162,7 @@ internal sealed class MosaikProfile
             {
                 ColumnFamilyOptions o = PointLookupColumnFamilyOptions();
                 o.Compression = CompressionType.LZ4;
-                o.ArenaBlockSize = LowMemoryMode ? 1UL * 1024 * 1024 : 128UL * 1024 * 1024;
+                if (ContentArenaBlockSize != 0) o.ArenaBlockSize = ContentArenaBlockSize;
                 return o;
             }
             case Shape.Prefix8NoFilter:
