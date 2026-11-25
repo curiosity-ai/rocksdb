@@ -339,6 +339,21 @@ tools/soak.sh --dir "$(mktemp -d)" --smoke         # 2-minute smoke run
 tools/soak.sh selftest                             # every check catches its injected bug (about 1 minute)
 ```
 
+## Mosaik soak (audit #15)
+
+`Validation/Audit15MosaikSoakWorkload.cs` (linked into the compat tests) runs Mosaik's storage calls at once on
+`MosaikProfile`: its write shapes, flush thread, manual compactions, readers, checkpoints and backups. Every key belongs
+to one writer and every value names its slot, version and operation, so each read is checked against what was
+acknowledged before it and invoked after it. After the run the reopened database must match the model exactly, and
+each checkpoint and kept backup must be one point in time. `Audit15MosaikSoakTests` runs it in both resource branches
+and with a power loss on a fault-injecting file system. `Audit15MosaikSoakCompatTests` also opens every result with
+native RocksDB.
+
+| Variable | Effect |
+|---|---|
+| `AUDIT15_SOAK_SECONDS=<s>` | length of each run (default 20 s; the power-loss runs 8 s) |
+| `AUDIT15_SOAK_SEED=<n>` | replay the workers' choices of a run (its seed is printed; thread interleavings still vary) |
+
 ## Cluster soak test (`tools/RocksDb.Managed.ClusterSoak`)
 
 The Jepsen-style soak of the Raft cluster mode: the supervisor (control node) runs N `ClusterNodeHost` processes over

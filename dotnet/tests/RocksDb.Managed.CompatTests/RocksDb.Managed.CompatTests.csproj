@@ -18,6 +18,8 @@
     <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
     <!-- Mosaik's option set, managed side (the native twin is Infrastructure/NativeMosaikProfile.cs). -->
     <Compile Include="..\Shared\MosaikProfile.cs" Link="Infrastructure\MosaikProfile.cs" />
+    <!-- Audit #15: Mosaik's concurrent mix (the unit tests run it with managed checks, the compat tests add native ones). -->
+    <Compile Include="..\RocksDb.Managed.Tests\Validation\Audit15MosaikSoakWorkload.cs" Link="Audit15\Audit15MosaikSoakWorkload.cs" />
     <!-- The managed side of the WAL error recovery crash images (WalErrorRecyclingCompatTests). -->
     <Compile Include="..\RocksDb.Managed.Tests\Db\FaultInjectionFileSystem.cs" Link="Wal\FaultInjectionFileSystem.cs" />
   </ItemGroup>
