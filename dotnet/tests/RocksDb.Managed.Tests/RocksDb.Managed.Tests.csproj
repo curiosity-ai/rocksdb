@@ -10,4 +10,8 @@
     <ProjectReference Include="..\..\src\RocksDb.Managed\RocksDb.Managed.csproj" />
     <ProjectReference Include="..\..\tools\RocksDb.Managed.Tools\RocksDb.Managed.Tools.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Mosaik's option set (shared with the compat tests). -->
+    <Compile Include="..\Shared\MosaikProfile.cs" Link="Validation\MosaikProfile.cs" />
+  </ItemGroup>
 </Project>

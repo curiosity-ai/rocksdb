@@ -16,6 +16,8 @@
   <ItemGroup>
     <!-- librocksdb under a .NET 11 apphost: see the file's remarks. -->
     <Compile Include="..\Shared\NativeStdCxxPreload.cs" Link="NativeStdCxxPreload.cs" />
+    <!-- Mosaik's option set, managed side (the native twin is Infrastructure/NativeMosaikProfile.cs). -->
+    <Compile Include="..\Shared\MosaikProfile.cs" Link="Infrastructure\MosaikProfile.cs" />
     <!-- The managed side of the WAL error recovery crash images (WalErrorRecyclingCompatTests). -->
     <Compile Include="..\RocksDb.Managed.Tests\Db\FaultInjectionFileSystem.cs" Link="Wal\FaultInjectionFileSystem.cs" />
   </ItemGroup>
