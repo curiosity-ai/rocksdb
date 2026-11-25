@@ -379,6 +379,26 @@ internal sealed class Compaction
         return false;
     }
 
+    /// <summary>
+    /// Port of Compaction::OutputFilePreallocationSize: the fallocate block of an output file (the inputs' total size,
+    /// capped by the maximum output file size for level compaction or outputs below level 0, plus 10%, at most 1 GiB).
+    /// </summary>
+    public ulong OutputFilePreallocationSize()
+    {
+        ulong preallocationSize = 0;
+        foreach (CompactionInputFiles l in _inputs)
+        {
+            foreach (FileMetaData f in l.Files) preallocationSize += f.FileSize;
+        }
+        if (MaxOutputFileSize != ulong.MaxValue && (Options.CompactionStyle == CompactionStyle.Level || OutputLevel > 0))
+        {
+            preallocationSize = Math.Min(MaxOutputFileSize, preallocationSize);
+        }
+        // Over-estimate slightly so we don't end up just barely crossing the threshold. No point to preallocate more
+        // than 1GB.
+        return Math.Min(1UL << 30, preallocationSize + preallocationSize / 10);
+    }
+
     public int NumInputLevels => _inputs.Length;
     public CompactionInputFiles Inputs(int which) => _inputs[which];
     public IReadOnlyList<CompactionInputFiles> AllInputs => _inputs;

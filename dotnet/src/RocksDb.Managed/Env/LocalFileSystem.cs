@@ -1196,6 +1196,10 @@ internal sealed class LocalWritableFile : IWritableFile, ITruncatableWritableFil
                 throw mapped;
             }
             if (notify) _io!.Finish(FileOperationType.Truncate, _path, Temperature.Unknown, 0, 0, startTime, start, null);
+            // PosixWritableFile::Close: "in some file systems, ftruncate only trims trailing space if the new file size is
+            // smaller than the current size": the blocks reserved past the end are released explicitly (upstream does it
+            // when fstat shows them still allocated; here always, the result is the same). Errors are ignored there too.
+            if (_preallocatedEnd > Size) UnixNative.TryPunchHole(_handle, Size, _preallocatedEnd - Size);
         }
     }
 
