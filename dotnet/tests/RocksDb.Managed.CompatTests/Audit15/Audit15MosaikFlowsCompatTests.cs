@@ -916,4 +916,113 @@ public sealed class Audit15MosaikFlowsCompatTests
         "sv " + db.Property(Nodes, "rocksdb.current-super-version-number") + " L0 " + db.Property(Nodes, "rocksdb.num-files-at-level0") +
         " L6 " + db.Property(Nodes, "rocksdb.num-files-at-level6") + " sst " + CountFiles(path, "*.sst") +
         " entries " + db.Property(Nodes, "rocksdb.num-entries-active-mem-table");
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // 6. max_total_wal_size while file deletions are disabled (a primary with registered replicas)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    private const string SwitchWalLogLine = "Flushing all column families with data in WAL number";
+
+    private static int CountLogLines(string dbPath, string text)
+    {
+        int n = 0;
+        foreach (string file in Directory.GetFiles(dbPath, "LOG*"))
+        {
+            using var reader = new StreamReader(new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+            for (string? line = reader.ReadLine(); line is not null; line = reader.ReadLine())
+            {
+                if (line.Contains(text, StringComparison.Ordinal)) n++;
+            }
+        }
+        return n;
+    }
+
+    /// <summary>
+    /// RocksDbBase.RegisterReplica disables file deletions for as long as a replica is registered, so obsolete WALs stay
+    /// alive and the WAL total stays above the low-resource max_total_wal_size (1 MiB). The family flushes before that
+    /// (here the flush thread's and the content family's own) left no column family needing the oldest WAL. DBImpl::SwitchWAL
+    /// (db_impl_write.cc) marks the oldest alive WAL as getting flushed whatever it finds to switch (outside 2PC) and logs
+    /// it once; every later write returns at the mark. Compared through the info LOG on both engines (Info level, which
+    /// Mosaik's normal branch uses), and nothing flushed or switched by the checks.
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000)]
+    public void SwitchWalWithFileDeletionsDisabledMarksTheOldestWalOnceLikeNative()
+    {
+        using var dir = new TempDir("a15-switchwal");
+        string ndb = Path.Combine(dir.Path, "n"), mdb = Path.Combine(dir.Path, "m");
+        var np = new NativeMosaikProfile(Path.Combine(dir.Path, "nj"), lowMemoryMode: true, processorCount: 2, cacheBytes: 8L << 20, writeBufferBytes: 32L << 20);
+        np.DbOptions.SetInfoLogLevel(RocksDbSharp.InfoLogLevel.Info);
+        var mp = new MosaikProfile(Path.Combine(dir.Path, "mj"), lowMemoryMode: true, processorCount: 2, cacheBytes: 8L << 20, writeBufferBytes: 32L << 20);
+        mp.DbOptions.InfoLogLevel = InfoLogLevel.Info;
+        var value = new byte[4096];
+        new Random(6).NextBytes(value);
+
+        string RunNative()
+        {
+            using RocksDbSharp.RocksDb n = np.Open(ndb);
+            RocksDbSharp.ColumnFamilyHandle content = n.GetColumnFamily(Content), nodes = n.GetColumnFamily(Nodes);
+            var waiter = new NativeMosaikDbWaiter(n);
+            n.DisableFileDeletions();
+            for (int round = 0; round < 8; round++)
+            {
+                for (int i = 0; i < 60; i++) n.Put(Uid(round * 1000 + i), value, content);
+                N.rocksdb_flush_cf(n.Handle, new RocksDbSharp.FlushOptions().SetWaitForFlush(true).Handle, content.Handle, out IntPtr err);
+                if (err != IntPtr.Zero) throw new RocksDbSharp.RocksDbException(err);
+                waiter.Wait();
+            }
+            // The writes that run SwitchWAL: over the limit, nothing needs the oldest WAL.
+            for (int i = 0; i < 200; i++) n.Put(Uid(100_000 + i), Le8((ulong)i), nodes);
+            waiter.Wait();
+            string state = "while disabled: switch logs " + CountLogLines(ndb, SwitchWalLogLine) + ", wal " + CountFiles(Path.Combine(dir.Path, "nj"), "*.log") +
+                ", nodes L0 " + n.GetProperty("rocksdb.num-files-at-level0", nodes) + ", nodes sv " + n.GetProperty("rocksdb.current-super-version-number", nodes);
+            n.EnableFileDeletions();
+            for (int i = 0; i < 200; i++) n.Put(Uid(200_000 + i), Le8((ulong)i), nodes);
+            waiter.Wait();
+            return state + "; enabled: wal " + CountFiles(Path.Combine(dir.Path, "nj"), "*.log") + ", archive " + CountFiles(Path.Combine(dir.Path, "nj", "archive"), "*.log");
+        }
+
+        string RunManaged()
+        {
+            using RocksDatabase m = mp.Open(mdb);
+            ColumnFamily content = m.GetColumnFamily(Content), nodes = m.GetColumnFamily(Nodes);
+            m.DisableFileDeletions();
+            for (int round = 0; round < 8; round++)
+            {
+                for (int i = 0; i < 60; i++) content.Put(Uid(round * 1000 + i), value);
+                content.Flush();
+                m.WaitForCompact();
+            }
+            for (int i = 0; i < 200; i++) nodes.Put(Uid(100_000 + i), Le8((ulong)i));
+            m.WaitForCompact();
+            string state = "while disabled: switch logs " + CountLogLines(mdb, SwitchWalLogLine) + ", wal " + CountFiles(Path.Combine(dir.Path, "mj"), "*.log") +
+                ", nodes L0 " + nodes.GetProperty("rocksdb.num-files-at-level0") + ", nodes sv " + nodes.GetProperty("rocksdb.current-super-version-number");
+            m.EnableFileDeletions();
+            for (int i = 0; i < 200; i++) nodes.Put(Uid(200_000 + i), Le8((ulong)i));
+            m.WaitForCompact();
+            return state + "; enabled: wal " + CountFiles(Path.Combine(dir.Path, "mj"), "*.log") + ", archive " + CountFiles(Path.Combine(dir.Path, "mj", "archive"), "*.log");
+        }
+
+        string native = RunNative(), managed = RunManaged();
+        Console.WriteLine("native: " + native + "\nmanaged: " + managed);
+        Assert.AreEqual(native, managed);
+        StringAssert.StartsWith(native, "while disabled: switch logs 1, ", "native marks the oldest WAL once");
+    }
+
+    private readonly struct NativeMosaikDbWaiter(RocksDbSharp.RocksDb db)
+    {
+        public void Wait()
+        {
+            IntPtr wfc = N.rocksdb_wait_for_compact_options_create();
+            try
+            {
+                N.rocksdb_wait_for_compact(db.Handle, wfc, out IntPtr err);
+                if (err != IntPtr.Zero) throw new RocksDbSharp.RocksDbException(err);
+            }
+            finally
+            {
+                N.rocksdb_wait_for_compact_options_destroy(wfc);
+            }
+        }
+    }
 }

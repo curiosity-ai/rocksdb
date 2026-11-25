@@ -1671,22 +1671,24 @@ internal sealed partial class DbImpl
     private async ValueTask SwitchWalAsync(bool synchronous, CancellationToken cancellationToken)
     {
         ulong oldest;
-        var cfds = new List<ColumnFamilyData>();
+        List<ColumnFamilyData> cfds;
         lock (_mutex)
         {
             if (_aliveWals.Count == 0) return;
             oldest = ulong.MaxValue;
             foreach (ulong n in _aliveWals) oldest = Math.Min(oldest, n);
             if (_walGettingFlushed == oldest) return;
+            // "if (!flush_wont_release_oldest_log) alive_wal_files_.begin()->getting_flushed = true" (outside 2PC always):
+            // also when no column family needs the oldest WAL any more. Such a WAL is obsolete and only waits for a purge,
+            // which file deletions disabled (a registered replica) can hold back indefinitely; without the mark every
+            // write over max_total_wal_size scanned the column families again until then.
+            _walGettingFlushed = oldest;
+            cfds = new List<ColumnFamilyData>();
             foreach (ColumnFamilyData cfd in Versions.ColumnFamilies)
             {
                 if (cfd.Dropped) continue;
                 if (cfd.LogNumber <= oldest) cfds.Add(cfd);
             }
-            // "we only mark this log as getting flushed if we have successfully flushed all data in this log": not when
-            // there is nothing to switch for it (the next write looks again).
-            if (cfds.Count == 0 && !Options.AtomicFlush) return;
-            _walGettingFlushed = oldest;
         }
         LogInfo("Flushing all column families with data in WAL number " + oldest + ". Total log size is " + Volatile.Read(ref _walsTotalSize) +
                 " while max_total_wal_size is " + GetMaxTotalWalSize());
