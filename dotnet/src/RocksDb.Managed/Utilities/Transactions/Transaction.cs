@@ -670,8 +670,32 @@ public abstract partial class Transaction : IDisposable
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(batch);
         ColumnFamilyData cfd = Cfd(columnFamily);
-        var reader = new TxnMultiValueReader(this, options, cfd);
-        _batch.MultiGet(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
+        Snapshot? view = ConsistentMultiReadSnapshot(ref options);
+        try
+        {
+            var reader = new TxnMultiValueReader(this, options, cfd);
+            _batch.MultiGet(cfd.Id, cfd.MergeOperator, cfd.TimestampSize, options, batch, ref reader);
+        }
+        finally
+        {
+            view?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The view of a multi-key read without a caller snapshot on a WritePrepared / WriteUnprepared DB. Upstream reads
+    /// all keys through DBImpl::MultiGetWithCallback: one super version, one sequence, the callback refreshed once. The
+    /// port reads such a DB key by key (each read validates its own snapshot), which without a common snapshot let a
+    /// commit between two keys show through: one key before it, the next after it. A snapshot taken for the call gives
+    /// the same single view. Null (nothing to release) when the caller passed a snapshot or the DB has no read hooks.
+    /// </summary>
+    private Snapshot? ConsistentMultiReadSnapshot(ref ReadOptions? options)
+    {
+        if (!_database.Impl.SeqPerBatch || options?.Snapshot is not null) return null;
+        Snapshot view = _database.GetSnapshot();
+        options = options?.Clone() ?? new ReadOptions();
+        options.Snapshot = view;
+        return view;
     }
 
     /// <summary><see cref="MultiGet(ReadOptions?, ColumnFamily, MultiGetBatch)"/> on the default column family.</summary>

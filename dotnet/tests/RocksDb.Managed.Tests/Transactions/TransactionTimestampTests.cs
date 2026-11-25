@@ -70,6 +70,15 @@ public sealed class TransactionTimestampTests
         {
             txn.Put(Cf(db), B("foo"), B("value"));
             AssertFails(StatusCode.InvalidArgument, txn.Commit);
+            // WriteCommittedTxn::CommitWithoutPrepareInternal fails inside the commit ("Must assign a commit
+            // timestamp"), after which PessimisticTransaction::Commit clears the transaction and leaves it in
+            // AWAITING_COMMIT, like any failed commit write (audit #14: the port used to keep it usable).
+            Assert.AreEqual(TransactionState.AwaitingCommit, txn.State);
+            Assert.AreEqual(0, db.GetLockStatusData().Count, "the failed commit released the locks");
+        }
+        using (Transaction txn = db.BeginTransaction(s_wo))
+        {
+            txn.Put(Cf(db), B("foo"), B("value"));
             txn.SetCommitTimestamp(20);
             txn.Commit();
         }

@@ -123,6 +123,8 @@ internal class WritePreparedTxn : PessimisticTransaction
         PrepareSequence = 0;
     }
 
+    private protected override void ResetPrepareSequenceAfterRollback() => PrepareSequence = 0;
+
     // WritePreparedTxn::CommitWithoutPrepareInternal / CommitInternal do not read snapshot_needed_.
     private protected override bool CommitChecksPendingSnapshotRequest => false;
 
@@ -327,7 +329,9 @@ internal class WritePreparedTxn : PessimisticTransaction
         private void Rollback(uint cf, ReadOnlySpan<byte> key)
         {
             if (!(_keys ??= new RollbackKeySet(txn._db)).Add(cf, key)) return;
-            txn.WriteRollbackKey(cf, key, null, callback, dst);
+            // RollbackWriteBatchBuilder: roptions.snapshot = GetMaxSnapshot(). Without a snapshot the read is capped at
+            // the published sequence, which with two write queues lags behind commits of lock-free keys.
+            txn.WriteRollbackKey(cf, key, txn._db.MaxSnapshotReadOptions, callback, dst);
         }
 
         public readonly bool Continue() => true;

@@ -226,6 +226,17 @@ public sealed class RaftPersistentState
     /// Replaces the whole term map. Used after a snapshot restore, when the local log is byte-for-byte the leader's log,
     /// so the leader's term map is the correct description of it.
     /// </summary>
+    /// <summary>
+    /// Runs <paramref name="action"/> while nothing else reads or persists this state: for an owner that moves the
+    /// directory the state lives in (a snapshot restore swapping the database directory, see
+    /// <see cref="SnapshotRestoreSwap"/>). The action may call back into this object.
+    /// </summary>
+    public void RunExclusive(Action action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        lock (_gate) action();
+    }
+
     public void ReplaceTerms(RaftLogTerms terms)
     {
         ArgumentNullException.ThrowIfNull(terms);

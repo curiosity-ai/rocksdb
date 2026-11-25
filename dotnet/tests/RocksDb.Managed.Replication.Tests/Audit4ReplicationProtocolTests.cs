@@ -31,8 +31,8 @@ public sealed class Audit4ReplicationProtocolTests
         int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
         // Default options: gRPC's own receive limit on both channels and both servers.
         Assert.AreEqual(4 * 1024 * 1024, GrpcTransportDefaults.CreateChannelOptions().MaxReceiveMessageSize);
-        using var toB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2));
-        using var toA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2));
+        using var toB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
+        using var toA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
         PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
         {
             NodeId = id,
@@ -43,8 +43,8 @@ public sealed class Audit4ReplicationProtocolTests
             RetryDelay = TimeSpan.FromMilliseconds(50),
         }, peer);
         PairNodeHost a = Host("A", toB), b = Host("B", toA);
-        await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, CancellationToken.None);
-        await using GrpcNodeServer serverB = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(b, System.Net.IPAddress.Loopback, portB, CancellationToken.None);
+        await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
+        await using GrpcNodeServer serverB = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(b, System.Net.IPAddress.Loopback, portB, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
         try
         {
             await a.StartAsync(CancellationToken.None);
@@ -84,7 +84,7 @@ public sealed class Audit4ReplicationProtocolTests
         Assert.AreEqual(GrpcTransportDefaults.KeepAlivePingDelay, handler.KeepAlivePingDelay);
         Assert.AreEqual(GrpcTransportDefaults.KeepAlivePingTimeout, handler.KeepAlivePingTimeout);
         Assert.AreEqual(GrpcTransportDefaults.MaxReceiveMessageSize, options.MaxReceiveMessageSize, "gRPC's default is left in place");
-        Assert.AreEqual(GrpcNodeServerOptions.DefaultMaxReceiveMessageSize, new GrpcNodeServerOptions().MaxReceiveMessageSize, "on servers too");
+        Assert.AreEqual(GrpcNodeServerOptions.DefaultMaxReceiveMessageSize, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }.MaxReceiveMessageSize, "on servers too");
         handler.Dispose();
 
         // Options of the caller: only what they leave open is filled in.
@@ -104,7 +104,7 @@ public sealed class Audit4ReplicationProtocolTests
     public async Task ChunkSizesAreCheckedAtStart()
     {
         using var dir = new TempDir("chunk-sizes");
-        using var peer = new GrpcPairClient("B", "http://127.0.0.1:1", TimeSpan.FromSeconds(1));
+        using var peer = new GrpcPairClient("B", "http://127.0.0.1:1", TimeSpan.FromSeconds(1), GrpcSecurity.InsecureNoAuthentication);
         PairNodeHostOptions Pair(int walChunk, int snapshotChunk) => new()
         {
             NodeId = "A",
@@ -128,20 +128,20 @@ public sealed class Audit4ReplicationProtocolTests
         int limit = GrpcTransportDefaults.MaxPayloadBytes;
         await using var tooLargeWal = new PairNodeHost(Pair(limit + 1, 1024), peer);
         ArgumentException wal = await Assert.ThrowsExactlyAsync<ArgumentException>(() =>
-            GrpcNodeServer.StartAsync<PairService, PairNodeHost>(tooLargeWal, CancellationToken.None));
+            GrpcNodeServer.StartAsync<PairService, PairNodeHost>(tooLargeWal, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None));
         StringAssert.Contains(wal.Message, "MaxChunkBytes = " + (limit + 1));
         var tooLargeSnapshot = new ReplicationPrimary(db, dir.Sub("cp"), null) { SnapshotChunkBytes = 8 * 1024 * 1024 };
         ArgumentException snapshot = await Assert.ThrowsExactlyAsync<ArgumentException>(() =>
-            GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(tooLargeSnapshot, CancellationToken.None));
+            GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(tooLargeSnapshot, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None));
         StringAssert.Contains(snapshot.Message, "SnapshotChunkBytes = " + (8 * 1024 * 1024));
 
         // At the limit, and above it once the deployment says its peers receive more.
         var atLimit = new ReplicationPrimary(db, dir.Sub("cp"), null) { MaxChunkBytes = limit, SnapshotChunkBytes = limit };
-        await using (await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(atLimit, CancellationToken.None))
+        await using (await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(atLimit, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None))
         {
         }
         await using (await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(tooLargeSnapshot, System.Net.IPAddress.Loopback, 0,
-            new GrpcNodeServerOptions { MaxStreamPayloadBytes = 16 * 1024 * 1024 }, CancellationToken.None))
+            new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication, MaxStreamPayloadBytes = 16 * 1024 * 1024 }, CancellationToken.None))
         {
         }
     }

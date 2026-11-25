@@ -40,6 +40,14 @@ public sealed class AdaptiveCommitDelayOptions
     public double TrendWeight { get; init; } = 2.0;
     /// <summary>Weight of the current lag's excess over the average.</summary>
     public double BurstWeight { get; init; } = 1.5;
+    /// <summary>
+    /// How long a replica's last report counts. A replica that has not reported for longer (it died, or was removed
+    /// without <see cref="AdaptiveCommitDelayController.ForgetReplica"/>) no longer contributes to the cluster lag;
+    /// without this its last lag stayed the maximum for good and writers were delayed for a replica that is not there.
+    /// When no replica has a current report, no delay is recommended. <see cref="Timeout.InfiniteTimeSpan"/> keeps every
+    /// report forever (the behaviour of rocksdb-sharp's controller). Default 30 s.
+    /// </summary>
+    public TimeSpan ReplicaLagStaleAfter { get; init; } = TimeSpan.FromSeconds(30);
 }
 
 /// <summary>
@@ -65,6 +73,10 @@ public sealed class AdaptiveCommitDelayController
 
     // Per-replica latest lag; one slot per replica.
     private readonly long[] _latestReplicaLag;
+    // When each replica last reported (TimeProvider timestamp); Never until it does, and after ForgetReplica.
+    private readonly long[] _reportedAt;
+    private const long Never = long.MinValue;
+    private readonly TimeSpan _staleAfter;
     // Ring buffer of recent cluster lag values.
     private readonly long[] _history;
     // Monotonic write counter. Each report claims one slot.
@@ -100,7 +112,12 @@ public sealed class AdaptiveCommitDelayController
         if (!(options.TrendWeight >= 0) || !double.IsFinite(options.TrendWeight)) throw new ArgumentOutOfRangeException(nameof(options.TrendWeight));
         if (!(options.BurstWeight >= 0) || !double.IsFinite(options.BurstWeight)) throw new ArgumentOutOfRangeException(nameof(options.BurstWeight));
 
+        if (options.ReplicaLagStaleAfter <= TimeSpan.Zero && options.ReplicaLagStaleAfter != Timeout.InfiniteTimeSpan)
+            throw new ArgumentOutOfRangeException(nameof(options.ReplicaLagStaleAfter));
+        _staleAfter = options.ReplicaLagStaleAfter;
         _latestReplicaLag = new long[replicaCount];
+        _reportedAt = new long[replicaCount];
+        Array.Fill(_reportedAt, Never);
         _history = new long[options.HistorySize];
         _historySize = options.HistorySize;
         _emaAlpha = options.EmaAlpha;
@@ -120,6 +137,8 @@ public sealed class AdaptiveCommitDelayController
 
         // Update this replica's latest lag atomically.
         Interlocked.Exchange(ref _latestReplicaLag[sample.ReplicaIndex], sample.LagVersions);
+        long now = _timeProvider.GetTimestamp();
+        Interlocked.Exchange(ref _reportedAt[sample.ReplicaIndex], now == Never ? Never + 1 : now);
         // Compute cluster lag as current max across replicas.
         long clusterLag = ReadMaxReplicaLag();
         // Claim next slot in ring buffer.
@@ -143,8 +162,40 @@ public sealed class AdaptiveCommitDelayController
 
     public void ReportLag(int replicaIndex, long lagVersions) => ReportLag(new ReplicaLagSample(replicaIndex, lagVersions));
 
+    /// <summary>The number of replicas this controller tracks (valid indexes are 0 .. ReplicaCount - 1).</summary>
+    public int ReplicaCount => _latestReplicaLag.Length;
+
+    /// <summary>
+    /// Stops counting replica <paramref name="replicaIndex"/> (it was removed or is being rebuilt) until it reports again.
+    /// </summary>
+    public void ForgetReplica(int replicaIndex)
+    {
+        if ((uint)replicaIndex >= (uint)_latestReplicaLag.Length) throw new ArgumentOutOfRangeException(nameof(replicaIndex));
+        Interlocked.Exchange(ref _reportedAt[replicaIndex], Never);
+        Interlocked.Exchange(ref _latestReplicaLag[replicaIndex], 0);
+    }
+
+    private bool IsCurrent(int replicaIndex)
+    {
+        long at = Volatile.Read(ref _reportedAt[replicaIndex]);
+        if (at == Never) return false;
+        return _staleAfter == Timeout.InfiniteTimeSpan || _timeProvider.GetElapsedTime(at) <= _staleAfter;
+    }
+
+    private bool AnyReplicaCurrent()
+    {
+        for (int i = 0; i < _reportedAt.Length; i++)
+        {
+            if (IsCurrent(i)) return true;
+        }
+        return false;
+    }
+
     public int GetRecommendedDelayMs()
     {
+        // Nobody reports any more (every replica is gone or forgotten): the history describes replicas that are not
+        // there, and nothing would ever change it.
+        if (!AnyReplicaCurrent()) return _minDelayMs;
         long currentLag = ReadCurrentLag();
         long count = Math.Min(Volatile.Read(ref _historyCount), _historySize);
         if (count == 0) return _minDelayMs;
@@ -184,6 +235,8 @@ public sealed class AdaptiveCommitDelayController
         long max = 0;
         for (int i = 0; i < _latestReplicaLag.Length; i++)
         {
+            // A replica that stopped reporting does not hold the maximum (ReplicaLagStaleAfter).
+            if (!IsCurrent(i)) continue;
             long value = Volatile.Read(ref _latestReplicaLag[i]);
             if (value > max) max = value;
         }

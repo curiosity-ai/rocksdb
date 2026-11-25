@@ -296,6 +296,10 @@ internal sealed class ErrorHandler
         }
         if (sev == ErrorSeverity.NoError)
         {
+            // ErrorHandler::SetBGError: "if (!new_bg_err.ok()) NotifyOnBackgroundError(...)" - a Status with severity
+            // kNoError is still not OK, so the listeners hear about it (e.g. a flush error with paranoid_checks off);
+            // it does not become the background error ("Hit less severe background error").
+            NotifyOnBackgroundError(reason, classified, autoRecovery, out _);
             _db.LogInfo("ErrorHandler: Hit less severe background error");
             return null;
         }
@@ -779,6 +783,16 @@ internal sealed partial class DbImpl
             if (!IsDbStopped && !IsBgWorkStopped) return; // nothing to do
             if (_readOnly) ThrowHelper.NotSupported("Cannot resume a read-only DB");
             if (ErrorHandler.IsRecoveryInProgress) throw new RocksDbException(StatusCode.Busy, "Resource busy: Recovery in progress");
+        }
+        // Managed extension (EventListener.OnManualRecoveryRequested): a listener may refuse the manual recovery.
+        if (Options.Listeners.Count > 0)
+        {
+            var request = new ManualRecoveryEventArgs(ErrorHandler.BgError);
+            foreach (EventListener l in Options.Listeners)
+            {
+                l.OnManualRecoveryRequested(request);
+                if (!request.Allow) ThrowHelper.NotSupported("Resume refused" + (request.Reason is null ? "" : ": " + request.Reason));
+            }
         }
         // Synchronous: the whole recovery (waits, MANIFEST and WAL switch, flushes) runs on the calling thread, and the
         // ValueTask is complete when returned.

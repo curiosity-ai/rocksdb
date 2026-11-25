@@ -33,7 +33,7 @@ internal sealed partial class DbImpl
             // moves to a write wake-up thread first, so that it never blocks its caller.
             bool exclusive = LeadsSynchronously(synchronous);
             if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
-            WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+            WriteThread.Writer w = await EnterUnbatchedIgnoringWalLockAsync(exclusive, ct).ConfigureAwait(false);
             try
             {
                 lock (_mutex)
@@ -61,14 +61,135 @@ internal sealed partial class DbImpl
         catch
         {
             // Undo this LockWAL().
-            UnlockWal();
+            UnlockWal(0);
             throw;
+        }
+        if (synchronous) NoteWalLockOwner(Environment.CurrentManagedThreadId, 1);
+    }
+
+    // The threads holding a LockWAL taken through the synchronous API (lock_wal_owner_thread_id_counts_), for the
+    // deadlock check of a synchronous manual flush. Locks taken through the asynchronous API have no owner thread.
+    // Guarded by mutex.
+    private Dictionary<int, int>? _walLockOwnerThreads;
+
+    private void NoteWalLockOwner(int threadId, int delta)
+    {
+        if (threadId == 0) return;
+        lock (_mutex)
+        {
+            _walLockOwnerThreads ??= new Dictionary<int, int>();
+            _walLockOwnerThreads.TryGetValue(threadId, out int n);
+            n += delta;
+            if (n <= 0) _walLockOwnerThreads.Remove(threadId);
+            else _walLockOwnerThreads[threadId] = n;
+        }
+    }
+
+    /// <summary>
+    /// A LockWAL taken through the asynchronous API, as seen from the asynchronous flow that took it: the flow (and the
+    /// flows it starts while it holds the lock) carries this token in an AsyncLocal, the way the thread id identifies
+    /// the holder of a synchronous lock. <see cref="Held"/> is set once the lock is acquired and cleared by the
+    /// unlock, whichever flow or thread releases it.
+    /// </summary>
+    internal sealed class WalLockFlow(DbImpl db, WalLockFlow? outer)
+    {
+        public readonly DbImpl Db = db;
+        public readonly WalLockFlow? Outer = outer;
+        public volatile bool Held;
+    }
+
+    private static readonly AsyncLocal<WalLockFlow?> s_walLockFlow = new();
+
+    /// <summary>
+    /// Marks the calling asynchronous flow as about to take a LockWAL. Must be called synchronously by the method the
+    /// user awaits (an AsyncLocal set inside an async method does not flow back to its caller).
+    /// </summary>
+    internal WalLockFlow BeginWalLockFlow()
+    {
+        var flow = new WalLockFlow(this, s_walLockFlow.Value);
+        s_walLockFlow.Value = flow;
+        return flow;
+    }
+
+    /// <summary>True when the calling asynchronous flow took a LockWAL of this DB through the asynchronous API and it is still held.</summary>
+    private bool CurrentFlowHoldsWalLock()
+    {
+        for (WalLockFlow? f = s_walLockFlow.Value; f is not null; f = f.Outer)
+        {
+            if (f.Held && ReferenceEquals(f.Db, this)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>True when the calling thread took a LockWAL through the synchronous API and still holds it.</summary>
+    private bool CurrentThreadHoldsWalLock()
+    {
+        lock (_mutex) return _walLockOwnerThreads is { } owners && owners.ContainsKey(Environment.CurrentManagedThreadId);
+    }
+
+    /// <summary>
+    /// The tail of DBImpl::WaitForPendingWrites: "Wait for any LockWAL to clear" (while
+    /// (!lock_wal_owner_thread_id_counts_.empty()) bg_cv_.Wait()). Called by a write leader (batched or unbatched)
+    /// before it switches a memtable or the WAL, or changes the logical state: LockWAL promises that neither happens
+    /// until UnlockWAL, and a flush of a switched memtable would let the WAL be archived, recycled or deleted under
+    /// the lock. Ends when the DB closes (the close then leads the queue; nothing it does needs the lock). With
+    /// <paramref name="synchronous"/> the wait blocks the thread and needs no thread-pool work (UnlockWAL completes
+    /// the signal directly).
+    /// </summary>
+    private ValueTask WaitForWalUnlockAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _lockWalCount) == 0) return default;
+        return WaitForWalUnlockSlowAsync(synchronous, cancellationToken);
+    }
+
+    /// <summary>
+    /// <see cref="WaitForWalUnlockAsync"/> for the leader of a write group (PreprocessWrite, before it switches a
+    /// memtable or the WAL). The wait is a write stall like the DelayWrite that would follow it: a no_slowdown write
+    /// fails with Incomplete instead of waiting, and the stall barrier is up meanwhile, so queued and later
+    /// no_slowdown writers fail too instead of waiting behind this leader (upstream waits here without either; the
+    /// writes are stopped by the lock in any case).
+    /// </summary>
+    private ValueTask WaitForWalUnlockAsLeaderAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _lockWalCount) == 0) return default;
+        return WaitForWalUnlockAsLeaderSlowAsync(noSlowdown, synchronous, cancellationToken);
+    }
+
+    private async ValueTask WaitForWalUnlockAsLeaderSlowAsync(bool noSlowdown, bool synchronous, CancellationToken cancellationToken)
+    {
+        if (noSlowdown) throw new RocksDbException(StatusCode.Incomplete, "Incomplete: Write stall");
+        _writeThread.BeginWriteStall();
+        try
+        {
+            await WaitForWalUnlockSlowAsync(synchronous, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeThread.EndWriteStall();
+        }
+    }
+
+    private async ValueTask WaitForWalUnlockSlowAsync(bool synchronous, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            Task wait;
+            lock (_mutex)
+            {
+                if (_lockWalCount == 0 || _closing || _shuttingDown || IsDisposed) return;
+                wait = _bgSignal.Task;
+            }
+            TestHooks.Invoke("DBImpl::WaitForPendingWrites:LockWal");
+            if (synchronous) wait.Wait(cancellationToken);
+            else await wait.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
     /// <summary>DBImpl::UnlockWAL: the last unlock releases the write stop and wakes the stalled writers.</summary>
-    public void UnlockWal()
+    /// <param name="ownerThreadId">The thread that took this lock through the synchronous API, 0 otherwise.</param>
+    public void UnlockWal(int ownerThreadId)
     {
+        long stallBegun = 0, nonmemStallBegun = 0;
         // A FlushWAL / SyncWAL called while the WAL is locked uses the WAL outside the write thread, under the WAL I/O
         // lock: the write stop is released only once none is in flight (the stalled writers append to the same WAL).
         SyncValueTask.GetResult(AcquireWalIoLockAsync(synchronous: true));
@@ -81,6 +202,11 @@ internal sealed partial class DbImpl
                 {
                     WriteControllerInstance.ReleaseStop();
                     _maybeStalled = IsWriteStalled();
+                    // "For the last UnlockWAL, we don't want to return from UnlockWAL() until the thread(s) that called
+                    // BeginWriteStall() have had a chance to call EndWriteStall(), so that no_slowdown writes after
+                    // UnlockWAL() are guaranteed to succeed if there's no other source of stall."
+                    stallBegun = _writeThread.GetBegunCountOfOutstandingStall();
+                    if (_twoWriteQueues) nonmemStallBegun = _nonmemWriteThread!.GetBegunCountOfOutstandingStall();
                     SignalBackgroundWork();
                 }
             }
@@ -89,5 +215,10 @@ internal sealed partial class DbImpl
         {
             ReleaseWalIoLock();
         }
+        NoteWalLockOwner(ownerThreadId, -1);
+        // Ensure stalls have cleared. Outside the WAL I/O lock and the mutex: the stalled leader needs neither to end
+        // its stall, but it needs a thread (an asynchronous leader's continuation runs on the thread pool).
+        if (stallBegun != 0) _writeThread.WaitForStallEndedCount(stallBegun);
+        if (nonmemStallBegun != 0) _nonmemWriteThread!.WaitForStallEndedCount(nonmemStallBegun);
     }
 }

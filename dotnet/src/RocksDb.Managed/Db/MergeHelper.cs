@@ -275,7 +275,10 @@ public sealed class MergeHelper : IDisposable
     internal static EntryType TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, MergeExistingValueKind baseKind, ReadOnlySpan<byte> baseValue,
         MergeContext context, IBufferWriter<byte> value, IBufferWriter<byte>? entity)
     {
-        MergeOperandBuffer buf = t_contextScratch ??= new MergeOperandBuffer();
+        // Taken out of the thread's slot while in use: the merge operator may read the DB (a nested Get that resolves
+        // a merge on this thread), which would otherwise clear and refill the buffer the outer operands point into.
+        MergeOperandBuffer buf = t_contextScratch ?? new MergeOperandBuffer();
+        t_contextScratch = null;
         buf.Clear();
         for (int i = 0; i < context.Count; i++) buf.PushOlder(context.GetOperandNewestFirst(i));
         try
@@ -285,6 +288,7 @@ public sealed class MergeHelper : IDisposable
         finally
         {
             buf.Clear();
+            t_contextScratch = buf;
         }
     }
 
@@ -373,7 +377,10 @@ public sealed class MergeHelper : IDisposable
     public static void TimedFullMerge(MergeOperator mergeOperator, ReadOnlySpan<byte> userKey, bool hasBaseValue, ReadOnlySpan<byte> baseValue,
         MergeContext context, IBufferWriter<byte> result)
     {
-        MergeOperandBuffer buf = t_contextScratch ??= new MergeOperandBuffer();
+        // Taken out of the thread's slot while in use: the merge operator may read the DB (a nested Get that resolves
+        // a merge on this thread), which would otherwise clear and refill the buffer the outer operands point into.
+        MergeOperandBuffer buf = t_contextScratch ?? new MergeOperandBuffer();
+        t_contextScratch = null;
         buf.Clear();
         for (int i = 0; i < context.Count; i++) buf.PushOlder(context.GetOperandNewestFirst(i));
         try
@@ -383,6 +390,7 @@ public sealed class MergeHelper : IDisposable
         finally
         {
             buf.Clear();
+            t_contextScratch = buf;
         }
     }
 

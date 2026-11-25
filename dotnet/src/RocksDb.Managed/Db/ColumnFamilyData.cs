@@ -156,7 +156,7 @@ internal sealed class ColumnFamilyData
             BlobFileReadHistogram = Stats.BlobFileReadHist,
             FileIo = db.FileIo,
         };
-        CompactionState = new ColumnFamilyCompactionState(options, Icmp);
+        CompactionState = new ColumnFamilyCompactionState(OptionsSnapshot, Icmp);
         // ioptions.cf_paths (= db_paths): GetPathId of the leveled and universal pickers.
         CompactionState.Picker.PathTargetSizes = db.DbPathTargetSizes;
         if (options.EnableBlobDirectWrite && options.EnableBlobFiles && !db.IsReadOnly)
@@ -293,6 +293,7 @@ internal sealed class ColumnFamilyData
     {
         Format = TableFactory.CreateFormatOptions(Options.TableOptions);
         OptionsSnapshot = Options.Clone();
+        CompactionState.Picker.Options = OptionsSnapshot;
         TableReaderOptions reader = CreateReaderOptions(Options, Format, db);
         Volatile.Write(ref _readerOptions, reader);
         TableCache.ReaderOptions = reader;

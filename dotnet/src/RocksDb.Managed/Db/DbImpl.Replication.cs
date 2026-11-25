@@ -621,7 +621,7 @@ internal sealed partial class DbImpl
             }
             else
             {
-                w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+                w = await EnterUnbatchedIgnoringWalLockAsync(exclusive, ct).ConfigureAwait(false);
                 await AcquireWalIoLockAsync(exclusive).ConfigureAwait(false);
                 break;
             }

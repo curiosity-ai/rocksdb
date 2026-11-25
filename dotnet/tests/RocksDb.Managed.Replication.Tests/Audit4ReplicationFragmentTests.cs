@@ -64,6 +64,9 @@ public sealed class Audit4ReplicationFragmentTests
 
         public IAsyncEnumerable<SnapshotChunk> StreamInitialStateAsync(CancellationToken cancellationToken) => primary.StreamInitialStateAsync(cancellationToken);
 
+        public Task<ReplicaAttachCheck> CheckReplicaLogAsync(ulong latestSeq, long incarnationAtLatest, CancellationToken cancellationToken) =>
+            Task.FromResult(primary.CheckReplicaLog(latestSeq, incarnationAtLatest));
+
         public async IAsyncEnumerable<WalStreamMessage> StreamUpdatesAsync(ulong startSeq, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref Streams);
@@ -322,7 +325,6 @@ public sealed class Audit4ReplicationFragmentTests
             inner.GetFileHashesAsync(candidates, cancellationToken);
         public IAsyncEnumerable<SnapshotChunk> StreamSnapshotAsync(IReadOnlyList<ReplicationFileInfo> verifiedInventory, CancellationToken cancellationToken) =>
             inner.StreamSnapshotAsync(verifiedInventory, cancellationToken);
-        public Task<string?> GetTermsAsync(CancellationToken cancellationToken) => inner.GetTermsAsync(cancellationToken);
     }
 
     /// <summary>
@@ -627,8 +629,8 @@ public sealed class Audit4ReplicationFragmentTests
         await WriteLargeAsync(source, "g", 1, 5 * 1024 * 1024);
         await WriteWorkloadAsync(source, 50, 100, 0);
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), null);
-        await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, CancellationToken.None);
-        using var client = new GrpcReplicationClient(server.Endpoint, TimeSpan.FromSeconds(5));
+        await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
+        using var client = new GrpcReplicationClient(server.Endpoint, TimeSpan.FromSeconds(5), GrpcSecurity.InsecureNoAuthentication);
 
         using var cts = new CancellationTokenSource(TestUtil.Timeout);
         Task<long> follow = ReplicaFollower.FollowAsync(client, replica, 0, cts.Token);
@@ -706,8 +708,8 @@ public sealed class Audit4ReplicationFragmentTests
             var p = new GrpcPair();
             int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
             // Every channel has gRPC's default receive limit: the large write must also replicate in pieces.
-            p.ToB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2));
-            p.ToA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2));
+            p.ToB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
+            p.ToA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
             PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
             {
                 NodeId = id,
@@ -774,7 +776,7 @@ public sealed class Audit4ReplicationFragmentTests
     [TestMethod]
     public async Task ClientWriteAboveFourMegabytesIsUploadedInFragmentsAndReplicated()
     {
-        await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions());
+        await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication });
         string large = Letters(6 * 1024 * 1024, 1);
 
         // The unary RPC used directly: refused by the server, nothing applied.
@@ -818,7 +820,7 @@ public sealed class Audit4ReplicationFragmentTests
     [TestMethod]
     public async Task FragmentedWriteToANonPrimaryIsRefusedLikeTheUnaryOne()
     {
-        await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions());
+        await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication });
         ulong before = p.B.Db.GetLatestSequenceNumber();
         PairWriteResultDto unary = await p.ToB.Service.WriteAsync("k", "v");
         PairWriteResultDto fragmented = await p.ToB.WriteAsync("k", Letters(600_000, 2), CancellationToken.None);
@@ -843,7 +845,7 @@ public sealed class Audit4ReplicationFragmentTests
     {
         await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions
         {
-            FragmentedWrites = new FragmentedWriteOptions { MaxWriteBytes = 1024 * 1024, MaxPendingBytes = 1024 * 1024 },
+            Security = GrpcSecurity.InsecureNoAuthentication, FragmentedWrites = new FragmentedWriteOptions { MaxWriteBytes = 1024 * 1024, MaxPendingBytes = 1024 * 1024 },
         });
         ulong before = p.A.Db.GetLatestSequenceNumber();
         LargeWriteException tooLarge = await Assert.ThrowsExactlyAsync<LargeWriteException>(() => p.ToA.WriteAsync("big", Letters(2 * 1024 * 1024, 3), CancellationToken.None));
@@ -889,11 +891,11 @@ public sealed class Audit4ReplicationFragmentTests
     {
         await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions
         {
-            FragmentedWrites = new FragmentedWriteOptions { IdleTimeout = how == "stalled" ? TimeSpan.FromMilliseconds(300) : TimeSpan.FromSeconds(30) },
+            Security = GrpcSecurity.InsecureNoAuthentication, FragmentedWrites = new FragmentedWriteOptions { IdleTimeout = how == "stalled" ? TimeSpan.FromMilliseconds(300) : TimeSpan.FromSeconds(30) },
         });
         ulong before = p.A.Db.GetLatestSequenceNumber();
         byte[] payload = U("gone" + Letters(600_000, 6));
-        using var client = new GrpcPairClient("A", p.ServerA.Endpoint, TimeSpan.FromSeconds(2));
+        using var client = new GrpcPairClient("A", p.ServerA.Endpoint, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
         using var cts = new CancellationTokenSource();
         global::MagicOnion.ClientStreamingResult<WriteFragmentDto, PairWriteResultDto> call =
             await client.Service.WithCancellationToken(cts.Token).WriteFragmentsAsync();
@@ -934,7 +936,7 @@ public sealed class Audit4ReplicationFragmentTests
     [TestMethod]
     public async Task MalformedUploadsAreRefusedAndApplyNothing()
     {
-        await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions());
+        await using GrpcPair p = await GrpcPair.StartAsync(new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication });
         ulong before = p.A.Db.GetLatestSequenceNumber();
         byte[] payload = U("keyvalue-0123456789");
         WriteFragmentDto Piece(int total, int keyLength, int offset, int length) =>
@@ -997,7 +999,7 @@ public sealed class Audit4ReplicationFragmentTests
         var members = new List<ClusterMember>();
         for (int i = 1; i <= 3; i++) members.Add(new ClusterMember("n" + i, "http://127.0.0.1:" + GrpcNodeServer.FindFreePort()));
         var clients = new Dictionary<string, GrpcClusterClient>();
-        foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1));
+        foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1), GrpcSecurity.InsecureNoAuthentication);
         var hosts = new Dictionary<string, ClusterNodeHost>();
         var servers = new Dictionary<string, GrpcNodeServer>();
         var log = new ConcurrentQueue<string>();
@@ -1021,7 +1023,7 @@ public sealed class Audit4ReplicationFragmentTests
                 }, peer => clients[peer.NodeId]);
                 hosts[m.NodeId] = host;
                 servers[m.NodeId] = await GrpcNodeServer.StartAsync<ClusterService, ClusterNodeHost>(host, System.Net.IPAddress.Loopback,
-                    new Uri(m.Endpoint).Port, CancellationToken.None);
+                    new Uri(m.Endpoint).Port, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
             }
             await hosts["n1"].StartAsync(CancellationToken.None);
             Assert.IsTrue(await hosts["n1"].TryWriteAsLeaderAsync(U("first"), U("1"), CancellationToken.None));

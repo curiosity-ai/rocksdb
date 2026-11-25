@@ -416,7 +416,10 @@ public sealed class Audit5WritePathTests
     {
         /// <summary>UnlockWAL, then a write: the write's WAL record.</summary>
         UnlockThenWrite,
-        /// <summary>A manual flush: its memtable switch writes out and replaces the WAL.</summary>
+        /// <summary>
+        /// A manual flush: its memtable switch writes out and replaces the WAL. Since audit #14 it waits for UnlockWAL
+        /// before it switches (WaitForPendingWrites: "Wait for any LockWAL to clear"), so it never meets the FlushWAL.
+        /// </summary>
         MemtableSwitch,
         /// <summary>Another FlushWAL (with sync).</summary>
         SyncWal,
@@ -454,6 +457,8 @@ public sealed class Audit5WritePathTests
             try
             {
                 TestHooks.Set(WalIoWaitHook, waiting.Set);
+                // The flush racer waits for the WAL lock itself to clear.
+                TestHooks.Set("DBImpl::WaitForPendingWrites:LockWal", waiting.Set);
                 var flusher = new Thread(() =>
                 {
                     try { db.FlushWal(sync: false); }
@@ -491,6 +496,12 @@ public sealed class Audit5WritePathTests
                 WaitHandle.WaitAny([waiting.WaitHandle, fs.Overlapped.WaitHandle]);
                 fs.ReleaseFlush.Set();
                 flusher.Join();
+                if (racer == WalRacer.MemtableSwitch)
+                {
+                    // The flush goes on once the WAL is unlocked.
+                    unlocked = true;
+                    walLock.Dispose();
+                }
                 other.Join();
             }
             finally

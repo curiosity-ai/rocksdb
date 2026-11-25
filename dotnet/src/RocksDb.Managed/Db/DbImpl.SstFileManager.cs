@@ -18,8 +18,6 @@ internal sealed partial class DbImpl
             Options.SstFileManager = new SstFileManager(FileSystem, 0, 0.25, 64UL << 20);
             _ownsSstFileManager = true;
         }
-        // DBImpl::Open: sfm->SetStatisticsPtr(immutable_db_options_.statistics).
-        Options.SstFileManager.Statistics = Options.Statistics;
     }
 
     private void DisposeOwnedSstFileManager()
@@ -37,6 +35,10 @@ internal sealed partial class DbImpl
     private void StartSstFileManager()
     {
         if (Options.SstFileManager is not { } sfm) return;
+        // DBImpl::Open: sfm->SetStatisticsPtr(immutable_db_options_.statistics), once the open has the DB (LOCK taken,
+        // recovery done). Set earlier, a second open of a path already open in this process failed on LOCK but had
+        // already pointed a shared manager's statistics at its own object.
+        sfm.Statistics = Options.Statistics;
         ulong maxWriteBufferSize = 0;
         lock (_mutex)
         {
@@ -83,6 +85,17 @@ internal sealed partial class DbImpl
     }
 
     /// <summary>SstFileManagerImpl::OnCompactionCompletion: drops the reservation of a finished compaction. REQUIRES: mutex.</summary>
+    /// <summary>
+    /// Close: gives back the room still reserved (compactions that were queued and never ran). The manager may be shared
+    /// with other DBs, which would otherwise see less room for good. REQUIRES: mutex.
+    /// </summary>
+    private void ReleaseAllCompactionRoom()
+    {
+        if (_sfmReservedCompactions.Count == 0) return;
+        foreach (KeyValuePair<Compaction, ulong> kv in _sfmReservedCompactions) Options.SstFileManager?.OnCompactionCompletion(kv.Value);
+        _sfmReservedCompactions.Clear();
+    }
+
     private void ReleaseCompactionRoom(Compaction c)
     {
         if (_sfmReservedCompactions.Remove(c, out ulong size)) Options.SstFileManager?.OnCompactionCompletion(size);

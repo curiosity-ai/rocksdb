@@ -417,7 +417,7 @@ Still open from this round:
 - [x] Replication: no compatibility between versions of the layer (never deployed): capability negotiation, fallbacks for older peers, default interface methods, duplicate wire fields, the rocksdb-sharp-shaped `HandleAppendEntries` overload, the `SwitchoverNode` constructor without a peer id and the term-less `WaitForCommitAsync` removed; DTO keys renumbered
 - [x] Replication: chunk sizes are checked at start (`MaxChunkBytes` / `SnapshotChunkBytes`: lower bound in the hosts, gRPC message bound in `GrpcNodeServer.StartAsync`, `GrpcNodeServerOptions.MaxStreamPayloadBytes`); `GrpcWriteOptions.MaxChunkBytes` must be positive (an upper bound is the server's to refuse)
 - [ ] Replication: no rolling upgrade across versions of the replication protocol (all nodes of a deployment run the same version; nothing is versioned or negotiated); a term / epoch map above 4 MiB (about 100 000 leadership changes) cannot be sent over gRPC with the default limits
-- [x] Replication: gRPC transport encrypted and mutually authenticated from a shared secret (`SharedSecretTls`, `GrpcNodeServerOptions.Tls`; off by default); not done: rotating the secret without a restart, the Windows key import path is untested (Linux only here)
+- [x] Replication: gRPC transport encrypted and mutually authenticated from a shared secret (`SharedSecretTls`, `GrpcNodeServerOptions.Security`; running without it is an explicit opt-in, see audit #14 second follow-up); not done: rotating the secret without a restart, the Windows key import path is untested (Linux only here)
 - [ ] Replication: without `SyncWal` a pair still loses acknowledged writes when the replica is unreachable while the primary restarts after a power loss (documented contract)
 
 ## Audit #6 (2026-11-14; docs/validation.md "Audit #6" and "Audit #6 follow-ups")
@@ -508,3 +508,16 @@ Still open from this round:
 - [x] FileSyncWorkers start rule, trash worker / recovery chain exception types, write buffer manager stall re-check, sub-millisecond lock wait spin
 - [x] Replication: resync flag on unexpected exceptions, linked CTS leaks, single-node commit index
 - [ ] OCC parallel validation: first-synchronous-committer window (async commits in flight finish on the pool)
+
+## Audit #14 (2026-11-24; docs/validation.md "Audit #14: second review pass")
+
+- [x] Concurrent SetOptions / SetDBOptions lost updates; rolled-back expirable transaction left the expirable map; nested merge clobbered the per-thread operand buffer; in-place memtable values reported pinned; transaction MultiGet torn across keys (WritePrepared / WriteUnprepared); compaction re-read verify flags; new column family visible before its super version; OnBackgroundError for non-stopping errors
+- [x] No flush before a successful open + failed open waits for jobs; SstFileManager reservation leak; LOG roll failure; sequential file refill; checkpoint waits for purges; OPTIONS files vs disabled deletions
+- [x] LockWAL stops memtable / WAL switches; UnlockWAL waits for stalls to end; SwitchWAL switches empty column families; closed WALs kept while deletions are disabled
+- [x] Atomic flush vs drop; compactions hold an options snapshot; manual compaction room check; max-allowed-space check per output file; ingestion / import install callback; zstd thread contexts; abandoned secondary lookups; truncated row cache entry
+- [x] Replication: failed chunk write no longer skipped (recovery veto + apply marker); plain replication lineage; commit delay controller stale lag; leftover checkpoint directories; restore without CURRENT; attach pin; strict term map; upload duration bound
+- [x] Per-node identities and authorization over gRPC (Node / Operator / Client; insecure mode is an explicit opt-in); resync by restore-then-swap when the disk has room (`ResyncRestoreMode`, default Auto)
+- [x] Mandatory lineage (fallbacks removed); `Resume()` refused on replicas; failed marker write stops following
+- [x] `LockWalAsync` holder flow; rollback reads at the max snapshot; failed commit timestamp check clears the transaction; WriteUnprepared rollback forgets its WAL
+- [ ] Cluster soak cannot cover restore-then-swap (fault file system tracks files by name); swap with an external `WalDir`
+- [ ] Identities: separate operator secret, secret rotation; `FollowerFault` in the gRPC status DTOs; remove unused term / epoch map RPCs

@@ -76,10 +76,20 @@ internal sealed class FileInfoLogger : InfoLogger
     private static ulong NowMicros() => (ulong)(DateTime.UtcNow - DateTime.UnixEpoch).Ticks / 10;
 
     /// <summary>Renames the current LOG (if any) to LOG.old.&lt;micros&gt;, trims old files and creates a new LOG. REQUIRES: _writeLock.</summary>
+    private bool _rollFailed; // a roll closed the old LOG and could not create the new one. Guarded by _writeLock.
+
     private void OpenNewFileLocked()
     {
-        _file?.Dispose();
+        IWritableFile? previous = _file;
         _file = null;
+        try
+        {
+            previous?.Dispose();
+        }
+        catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
+        {
+            // The old file is gone either way; logging goes on in the new one.
+        }
         if (_fs.FileExists(_fileName))
         {
             try
@@ -214,7 +224,26 @@ internal sealed class FileInfoLogger : InfoLogger
         lock (_writeLock)
         {
             IWritableFile? f = _file;
-            if (f is null) return;
+            if (f is null && (!_rollFailed || _closed)) return; // closed (or never opened): nothing to write to
+            if (f is null)
+            {
+                // A roll that could not create the new LOG (no space, no file descriptors) left no file. Upstream's
+                // AutoRollLogger drops the line and tries again at the next one; without a retry here the queue was
+                // never drained again and grew for the life of the process.
+                try
+                {
+                    OpenNewFileLocked();
+                    foreach (string h in _headers) WriteLine(_file!, h);
+                    f = _file;
+                    _rollFailed = false;
+                }
+                catch (Exception e) when (e is IOException or RocksDbException or UnauthorizedAccessException or ObjectDisposedException)
+                {
+                    _queue.Clear();
+                    return;
+                }
+                if (f is null) return;
+            }
             try
             {
                 bool wrote = false;
@@ -256,7 +285,10 @@ internal sealed class FileInfoLogger : InfoLogger
         bool bySize = _maxLogFileSize > 0 && (ulong)_file!.Size >= _maxLogFileSize;
         bool byTime = _logFileTimeToRoll > 0 && (ulong)(Environment.TickCount64 - _fileCreatedTicks) / 1000 >= _logFileTimeToRoll;
         if (!bySize && !byTime) return;
+        // Set while the roll is under way: if creating the new LOG throws, the next drain tries again.
+        _rollFailed = true;
         OpenNewFileLocked();
+        _rollFailed = false;
         // Replay the headers (options dump etc.) at the top of the new file, like AutoRollLogger::RollLogFile.
         foreach (string h in _headers) WriteLine(_file!, h);
     }

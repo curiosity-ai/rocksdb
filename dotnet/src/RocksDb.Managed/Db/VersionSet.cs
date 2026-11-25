@@ -512,6 +512,43 @@ internal sealed class VersionSet : IAsyncDisposable
         else await _manifestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (atomicGroup && n > 1)
+            {
+                // ProcessManifestWrites: the edits of a column family dropped meanwhile are left out of an atomic group
+                // and the group's remaining_entries are counted without them (the group is numbered when it is written,
+                // from the edits kept here); the other column families' edits are installed. Failing the whole group
+                // made an atomic flush racing a drop flush every other column family again. A drop is applied under
+                // _manifestLock, which is held: the check cannot race with it.
+                List<ManifestEditEntry>? kept = null;
+                lock (_db.Mutex)
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (edits[i].Cfd is { Dropped: true })
+                        {
+                            if (kept is null)
+                            {
+                                kept = new List<ManifestEditEntry>(n);
+                                for (int j = 0; j < i; j++) kept.Add(edits[j]);
+                            }
+                        }
+                        else
+                        {
+                            kept?.Add(edits[i]);
+                        }
+                    }
+                    if (kept is { Count: 0 })
+                    {
+                        installedUnderMutex?.Invoke();
+                        return;
+                    }
+                }
+                if (kept is not null)
+                {
+                    edits = kept;
+                    n = kept.Count;
+                }
+            }
             RecoveredVersionState? snapshot = null;
             var newFiles = new FileMetaData[n][][];
             var addedFiles = new FileMetaData[n][][];

@@ -44,7 +44,11 @@ internal sealed partial class DbImpl
     /// </summary>
     private void MaybeScheduleFlush()
     {
-        if (_shuttingDown || IsBgWorkStopped) return;
+        // MaybeScheduleFlushOrCompaction: "if (!opened_successfully_) return" - no background job starts before the
+        // open has succeeded (a write the open itself makes, e.g. to the stats column family, can switch a memtable).
+        // A job started earlier would run next to the open's obsolete-file scan and outlive a failed open, which
+        // releases LOCK. The queued flush is scheduled when the open enables background work.
+        if (!_compactionsEnabled || _shuttingDown || IsBgWorkStopped) return;
         if (Options.AtomicFlush)
         {
             MaybeScheduleAtomicFlush();
@@ -90,9 +94,11 @@ internal sealed partial class DbImpl
     /// atomic_flush the memtables of every column family holding data are switched instead
     /// (DBImpl::SelectColumnFamiliesForAtomicFlush) and flushed as one atomic flush. REQUIRES: write leader.
     /// </summary>
-    private async ValueTask SwitchMemtablesForFlushAsync(IReadOnlyList<ColumnFamilyData> cfds, FlushReason reason, bool synchronous,
+    /// <param name="includeEmpty">Also switch empty memtables (DBImpl::SwitchWAL; not with atomic_flush).</param>
+    private async ValueTask SwitchMemtablesForFlushAsync(IReadOnlyList<ColumnFamilyData> cfds, FlushReason reason, bool includeEmpty, bool synchronous,
         CancellationToken cancellationToken)
     {
+        if (Options.AtomicFlush) includeEmpty = false;
         if (Options.AtomicFlush)
         {
             var all = new List<ColumnFamilyData>();
@@ -113,7 +119,7 @@ internal sealed partial class DbImpl
             for (int i = 0; i < cfds.Count; i++)
             {
                 ColumnFamilyData cfd = cfds[i];
-                if (cfd.Dropped || cfd.Mem.IsEmpty) continue;
+                if (cfd.Dropped || (cfd.Mem.IsEmpty && !includeEmpty)) continue;
                 await SwitchMemtableAsync(cfd, reason, synchronous, cancellationToken).ConfigureAwait(false);
                 switched = true;
             }
@@ -779,6 +785,19 @@ internal sealed partial class DbImpl
     {
         ThrowIfDisposed();
         if (_readOnly) ThrowReadOnly();
+        // DBImpl::FlushMemTable / AtomicFlushMemTables (not for the recovery flushes, which do not come through here).
+        if (!wait && WriteControllerInstance.IsStopped)
+        {
+            throw new RocksDbException(StatusCode.TryAgain,
+                "Writes have been stopped, thus unable to perform manual flush. Please try again later after writes are resumed");
+        }
+        // "if (lock_wal_owner_thread_id_counts_.count(env_->GetThreadID()) > 0) return Status::Aborted(...)": the flush
+        // below waits for LockWAL to clear, which this caller would never do. A lock taken through the synchronous API
+        // has an owner thread (a synchronous flush blocks it); a lock taken through the asynchronous API is known to
+        // the asynchronous flow that took it (and to the flows it started while holding it), whose flush - awaited or
+        // blocking - would wait for an unlock that comes after it.
+        if (wait && ((synchronous && CurrentThreadHoldsWalLock()) || CurrentFlowHoldsWalLock()))
+            throw new RocksDbException(StatusCode.Aborted, "Operation aborted: Likely deadlock as the same thread called LockWAL()");
         // Leads synchronously once the DB has synchronous writers (see LeadsSynchronously); an asynchronous call
         // moves to a write wake-up thread first, so that it never blocks its caller.
         bool exclusive = LeadsSynchronously(synchronous);
@@ -792,7 +811,7 @@ internal sealed partial class DbImpl
             // DBImpl::FlushMemTable does not look at the background error before SwitchMemtable: the memtable is sealed
             // and the flush requested; WaitForFlushMemTables reports the error (only with FlushOptions::wait).
             if (cfd.Dropped) ThrowDropped(cfd);
-            await SwitchMemtablesForFlushAsync([cfd], reason, exclusive, cancellationToken).ConfigureAwait(false);
+            await SwitchMemtablesForFlushAsync([cfd], reason, includeEmpty: false, exclusive, cancellationToken).ConfigureAwait(false);
             lock (_mutex)
             {
                 // DBImpl::FlushMemTable: the column families with sealed memtables get FlushRequested, also when nothing
@@ -992,6 +1011,22 @@ internal sealed partial class DbImpl
             lock (_mutex)
             {
                 if (_backgroundJobs == 0 && _pendingPurges == 0) return;
+                signal = _bgSignal.Task;
+            }
+            if (synchronous) signal.Wait();
+            else await signal.ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Waits until no purge of obsolete files is running (pending_purge_obsolete_files_ == 0).</summary>
+    private async ValueTask WaitForPendingPurgesAsync(bool synchronous)
+    {
+        while (true)
+        {
+            Task signal;
+            lock (_mutex)
+            {
+                if (_pendingPurges == 0) return;
                 signal = _bgSignal.Task;
             }
             if (synchronous) signal.Wait();

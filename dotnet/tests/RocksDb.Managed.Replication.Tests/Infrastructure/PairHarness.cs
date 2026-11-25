@@ -47,6 +47,9 @@ public sealed class PairHarness : IAsyncDisposable
     /// <summary><see cref="PairNodeHostOptions.MaxBatchBytes"/> of the hosts started from now on.</summary>
     public int MaxBatchBytes { get; set; } = WalStreamAssembler.DefaultMaxBatchBytes;
 
+    /// <summary><see cref="PairNodeHostOptions.ResyncRestoreMode"/> of the hosts started from now on.</summary>
+    public SnapshotRestoreMode ResyncRestoreMode { get; set; } = SnapshotRestoreMode.Auto;
+
     public string DbPath(string id) => FileSystemOf is null ? _dir.Sub(id) : "/pair/" + id;
 
     /// <summary>
@@ -88,6 +91,7 @@ public sealed class PairHarness : IAsyncDisposable
             ReplicaAckTimeout = ReplicaAckTimeout,
             YieldToReplicaAheadOnRestart = YieldToReplicaAheadOnRestart,
             MaxBatchBytes = MaxBatchBytes,
+            ResyncRestoreMode = ResyncRestoreMode,
             Switchover = Switchover,
             MaxChunkBytes = 16 * 1024,
             RetryDelay = TimeSpan.FromMilliseconds(50),

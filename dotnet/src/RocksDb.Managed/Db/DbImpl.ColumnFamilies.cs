@@ -35,7 +35,8 @@ internal sealed partial class DbImpl
         // moves to a write wake-up thread first, so that it never blocks its caller.
         bool exclusive = LeadsSynchronously(synchronous);
         if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
-        WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+        // CreateColumnFamilyImpl enters the write thread without WaitForPendingWrites: allowed while the WAL is locked.
+        WriteThread.Writer w = await EnterUnbatchedIgnoringWalLockAsync(exclusive, ct).ConfigureAwait(false);
         ColumnFamilyData cfd;
         try
         {
@@ -58,13 +59,18 @@ internal sealed partial class DbImpl
                 LogNumber = logNumber,
             };
             edit.AddColumnFamily(name);
-            await Versions.LogAndApplyAsync(cfd, edit, exclusive, ct).ConfigureAwait(false);
-            lock (_mutex)
+            // The memtable and the super version are installed in the same mutex hold that makes the column family
+            // visible (DBImpl::CreateColumnFamilyImpl holds mutex_ across LogAndApply and
+            // InstallSuperVersionForConfigChange). Installed in a later critical section, the new column family was
+            // visible without them for a moment: a stats dump, GetLiveFilesMetaData or a read through db.ColumnFamilies
+            // on another thread hit a null super version.
+            ColumnFamilyData created = cfd;
+            await Versions.LogAndApplyAsync(cfd, edit, exclusive, () =>
             {
-                cfd.NextEpochNumber = 1;
-                cfd.Mem = cfd.ConstructNewMemtable(Versions.LastSequence);
-                InstallSuperVersion(cfd);
-            }
+                created.NextEpochNumber = 1;
+                created.Mem = created.ConstructNewMemtable(Versions.LastSequence);
+                InstallSuperVersion(created);
+            }, ct).ConfigureAwait(false);
             RegisterCfForWrite(cfd);
         }
         finally
@@ -149,7 +155,12 @@ internal sealed partial class DbImpl
                 if (FileNames.TryParseFileName(child, out ulong n, out FileType type) && type == FileType.OptionsFile) existing.Add((n, child));
             }
             existing.Sort(static (a, b) => b.Number.CompareTo(a.Number));
-            if (existing.Count > 2)
+            // Old OPTIONS files are obsolete files: not deleted while file deletions are disabled (upstream purges them
+            // through PurgeObsoleteFiles), or a checkpoint / backup that captured the latest OPTIONS file lost it to
+            // the second SetOptions after it. They are trimmed by the next write of an OPTIONS file.
+            bool deletionsDisabled;
+            lock (_mutex) deletionsDisabled = FileDeletionsDisabled;
+            if (existing.Count > 2 && !deletionsDisabled)
             {
                 ulong keepFrom = MinOptionsFileNumberToKeep(existing[1].Number);
                 for (int i = 2; i < existing.Count; i++)

@@ -225,6 +225,7 @@ internal sealed partial class DbImpl
             {
                 SchedulePendingCompaction(cfd);
             }
+            MaybeScheduleFlush(); // flushes queued while the DB was opening
             MaybeScheduleCompaction();
         }
         RescheduleCompactionTrigger();
@@ -716,6 +717,9 @@ internal sealed partial class DbImpl
         Compaction forwarded;
         if (needRepick)
         {
+            // The picked compaction is replaced by an intent and repicked on the bottom thread, which reserves room for
+            // what it picks: the reservation made for this one (keyed by it) would never be released.
+            ReleaseCompactionRoom(c);
             forwarded = CreateIntendedCompactionForwardedToBottomPriorityPool(cfd, c);
         }
         else
@@ -815,6 +819,12 @@ internal sealed partial class DbImpl
                             TestHooks.Invoke("DBImpl::BackgroundCompaction():BeforePickCompaction");
                             snapshots = SnapshotsForCompaction();
                             c = picker.PickCompaction(cfd.Current.Storage, snapshots, CurrentSnapshotChecker, requireMaxOutputLevel: true);
+                            // BackgroundCompaction's repick goes through EnoughRoomForCompaction like any pick.
+                            if (c is not null && !EnoughRoomForCompaction(cfd, c))
+                            {
+                                c = null;
+                                cfd.Current.Storage.ComputeCompactionScore();
+                            }
                             if (c is not null)
                             {
                                 c.InputVersion = cfd.Current;
@@ -1167,7 +1177,13 @@ internal sealed partial class DbImpl
                 bool deleteOutputs = !ok && !(editSubmitted && Versions.IoStatus is not null);
                 if (deleteOutputs && job is not null)
                 {
-                    foreach (ulong n in job.CreatedFileNumbers) TryDeleteFile(FileNames.TableFileName(DbPaths, n, c.OutputPathId));
+                    foreach (ulong n in job.CreatedFileNumbers)
+                    {
+                        string path = FileNames.TableFileName(DbPaths, n, c.OutputPathId);
+                        TryDeleteFile(path);
+                        // The job reported its finished outputs to the SstFileManager (CompactionJob.FinishOutput).
+                        Options.SstFileManager?.OnDeleteFile(path);
+                    }
                 }
                 if (deleteOutputs && remote is not null)
                 {
@@ -1681,6 +1697,13 @@ internal sealed partial class DbImpl
                     }
                     if (!conflict)
                     {
+                        // BackgroundCompaction, manual branch: "First check if we have enough room to do the compaction";
+                        // without room the files are released and the manual compaction ends with CompactionTooLarge.
+                        // (The reservation is released by the job, like for automatic compactions.)
+                        if (c is not null && !EnoughRoomForCompaction(cfd, c))
+                        {
+                            throw new RocksDbException(StatusCode.CompactionTooLarge, "Compaction too large");
+                        }
                         if (c is not null)
                         {
                             c.BlobGarbageCollectionPolicy = options.BlobGarbageCollectionPolicy;

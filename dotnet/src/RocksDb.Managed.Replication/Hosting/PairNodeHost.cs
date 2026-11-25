@@ -71,6 +71,27 @@ public sealed class PairNodeHostOptions
     public TimeSpan DisposeDrainTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// How long this node, as the source of a snapshot, keeps its obsolete files (its WAL) after the snapshot stream
+    /// ended, waiting for the replica to attach to the WAL stream; the first WAL stream it serves ends the wait. Zero
+    /// releases them with the end of the snapshot stream (a flush in between can then force another snapshot).
+    /// </summary>
+    public TimeSpan SnapshotAttachTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How a resync treats the copy this node has (<see cref="SnapshotRestoreMode"/>). Default
+    /// <see cref="SnapshotRestoreMode.Auto"/>: the snapshot is restored next to the current copy and swapped in when the
+    /// volume has room for it (the node then keeps an openable copy for the whole resync), and the current copy is
+    /// deleted first when it has not, or when the free space cannot be determined. The host logs which was chosen.
+    /// </summary>
+    public SnapshotRestoreMode ResyncRestoreMode { get; init; } = SnapshotRestoreMode.Auto;
+
+    /// <summary>
+    /// <see cref="SnapshotRestoreMode.Auto"/>: the free space that must remain beyond the bytes the snapshot announces
+    /// (default 64 MiB).
+    /// </summary>
+    public long ResyncFreeSpaceMarginBytes { get; init; } = SnapshotRestoreOptions.DefaultFreeSpaceMarginBytes;
+
+    /// <summary>
     /// Whether log entries are fsync'd before they count (the counterpart of <see cref="ClusterNodeHostOptions.SyncWal"/>):
     /// a client write before <see cref="PairNodeHost.WriteAsync"/> acknowledges it (and before it is streamed to the
     /// replica), a replicated chunk before the replica's latest sequence number moves past it - which is what a
@@ -145,7 +166,11 @@ public enum PairWriteStatus
 public readonly record struct PairWriteResult(PairWriteStatus Status, string? PrimaryHint, ulong Sequence);
 
 /// <summary>Status of a pair node.</summary>
-public sealed record PairNodeStatus(ReplicationNodeStatus Node, bool Resyncing, int Resyncs, bool WritesOpen, ulong AttachedFromSeq);
+public sealed record PairNodeStatus(ReplicationNodeStatus Node, bool Resyncing, int Resyncs, bool WritesOpen, ulong AttachedFromSeq)
+{
+    /// <summary><see cref="PairNodeHost.FollowerFault"/>: why the node stopped following for good, or null.</summary>
+    public string? FollowerFault { get; init; }
+}
 
 /// <summary>Fault injection for tests (rocksdb-sharp SwitchoverTest's InjectedFaults).</summary>
 public sealed class PairFaults
@@ -184,6 +209,7 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     private int _walStreamFaults;
     private string? _lastWalStreamFault;
     private readonly FollowerResyncPolicy _resyncPolicy = new();
+    private readonly SnapshotAttachPin _attachPin = new();
     // Cancelled whenever this node becomes a replica: ends the WAL streams it serves as primary.
     private CancellationTokenSource _primaryCts = new();
     private Task _resolveTask = Task.CompletedTask;
@@ -206,10 +232,16 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         WalTailer.ValidateChunkSizes(options.MaxChunkBytes, options.SnapshotChunkBytes);
         _cfg = options;
         _peer = peer;
+        Authorization = new ReplicationAuthorizer(options.NodeId, [options.PeerId]);
         _fs = options.DbOptionsFactory().FileSystem;
     }
 
     public string NodeId => _cfg.NodeId;
+    /// <summary>
+    /// Who may call this node's endpoints: its node-to-node endpoints are for the other node of the pair. A transport
+    /// asks it before it hands a call to this host (see <see cref="ReplicationAuthorizer"/>).
+    /// </summary>
+    public ReplicationAuthorizer Authorization { get; }
     public int MaxChunkBytes => _cfg.MaxChunkBytes;
     public int SnapshotChunkBytes => _cfg.SnapshotChunkBytes;
     public RocksDatabase Db => _db;
@@ -233,8 +265,19 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        // A resync that was swapping the restored copy in when the process ended (SnapshotRestoreSwap): completed or
+        // discarded before the directory and the role state in it are touched.
+        string? restoredEpochs = SnapshotRestoreSwap.Recover(_fs, _cfg.DbPath, [RoleDirName], Log);
         _fs.CreateDirectoryIfMissing(_cfg.DbPath);
+        HostResync.DeleteLeftoverCheckpointsOf(_fs, _cfg.DbPath, Log);
         _state = new ReplicationRoleState(_fs, FileSystemHelpers.Combine(_cfg.DbPath, RoleDirName));
+        if (restoredEpochs is not null)
+        {
+            // The swap was done but the epoch map of the restored log had not been stored yet.
+            _state.ReplaceEpochs(restoredEpochs);
+            SnapshotRestoreSwap.ClearPendingDescription(_fs, _cfg.DbPath);
+            Log("applied the epoch map of the snapshot restored before the restart");
+        }
         bool replica = _state.IsFresh ? _cfg.InitialRole == ReplicationRole.Replica : _state.Role == ReplicationRole.Replica;
         if (replica && !_fs.FileExists(FileSystemHelpers.Combine(_cfg.DbPath, "CURRENT")))
         {
@@ -243,6 +286,16 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
             if (_state.IsFresh) _state.Set(0, ReplicationRole.Replica, _cfg.PeerId);
         }
         _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
+        // A chunk failed to apply before this node stopped, and its log does not end where it ended then (the engine
+        // published the failed range, or the restart replayed the failed write): the log end no longer says what this
+        // replica holds. Rebuild before following or being promoted.
+        if (replica && ReplicaApplyGuard.TryReadMarker(_fs, _cfg.DbPath, out ulong appliedBeforeFailure) && ReplicaApplyGuard.IsLogEndUnknown(_db))
+        {
+            Log("a chunk failed to apply before the restart and the log no longer ends at " + appliedBeforeFailure + ": rebuilding from a snapshot");
+            await HostResync.CloseDatabaseAsync(_db, Log).ConfigureAwait(false);
+            await PullSnapshotWithRetryAsync(cancellationToken).ConfigureAwait(false);
+            _db = await OpenDatabaseAsync(cancellationToken).ConfigureAwait(false);
+        }
         if (_cfg.InitialRole == ReplicationRole.Primary) SwitchoverNode.BootstrapPrimary(_state, _db, _cfg.NodeId);
         bool restarted = !_state.IsFresh;
         _node = new SwitchoverNode(_cfg.NodeId, _cfg.PeerId, _state, _db, DetachFromPrimaryAsync);
@@ -334,6 +387,10 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     {
         DbOptions o = _cfg.DbOptionsFactory();
         o.CreateIfMissing = true;
+        // While this node is the replica, the engine must not recover from a background error on its own: the recovery
+        // from a failed WAL write publishes the sequence numbers of a chunk that was not applied (ReplicaApplyGuard).
+        // The node rebuilds from a snapshot instead.
+        o.Listeners.Add(new ReplicaRecoveryVeto(() => Volatile.Read(ref _node) is { } n && n.Role == ReplicationRole.Replica));
         return await RocksDatabase.OpenAsync(_cfg.DbPath, o, cancellationToken).ConfigureAwait(false);
     }
 
@@ -518,7 +575,7 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     public async Task<long> ForcePromoteAsync(CancellationToken cancellationToken) => await _node.ForcePromoteAsync(cancellationToken).ConfigureAwait(false);
 
     public PairNodeStatus GetStatus() =>
-        new(GetNodeStatus(), _resyncing, Resyncs, _node.Writes.IsOpen, Volatile.Read(ref _attachedFromSeq));
+        new(GetNodeStatus(), _resyncing, Resyncs, _node.Writes.IsOpen, Volatile.Read(ref _attachedFromSeq)) { FollowerFault = _followerFault };
 
     public DatabaseDigest? Checksum()
     {
@@ -571,6 +628,8 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
             await foreach (WalStreamMessage m in WalStreamSender.StreamAsync(_db, startSeq, Tag, node.GetEpochForSeq, _cfg.MaxChunkBytes, OnWalStreamFault, cts.Token)
                                .ConfigureAwait(false))
             {
+                // The replica is reading the WAL: the files kept for its snapshot may go.
+                if (_attachPin.HasHolds) _attachPin.ReleaseAll();
                 yield return m;
             }
         }
@@ -596,11 +655,15 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             string dir = _cfg.DbPath.TrimEnd('/') + ".checkpoint-" + Guid.NewGuid().ToString("N");
             using ReplicationSession session = await new ReplicationSource(_db).GetInitialStateAsync(dir, cancellationToken).ConfigureAwait(false);
+            // The epoch map travels with the files it describes, captured now (see ClusterNodeHost.StreamSnapshotAsync).
+            string epochs = _node.SerializeEpochs();
             // A full transfer: after a switchover the two nodes flushed their own SSTs, so a delta would reuse little.
             await foreach (SnapshotChunk c in session.StreamSnapshotAsync([], _cfg.SnapshotChunkBytes, cancellationToken).ConfigureAwait(false))
             {
-                yield return c;
+                yield return c.Kind == SnapshotChunkKind.Plan ? c.WithLogDescription(epochs) : c;
             }
+            // Sent completely: keep the WAL until the replica attaches (before the session re-enables deletions).
+            _attachPin.HoldUntilAttach(_db, _cfg.SnapshotAttachTimeout);
         }
         finally
         {
@@ -611,11 +674,28 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
     // ---------------------------------------------------------------------------------------------------
     // Replica side: the WAL stream from the primary
 
+    // Set when a failed apply could not be recorded durably: this node stops following until it is rebuilt.
+    private volatile string? _followerFault;
+
+    /// <summary>
+    /// Why this node stopped following for good, or null. Set when a chunk failed to apply and the failure could not be
+    /// recorded in the database directory (<see cref="ReplicaApplyGuard"/>): nothing durable would tell a later process
+    /// that its log end may not say what it holds, so the node does not go on as if nothing happened. A resync
+    /// (<see cref="TriggerResync"/>) clears it.
+    /// </summary>
+    public string? FollowerFault => _followerFault;
+
+    private void EnterFollowerFault(string reason)
+    {
+        _followerFault = reason;
+        Log("FOLLOWER FAULT, not following any more (rebuild this node with a resync): " + reason);
+    }
+
     private void EnsureFollowerStream()
     {
         lock (_followerLock)
         {
-            if (_resyncing || _cts.IsCancellationRequested) return;
+            if (_resyncing || _cts.IsCancellationRequested || _followerFault is not null) return;
             if (_followerCts != null && _followerTask is { IsCompleted: false }) return;
             // Not linked to _cts: a linked source keeps a registration on the host's source until it is disposed, one
             // per attach for the life of the host, and it cannot be disposed safely while another flow may still cancel
@@ -683,6 +763,14 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             try
             {
+                // A chunk that failed to apply earlier, and a log that no longer ends where it ended then: the failed
+                // range was published without its data (ReplicaApplyGuard). Attaching would stream from behind it.
+                if (ReplicaApplyGuard.IsLogEndUnknown(_db))
+                {
+                    if (ct.IsCancellationRequested) return;
+                    TriggerResync("a chunk failed to apply and the log end moved past it: the log end is unknown");
+                    return;
+                }
                 // The attach check: our log must be a prefix of the primary's.
                 ulong latest = _db.GetLatestSequenceNumber();
                 ReplicaLogCheck? check = await _peer.CheckReplicaLogAsync(latest, _node.GetEpochForSeq(latest), ct).ConfigureAwait(false);
@@ -769,7 +857,30 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
                         if (ct.IsCancellationRequested) return;
                         // A replica applies the primary's entries at exactly the same sequence numbers - which is what
                         // lets it take over at the handoff point. Anything else diverges.
-                        if (!await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false))
+                        ulong appliedThrough = _db.GetLatestSequenceNumber();
+                        bool applied;
+                        try
+                        {
+                            applied = await consumer.TryIngestChunkAsync(chunk, CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch (Exception ex) when (ex is not OutOfMemoryException)
+                        {
+                            // The write failed: whatever the engine does with the chunk's sequence numbers from here
+                            // on, this node holds its log through appliedThrough and nothing after it.
+                            if (!ReplicaApplyGuard.RecordFailure(_db, appliedThrough))
+                            {
+                                EnterFollowerFault("the chunk at " + (appliedThrough + 1) + " could not be applied (" + ex.Message +
+                                    ") and the failure could not be recorded in the database directory");
+                                return;
+                            }
+                            if (_resyncPolicy.ShouldRebuildAfterApplyFault(appliedThrough))
+                            {
+                                TriggerResync("the chunk at " + (appliedThrough + 1) + " cannot be applied: " + ex.Message);
+                                return;
+                            }
+                            throw;
+                        }
+                        if (!applied)
                         {
                             TriggerResync("stream mismatch: expected seq " + consumer.ExpectedNextSequence + ", got " + m.FirstSequence);
                             return;
@@ -825,11 +936,22 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
 
     private async Task PullSnapshotAsync(CancellationToken ct)
     {
-        SnapshotRestoreResult r = await SnapshotReceiver.ReceiveAsync(_peer.StreamSnapshotAsync(ct), _fs, _cfg.DbPath, [RoleDirName], ct).ConfigureAwait(false);
-        // The restored log is byte-for-byte the primary's, so its epoch map is the right description of it.
-        string? epochs = await _peer.GetEpochsAsync(ct).ConfigureAwait(false) ?? throw new InvalidOperationException("no epoch map from " + _cfg.PeerId);
-        _state.ReplaceEpochs(epochs);
-        Log("snapshot from " + _cfg.PeerId + ": " + r.TransferredFiles + " files, " + r.TransferredBytes + " bytes");
+        // The restored log is byte-for-byte the primary's, so its epoch map is the right description of it. It comes with
+        // the snapshot's plan and is persisted before CURRENT appears, so the files and the map are from one moment.
+        // A snapshot without the map is refused. While this node has a database, the snapshot is restored next to it and
+        // swapped in (SnapshotRestoreMode; the role state moves with the swap, under its own lock), so the node keeps a
+        // copy it can be promoted on if the primary dies during the resync.
+        SnapshotRestoreResult r = await SnapshotReceiver.ReceiveAsync(_peer.StreamSnapshotAsync(ct), _fs, _cfg.DbPath, [RoleDirName],
+            new SnapshotRestoreOptions
+            {
+                Mode = _cfg.ResyncRestoreMode,
+                FreeSpaceMarginBytes = _cfg.ResyncFreeSpaceMarginBytes,
+                RequireLogDescription = true,
+                OnLogDescription = description => _state.ReplaceEpochs(description),
+                SwapGuard = _state.RunExclusive,
+                Log = Log,
+            }, ct).ConfigureAwait(false);
+        Log("snapshot from " + _cfg.PeerId + ": " + r.TransferredFiles + " files, " + r.TransferredBytes + " bytes" + (r.Swapped ? " (swapped in)" : ""));
     }
 
     /// <summary>
@@ -848,6 +970,8 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         {
             if (_resyncing || _cts.IsCancellationRequested) return;
             _resyncing = true;
+            // The rebuild replaces the log whose end was in doubt.
+            _followerFault = null;
             Log("resync: " + reason);
             _resyncTask = Task.Run(PerformResyncAsync);
         }
@@ -967,5 +1091,15 @@ public sealed class PairNodeHost : IAsyncDisposable, IReplicationChunkSizes
         if (_db != null) await _db.DisposeAsync().ConfigureAwait(false);
     }
 
-    private void Log(string message) => _cfg.Log?.Invoke(_cfg.NodeId + ": " + message);
+    private void Log(string message)
+    {
+        try
+        {
+            _cfg.Log?.Invoke(_cfg.NodeId + ": " + message);
+        }
+        catch (Exception)
+        {
+            // The application's logger: an exception from it must not escape a catch block or end a loop of this host.
+        }
+    }
 }

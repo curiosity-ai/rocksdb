@@ -836,7 +836,8 @@ internal sealed partial class DbImpl
     private void StartStatsDump()
     {
         uint period = Options.StatsDumpPeriodSec;
-        if (period == 0 || _infoLog is null) return;
+        // Not after the close began (SetDBOptions racing it): the timer would never be disposed and root the DB.
+        if (period == 0 || _infoLog is null || IsDisposed || IsShuttingDown) return;
         _statsDumpTimer = new Timer(static s => ((DbImpl)s!).DumpStats(), this, TimeSpan.FromSeconds(period), TimeSpan.FromSeconds(period));
     }
 

@@ -46,8 +46,8 @@ internal static class SwitchoverBenchmark
         bool grpc = config.Transport == "grpc";
         var hosts = new Dictionary<string, PairNodeHost>(StringComparer.Ordinal);
         int portA = grpc ? GrpcNodeServer.FindFreePort() : 0, portB = grpc ? GrpcNodeServer.FindFreePort() : 0;
-        GrpcPairClient? toA = grpc ? new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2)) : null;
-        GrpcPairClient? toB = grpc ? new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2)) : null;
+        GrpcPairClient? toA = grpc ? new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication) : null;
+        GrpcPairClient? toB = grpc ? new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication) : null;
         PairNodeHost NewHost(string id)
         {
             string peer = id == "A" ? "B" : "A";
@@ -69,9 +69,9 @@ internal static class SwitchoverBenchmark
         {
             if (grpc)
             {
-                servers.Add(await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(hosts["A"], System.Net.IPAddress.Loopback, portA, CancellationToken.None)
+                servers.Add(await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(hosts["A"], System.Net.IPAddress.Loopback, portA, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None)
                     .ConfigureAwait(false));
-                servers.Add(await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(hosts["B"], System.Net.IPAddress.Loopback, portB, CancellationToken.None)
+                servers.Add(await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(hosts["B"], System.Net.IPAddress.Loopback, portB, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None)
                     .ConfigureAwait(false));
             }
             await hosts["A"].StartAsync(CancellationToken.None).ConfigureAwait(false);

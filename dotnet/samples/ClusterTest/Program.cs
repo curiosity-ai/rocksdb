@@ -31,7 +31,7 @@ static async Task<int> RunNodeAsync(string[] args)
         members.Add(new ClusterMember(kv[0], "http://127.0.0.1:" + kv[1]));
     }
     var clients = new Dictionary<string, GrpcClusterClient>();
-    foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1));
+    foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1), GrpcSecurity.InsecureNoAuthentication);
     ClusterMember self = members.Find(m => m.NodeId == id)!;
     await using var host = new ClusterNodeHost(new ClusterNodeHostOptions
     {
@@ -47,7 +47,7 @@ static async Task<int> RunNodeAsync(string[] args)
         Log = static m => Console.WriteLine(DateTime.UtcNow.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + " " + m),
     }, m => clients[m.NodeId]);
     await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ClusterService, ClusterNodeHost>(host, System.Net.IPAddress.Loopback,
-        new Uri(self.Endpoint).Port, CancellationToken.None);
+        new Uri(self.Endpoint).Port, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
     await host.StartAsync(CancellationToken.None);
     Console.WriteLine("READY " + id);
     await Task.Run(Console.In.ReadToEnd);

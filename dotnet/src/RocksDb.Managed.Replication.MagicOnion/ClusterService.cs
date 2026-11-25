@@ -45,11 +45,23 @@ public interface IClusterService : IService<IClusterService>
     Task<ClientStreamingResult<WriteFragmentDto, bool>> WriteFragmentsAsync();
 }
 
-/// <summary>Server side of <see cref="IClusterService"/>: delegates to the process's <see cref="ClusterNodeHost"/>.</summary>
-public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterService>, IClusterService
+/// <summary>
+/// Server side of <see cref="IClusterService"/>: delegates to the process's <see cref="ClusterNodeHost"/>, after the
+/// host's <see cref="ReplicationAuthorizer"/> accepted the caller. The Raft and data-plane endpoints are for the other
+/// members, each under its own node id (the candidate of a vote request, the leader of a heartbeat and the follower of
+/// an attach check, a WAL stream or a progress report must be the caller); status, writes and checksums are for any
+/// authenticated caller. A refused call fails with PermissionDenied.
+/// </summary>
+public sealed class ClusterService(ClusterNodeHost host, GrpcCallerResolver callers) : ServiceBase<IClusterService>, IClusterService
 {
+    private void Peer(string? claimedNodeId, string operation) =>
+        GrpcAuthorization.Peer(callers, Context.CallContext, host.Authorization, claimedNodeId, operation);
+
+    private void Authenticated(string operation) => GrpcAuthorization.Authenticated(callers, Context.CallContext, host.Authorization, operation);
+
     public async UnaryResult<RequestVoteResultDto> RequestVoteAsync(RequestVoteDto request)
     {
+        Peer(request.CandidateId, nameof(RequestVoteAsync));
         RequestVoteResult r = await host.HandleRequestVoteAsync(new RequestVotePayload(request.Term, request.CandidateId, request.LastLogSeq, request.LastLogTerm),
             Context.CallContext.CancellationToken).ConfigureAwait(false);
         return new RequestVoteResultDto { Term = r.Term, VoteGranted = r.VoteGranted };
@@ -57,21 +69,28 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
 
     public async UnaryResult<AppendEntriesDto> HeartbeatAsync(HeartbeatDto request)
     {
+        Peer(request.LeaderId, nameof(HeartbeatAsync));
         AppendEntriesResult r = await host.HandleHeartbeatAsync(new HeartbeatPayload(request.Term, request.LeaderId, request.PrevLogSeq, request.PrevLogTerm,
             request.LeaderCommit, (ClusterMode)request.LeaderMode), Context.CallContext.CancellationToken).ConfigureAwait(false);
         return new AppendEntriesDto { Term = r.Term, Success = r.Success, LastSeq = r.LastSeq, Reason = r.Reason };
     }
 
-    public UnaryResult<ClusterStatusDto> GetStatusAsync() => UnaryResult.FromResult(ClusterStatusDto.From(host.GetStatus()));
+    public UnaryResult<ClusterStatusDto> GetStatusAsync()
+    {
+        Authenticated(nameof(GetStatusAsync));
+        return UnaryResult.FromResult(ClusterStatusDto.From(host.GetStatus()));
+    }
 
     public async UnaryResult<AttachDto> CheckLogConsistencyAsync(string followerId, ulong latestSeq, long termAtLatest)
     {
+        Peer(followerId, nameof(CheckLogConsistencyAsync));
         ClusterAttachResult r = await host.HandleCheckLogConsistencyAsync(latestSeq, termAtLatest, Context.CallContext.CancellationToken).ConfigureAwait(false);
         return new AttachDto { IsLeader = r.IsLeader, Consistent = r.Consistent, Term = r.Term, Terms = r.Terms };
     }
 
     public async Task<ServerStreamingResult<WalChunkDto>> SyncUpdatesAsync(string followerId, ulong startSeq)
     {
+        Peer(followerId, nameof(SyncUpdatesAsync));
         ServerStreamingContext<WalChunkDto> stream = GetServerStreamingContext<WalChunkDto>();
         // The call's token (client gone, deadline, server stopping) or the host shutting down ends a write that a
         // stalled client would otherwise block forever - with the host's database still in use by this handler.
@@ -81,7 +100,7 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         {
             await foreach (WalStreamMessage m in host.StreamUpdatesAsync(followerId, startSeq, ct).ConfigureAwait(false))
             {
-                await stream.WriteAsync(WalChunkDto.From(m)).WaitAsync(ct).ConfigureAwait(false);
+                await StreamWrites.WriteOrAbortAsync(stream, WalChunkDto.From(m), Context.CallContext, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -90,11 +109,15 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
         return stream.Result();
     }
 
-    public async UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm) =>
-        await host.HandleReportProgressAsync(nodeId, seq, leaderTerm, Context.CallContext.CancellationToken).ConfigureAwait(false);
+    public async UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seq, long leaderTerm)
+    {
+        Peer(nodeId, nameof(ReportLastSyncSequenceNumber));
+        return await host.HandleReportProgressAsync(nodeId, seq, leaderTerm, Context.CallContext.CancellationToken).ConfigureAwait(false);
+    }
 
     public async UnaryResult<Dictionary<string, string>> GetFileHashesAsync(List<FileInfoDto> candidates)
     {
+        Peer(null, nameof(GetFileHashesAsync));
         IReadOnlyDictionary<string, string> r = await host.HandleGetFileHashesAsync(FileInfoDto.To(candidates), Context.CallContext.CancellationToken)
             .ConfigureAwait(false);
         return new Dictionary<string, string>(r, StringComparer.Ordinal);
@@ -102,23 +125,32 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
 
     public async Task<ServerStreamingResult<SnapshotChunkDto>> SyncInitialStateAsync(List<FileInfoDto> verifiedInventory)
     {
+        Peer(null, nameof(SyncInitialStateAsync));
         ServerStreamingContext<SnapshotChunkDto> stream = GetServerStreamingContext<SnapshotChunkDto>();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
         CancellationToken ct = linked.Token;
         await foreach (SnapshotChunk c in host.StreamSnapshotAsync(FileInfoDto.To(verifiedInventory), ct).ConfigureAwait(false))
         {
-            await stream.WriteAsync(SnapshotChunkDto.From(c)).WaitAsync(ct).ConfigureAwait(false);
+            await StreamWrites.WriteOrAbortAsync(stream, SnapshotChunkDto.From(c), Context.CallContext, ct).ConfigureAwait(false);
         }
         return stream.Result();
     }
 
-    public UnaryResult<string> GetRaftTermsAsync() => UnaryResult.FromResult(host.HandleGetTerms());
+    public UnaryResult<string> GetRaftTermsAsync()
+    {
+        Peer(null, nameof(GetRaftTermsAsync));
+        return UnaryResult.FromResult(host.HandleGetTerms());
+    }
 
-    public async UnaryResult<bool> WriteAsync(string key, string value) =>
-        await ApplyAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), Context.CallContext.CancellationToken).ConfigureAwait(false);
+    public async UnaryResult<bool> WriteAsync(string key, string value)
+    {
+        Authenticated(nameof(WriteAsync));
+        return await ApplyAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), Context.CallContext.CancellationToken).ConfigureAwait(false);
+    }
 
     public async Task<ClientStreamingResult<WriteFragmentDto, bool>> WriteFragmentsAsync()
     {
+        Authenticated(nameof(WriteFragmentsAsync));
         ClientStreamingContext<WriteFragmentDto, bool> stream = GetClientStreamingContext<WriteFragmentDto, bool>();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(Context.CallContext.CancellationToken, host.Stopping);
         CancellationToken ct = Context.CallContext.CancellationToken;
@@ -130,7 +162,11 @@ public sealed class ClusterService(ClusterNodeHost host) : ServiceBase<IClusterS
     private ValueTask<bool> ApplyAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, CancellationToken cancellationToken) =>
         host.WriteCommittedAsync(key, value, TimeSpan.FromSeconds(10), cancellationToken);
 
-    public UnaryResult<DigestDto> ChecksumAsync() => UnaryResult.FromResult(DigestDto.From(host.Checksum()));
+    public UnaryResult<DigestDto> ChecksumAsync()
+    {
+        Authenticated(nameof(ChecksumAsync));
+        return UnaryResult.FromResult(DigestDto.From(host.Checksum()));
+    }
 }
 
 /// <summary>
@@ -143,7 +179,11 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
     private readonly IClusterService _client;
     private readonly TimeSpan _unaryTimeout;
 
-    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout) : this(peer, unaryTimeout, new GrpcChannelOptions())
+    /// <summary>
+    /// A client of the member <paramref name="peer"/>. <paramref name="security"/>: with a shared secret the channel
+    /// presents this process's identity and accepts only a server that proves to be <paramref name="peer"/>.
+    /// </summary>
+    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout, GrpcSecurity security) : this(peer, unaryTimeout, security, new GrpcChannelOptions())
     {
     }
 
@@ -152,12 +192,13 @@ public sealed class GrpcClusterClient : IClusterNodeClient, IDisposable
     /// so a healed network partition is noticed quickly). What the options leave open is filled in with
     /// <see cref="GrpcTransportDefaults.Apply"/>: keep-alive pings unless a handler or client is set.
     /// </summary>
-    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout, GrpcChannelOptions channelOptions)
+    public GrpcClusterClient(ClusterMember peer, TimeSpan unaryTimeout, GrpcSecurity security, GrpcChannelOptions channelOptions)
     {
         ArgumentNullException.ThrowIfNull(peer);
+        ArgumentNullException.ThrowIfNull(security);
         ArgumentNullException.ThrowIfNull(channelOptions);
         NodeId = peer.NodeId;
-        _channel = GrpcChannel.ForAddress(peer.Endpoint, GrpcTransportDefaults.Apply(channelOptions));
+        _channel = GrpcChannel.ForAddress(peer.Endpoint, security.ApplyToChannel(channelOptions, peer.Endpoint, peer.NodeId));
         _client = MagicOnionClient.Create<IClusterService>(_channel);
         _unaryTimeout = unaryTimeout;
     }

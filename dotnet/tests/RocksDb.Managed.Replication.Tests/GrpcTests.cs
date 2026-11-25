@@ -21,9 +21,9 @@ public sealed class GrpcTests
         await using RocksDatabase source = await RocksDatabase.OpenAsync(dir.Sub("primary"), o);
         await WriteWorkloadAsync(source, 0, 500, 0);
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), new AdaptiveCommitDelayController(1)) { MaxChunkBytes = 16 * 1024 };
-        await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, CancellationToken.None);
+        await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
 
-        using var client = new GrpcReplicationClient(server.Endpoint);
+        using var client = new GrpcReplicationClient(server.Endpoint, GrpcSecurity.InsecureNoAuthentication);
         SnapshotRestoreResult r = await ReplicaFollower.SyncInitialStateAsync(client, LocalFileSystem.Instance, dir.Sub("replica"), [], CancellationToken.None);
         Assert.IsTrue(r.TransferredFiles > 0);
         await using RocksDatabase replica = await RocksDatabase.OpenAsync(dir.Sub("replica"), DbOpts(null));
@@ -55,8 +55,8 @@ public sealed class GrpcTests
     {
         using var dir = new TempDir("grpc-pair");
         int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
-        var toB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2));
-        var toA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2));
+        var toB = new GrpcPairClient("B", "http://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
+        var toA = new GrpcPairClient("A", "http://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), GrpcSecurity.InsecureNoAuthentication);
         PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
         {
             NodeId = id,
@@ -68,8 +68,8 @@ public sealed class GrpcTests
         }, peer);
         await using PairNodeHost a = Host("A", toB);
         await using PairNodeHost b = Host("B", toA);
-        await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, CancellationToken.None);
-        await using GrpcNodeServer serverB = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(b, System.Net.IPAddress.Loopback, portB, CancellationToken.None);
+        await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
+        await using GrpcNodeServer serverB = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(b, System.Net.IPAddress.Loopback, portB, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
         await a.StartAsync(CancellationToken.None);
         await b.StartAsync(CancellationToken.None);
 
@@ -93,7 +93,7 @@ public sealed class GrpcTests
         var members = new List<ClusterMember>();
         for (int i = 1; i <= 3; i++) members.Add(new ClusterMember("n" + i, "http://127.0.0.1:" + GrpcNodeServer.FindFreePort()));
         var clients = new Dictionary<string, GrpcClusterClient>();
-        foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1));
+        foreach (ClusterMember m in members) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromSeconds(1), GrpcSecurity.InsecureNoAuthentication);
         var hosts = new Dictionary<string, ClusterNodeHost>();
         var servers = new Dictionary<string, GrpcNodeServer>();
         try
@@ -115,7 +115,7 @@ public sealed class GrpcTests
                 }, peer => clients[peer.NodeId]);
                 hosts[m.NodeId] = host;
                 servers[m.NodeId] = await GrpcNodeServer.StartAsync<ClusterService, ClusterNodeHost>(host, System.Net.IPAddress.Loopback,
-                    new Uri(m.Endpoint).Port, CancellationToken.None);
+                    new Uri(m.Endpoint).Port, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication }, CancellationToken.None);
             }
             await hosts["n1"].StartAsync(CancellationToken.None);
             for (int i = 0; i < 100; i++) Assert.IsTrue(await hosts["n1"].TryWriteAsLeaderAsync(U(K(i)), U(V(i, 0)), CancellationToken.None));

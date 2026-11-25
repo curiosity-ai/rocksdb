@@ -67,6 +67,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
             // manager may flush too ("suboptimal but still correct").
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
+            await WaitForWalUnlockAsLeaderAsync(noSlowdown, synchronous, cancellationToken).ConfigureAwait(false);
             await HandleWriteBufferManagerFlushAsync(synchronous, cancellationToken).ConfigureAwait(false);
         }
         // Writers of all DBs using the manager stall once memory usage exceeds the limit; the current write too.
@@ -109,7 +110,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
         WriteBufferManager wbm = WriteBufferManager;
         LogInfo("Flushing triggered to alleviate write buffer memory usage. Write buffer is using " + wbm.MemoryUsage +
                 " bytes out of a total of " + wbm.BufferSize + ".");
-        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WriteBufferManager, synchronous, cancellationToken).ConfigureAwait(false);
+        await SwitchMemtablesForFlushAsync(cfds, FlushReason.WriteBufferManager, includeEmpty: false, synchronous, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -237,6 +238,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
             if (!retryLocalFlush) continue;
             if (_pipelined) await WaitForMemTableWritersAsync(synchronous).ConfigureAwait(false);
             await WaitForPendingWritesAsync(synchronous).ConfigureAwait(false);
+            await WaitForWalUnlockAsLeaderAsync(noSlowdown: false, synchronous, cancellationToken).ConfigureAwait(false);
             await HandleWriteBufferManagerFlushAsync(synchronous, cancellationToken).ConfigureAwait(false);
         }
         RecordWriteStall(start);
@@ -277,7 +279,7 @@ internal sealed partial class DbImpl : IWriteBufferManagerFlushInitiator
             ColumnFamilyData? cfd;
             lock (_mutex) cfd = CollectFlushableColumnFamilies(includeWaitingImmutable: true, out _, out _);
             if (cfd is not null)
-                await SwitchMemtablesForFlushAsync([cfd], FlushReason.WriteBufferManager, exclusive, CancellationToken.None).ConfigureAwait(false);
+                await SwitchMemtablesForFlushAsync([cfd], FlushReason.WriteBufferManager, includeEmpty: false, exclusive, CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {

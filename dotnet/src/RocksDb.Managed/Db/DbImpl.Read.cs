@@ -19,6 +19,15 @@ internal sealed partial class DbImpl
         return snap.SequenceNumber;
     }
 
+    /// <summary>
+    /// Read options with WritePreparedTxnDB::GetMaxSnapshot (a snapshot at kMaxSequenceNumber that is in no snapshot
+    /// list): a read with a callback then looks at every version and leaves visibility to the callback, as the
+    /// rollback of a WritePrepared / WriteUnprepared transaction needs ("roptions.snapshot = wpt_db_->GetMaxSnapshot()").
+    /// </summary>
+    internal ReadOptions MaxSnapshotReadOptions =>
+        _maxSnapshotReadOptions ??= new ReadOptions { Snapshot = new Snapshot(this, DbFormat.MaxSequenceNumber, 0) };
+    private ReadOptions? _maxSnapshotReadOptions;
+
     /// <summary>Validates the snapshot of <paramref name="options"/> (before any reference is taken).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ValidateReadSnapshot(ReadOptions? options)

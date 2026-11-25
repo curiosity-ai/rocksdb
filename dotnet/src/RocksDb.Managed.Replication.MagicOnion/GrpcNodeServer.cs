@@ -134,16 +134,24 @@ public sealed class GrpcNodeServerOptions
     public FragmentedWriteOptions FragmentedWrites { get; init; } = new();
 
     /// <summary>
-    /// Null (the default): plaintext HTTP/2 that accepts every caller - for a trusted network only. Otherwise the
-    /// server speaks TLS and accepts only clients that hold the same shared secret (<see cref="SharedSecretTls"/>);
-    /// <see cref="GrpcNodeServer.Endpoint"/> is then an <c>https://</c> address. The caller keeps ownership and
-    /// disposes it after the server.
+    /// How the server is secured; there is no default. <see cref="GrpcSecurity.SharedSecret"/>: the server speaks TLS,
+    /// accepts only callers that hold a secret of the deployment, and tells the services who each caller is
+    /// (<see cref="GrpcNodeServer.Endpoint"/> is then an <c>https://</c> address). <see cref="GrpcSecurity.InsecureNoAuthentication"/>:
+    /// plaintext HTTP/2 that accepts every caller for every call - an explicit choice, for a trusted network only.
     /// </summary>
-    public SharedSecretTls? Tls { get; init; }
+    public required GrpcSecurity Security { get; init; }
+
+    /// <summary>
+    /// For a server of a plain replication primary (<see cref="ReplicationService"/>) with authentication: the node ids
+    /// of its replicas, in the order of their replica index. Only these nodes may read its streams, and each reports
+    /// its progress under its own index. Required then; ignored for the pair and cluster services, whose hosts know
+    /// their peers, and without authentication.
+    /// </summary>
+    public IReadOnlyList<string>? ReplicaNodeIds { get; init; }
 }
 
 /// <summary>
-/// A Kestrel (HTTP/2; plaintext unless <see cref="GrpcNodeServerOptions.Tls"/> is set; loopback by default) server exposing one MagicOnion service backed by a singleton -
+/// A Kestrel (HTTP/2; TLS or plaintext as <see cref="GrpcNodeServerOptions.Security"/> says; loopback by default) server exposing one MagicOnion service backed by a singleton -
 /// the StartServerAsync of rocksdb-sharp's sample hosts. Port 0 picks a free port; <see cref="Endpoint"/> is the bound
 /// address.
 /// </summary>
@@ -161,14 +169,8 @@ public sealed class GrpcNodeServer : IAsyncDisposable
     /// <summary>The large client writes this server is receiving (<see cref="GrpcNodeServerOptions.FragmentedWrites"/>).</summary>
     public FragmentedWriteBudget FragmentedWrites { get; }
 
-    /// <summary>The bound address, e.g. "http://127.0.0.1:51234" ("https://..." with <see cref="GrpcNodeServerOptions.Tls"/>).</summary>
+    /// <summary>The bound address, e.g. "https://127.0.0.1:51234" ("http://..." without authentication).</summary>
     public string Endpoint { get; }
-
-    /// <summary>Starts a server for <typeparamref name="TService"/> whose constructor receives <paramref name="backend"/>.</summary>
-    public static Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, IPAddress address, int port, CancellationToken cancellationToken)
-        where TService : class, IServiceMarker
-        where TBackend : class =>
-        StartAsync<TService, TBackend>(backend, address, port, new GrpcNodeServerOptions(), cancellationToken);
 
     /// <summary>Starts a server for <typeparamref name="TService"/> with <paramref name="options"/>.</summary>
     public static async Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, IPAddress address, int port, GrpcNodeServerOptions options,
@@ -183,19 +185,46 @@ public sealed class GrpcNodeServer : IAsyncDisposable
         {
             GrpcTransportDefaults.EnsureChunkSizesFit(sizes, options.MaxStreamPayloadBytes);
         }
+        ArgumentNullException.ThrowIfNull(options.Security);
+        SharedSecretTls? tls = options.Security.Tls;
+        // A server's own identity is a node's: clients check it (SharedSecretTls.IsExpectedServer).
+        if (tls is not null && tls.Identity.Kind != RocksDb.Managed.Replication.Hosting.ReplicationCallerKind.Node)
+        {
+            throw new ArgumentException("A server needs the SharedSecretTls of a node (ReplicationCaller.Node), not of " + tls.Identity + ".", nameof(options));
+        }
+        if (tls is not null && backend is RocksDb.Managed.Replication.Hosting.ClusterNodeHost cluster && cluster.NodeId != tls.Identity.Name)
+        {
+            throw new ArgumentException("The server's identity " + tls.Identity + " is not the host's node id '" + cluster.NodeId + "'.", nameof(options));
+        }
+        if (tls is not null && backend is RocksDb.Managed.Replication.Hosting.PairNodeHost pair && pair.NodeId != tls.Identity.Name)
+        {
+            throw new ArgumentException("The server's identity " + tls.Identity + " is not the host's node id '" + pair.NodeId + "'.", nameof(options));
+        }
+        RocksDb.Managed.Replication.Hosting.ReplicationAuthorizer? replicaAuthorizer = null;
+        if (backend is RocksDb.Managed.Replication.Hosting.ReplicationPrimary)
+        {
+            if (tls is not null && options.ReplicaNodeIds is null)
+            {
+                throw new ArgumentException("A replication primary served with authentication needs GrpcNodeServerOptions.ReplicaNodeIds: the node ids of its replicas.",
+                    nameof(options));
+            }
+            replicaAuthorizer = RocksDb.Managed.Replication.Hosting.ReplicationAuthorizer.ForReplicas(options.ReplicaNodeIds ?? []);
+        }
         var fragmentedWrites = new FragmentedWriteBudget(options.FragmentedWrites);
         WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
         builder.Services.AddGrpc(o => o.MaxReceiveMessageSize = options.MaxReceiveMessageSize);
         builder.Services.AddMagicOnion();
         builder.Services.AddSingleton(backend);
         builder.Services.AddSingleton(fragmentedWrites);
+        builder.Services.AddSingleton(new GrpcCallerResolver(options.Security));
+        if (replicaAuthorizer is not null) builder.Services.AddSingleton(replicaAuthorizer);
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(o =>
         {
             o.Listen(address, port, lo =>
             {
                 lo.Protocols = HttpProtocols.Http2;
-                if (options.Tls is { } tls)
+                if (tls is not null)
                 {
                     lo.UseHttps(tls.ConfigureServer);
                 }
@@ -225,10 +254,10 @@ public sealed class GrpcNodeServer : IAsyncDisposable
     }
 
     /// <summary>Starts a loopback server on a free port.</summary>
-    public static Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, CancellationToken cancellationToken)
+    public static Task<GrpcNodeServer> StartAsync<TService, TBackend>(TBackend backend, GrpcNodeServerOptions options, CancellationToken cancellationToken)
         where TService : class, IServiceMarker
         where TBackend : class =>
-        StartAsync<TService, TBackend>(backend, IPAddress.Loopback, 0, cancellationToken);
+        StartAsync<TService, TBackend>(backend, IPAddress.Loopback, 0, options, cancellationToken);
 
     public async ValueTask DisposeAsync()
     {

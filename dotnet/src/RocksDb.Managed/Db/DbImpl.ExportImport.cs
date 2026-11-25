@@ -147,7 +147,7 @@ internal sealed partial class DbImpl
             // moves to a write wake-up thread first, so that it never blocks its caller.
             bool exclusive = LeadsSynchronously(synchronous);
             if (exclusive && !synchronous && !WriteThread.OnWakeupThread) await WriteThread.WakeupThreads.SwitchTo();
-            WriteThread.Writer w = await EnterUnbatchedAsync(exclusive, ct).ConfigureAwait(false);
+            WriteThread.Writer w = await EnterUnbatchedIgnoringWalLockAsync(exclusive, ct).ConfigureAwait(false);
             BeginIngestion();
             try
             {
@@ -158,7 +158,19 @@ internal sealed partial class DbImpl
                 TestHooks.Invoke("DBImpl::CreateColumnFamilyWithImport:BeforeLogAndApply");
                 try
                 {
-                    await Versions.LogAndApplyAsync(cfd, edit, exclusive, ct).ConfigureAwait(false);
+                    // Installed in the mutex hold that installs the version, like ingestion.
+                    ColumnFamilyData target = cfd;
+                    ulong importedSeqno = largestSeqno;
+                    await Versions.LogAndApplyAsync(cfd, edit, exclusive, () =>
+                    {
+                        // Imported files keep their sequence numbers: the DB's last sequence must cover them.
+                        if (importedSeqno > Versions.LastSequence)
+                        {
+                            Versions.SetLastSequence(importedSeqno);
+                            Versions.SetLastPublishedSequence(importedSeqno);
+                        }
+                        InstallSuperVersion(target);
+                    }, ct).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -166,16 +178,6 @@ internal sealed partial class DbImpl
                     // MANIFEST that CURRENT names: the imported files must stay (see IngestExternalFilesAsync).
                     keepFiles = Versions.IoStatus is not null;
                     throw;
-                }
-                lock (_mutex)
-                {
-                    // Imported files keep their sequence numbers: the DB's last sequence must cover them.
-                    if (largestSeqno > Versions.LastSequence)
-                    {
-                        Versions.SetLastSequence(largestSeqno);
-                        Versions.SetLastPublishedSequence(largestSeqno);
-                    }
-                    InstallSuperVersion(cfd);
                 }
                 ok = true;
             }

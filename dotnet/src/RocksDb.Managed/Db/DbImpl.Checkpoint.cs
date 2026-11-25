@@ -257,6 +257,11 @@ internal sealed partial class DbImpl
         HashSet<ulong>? openWals = _readOnly ? null : new HashSet<ulong>();
         if (!_readOnly) await FlushWalAsync(sync: false, synchronous, openWals, ct).ConfigureAwait(false);
 
+        // GetSortedWalFilesImpl: "while (pending_purge_obsolete_files_ > 0 || bg_purge_scheduled_ > 0) bg_cv_.Wait()" - a
+        // purge that took its obsolete WALs before deletions were disabled is still deleting or archiving them; a WAL
+        // listed now and gone a moment later failed the checkpoint with "not found". Purges that start now delete
+        // nothing (deletions are disabled), so the wait ends.
+        await WaitForPendingPurgesAsync(synchronous).ConfigureAwait(false);
         // GetSortedWalFilesImpl(need_seqnos = false): empty WALs (e.g. the one created by the flush above) are live too.
         List<WalFileInfo> liveWalFiles = GetSortedWalFiles(includeArchived: false, needSeqnos: false);
         // Link WAL files. Copy exact size of last one because it is the only one that has changes after the last flush.

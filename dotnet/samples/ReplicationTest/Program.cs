@@ -67,7 +67,7 @@ static async Task<int> RunPrimaryAsync(string dbPath, int port, int seconds)
     await using RocksDatabase db = await RocksDatabase.OpenAsync(dbPath, new DbOptions { CreateIfMissing = true, WalTtlSeconds = 60 });
     var delay = new AdaptiveCommitDelayController(1, new AdaptiveCommitDelayOptions { DelayPerLagUnitMs = 5, LagUnit = 1000 });
     var primary = new ReplicationPrimary(db, dbPath + ".checkpoints", delay);
-    await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, System.Net.IPAddress.Loopback, port,
+    await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, System.Net.IPAddress.Loopback, port, new GrpcNodeServerOptions { Security = GrpcSecurity.InsecureNoAuthentication },
         CancellationToken.None);
     Console.WriteLine("[Primary] serving on " + server.Endpoint);
     var sw = Stopwatch.StartNew();
@@ -100,7 +100,7 @@ static async Task<int> RunPrimaryAsync(string dbPath, int port, int seconds)
 
 static async Task<int> RunReplicaAsync(string dbPath, int primaryPort)
 {
-    using var client = new GrpcReplicationClient("http://127.0.0.1:" + primaryPort);
+    using var client = new GrpcReplicationClient("http://127.0.0.1:" + primaryPort, GrpcSecurity.InsecureNoAuthentication);
     while (true)
     {
         SnapshotRestoreResult r = await ReplicaFollower.SyncInitialStateAsync(client, LocalFileSystem.Instance, dbPath, [], CancellationToken.None);

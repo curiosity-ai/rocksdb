@@ -245,7 +245,7 @@ internal static class NodeMain
         };
         var clients = new Dictionary<string, GrpcClusterClient>(StringComparer.Ordinal);
         foreach (ClusterMember m in members)
-            if (m.NodeId != cfg.NodeId) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromMilliseconds(cfg.RpcTimeoutMs), channelOptions);
+            if (m.NodeId != cfg.NodeId) clients[m.NodeId] = new GrpcClusterClient(m, TimeSpan.FromMilliseconds(cfg.RpcTimeoutMs), GrpcSecurity.InsecureNoAuthentication, channelOptions);
 
         var clock = new SkewedTimeProvider();
         ClusterMember self = members.Find(m => m.NodeId == cfg.NodeId)!;
@@ -265,6 +265,9 @@ internal static class NodeMain
             HeartbeatIntervalMs = cfg.HeartbeatMs,
             MaxChunkBytes = 64 * 1024,
             SnapshotChunkBytes = 256 * 1024,
+            // The fault file system tracks the files of the database directory by name and cannot follow a resync that
+            // replaces the directory itself (restore-then-swap), so the soak resyncs in place.
+            ResyncRestoreMode = SnapshotRestoreMode.AlwaysDeleteFirst,
             RetryDelay = TimeSpan.FromMilliseconds(100),
             TimeProvider = clock,
             Log = m =>

@@ -72,6 +72,11 @@ internal sealed class CompactionJob
 
     private readonly bool _targetFileSizeIsUpperBound;
     private readonly bool _enableOutputHash;
+    // verify_output_flags (with paranoid_file_checks folded in) as of the job's start: SetOptions edits the column
+    // family's options object in place, and flags read again at the end could ask for a hash comparison of outputs
+    // that were written without a hash (a spurious Corruption, which stops the DB). Upstream's job holds the
+    // MutableCFOptions copy taken when the compaction was picked.
+    private readonly VerifyOutputFlags _verifyOutputFlags;
 
     /// <summary>The DB's snapshot checker (WritePrepared / WriteUnprepared), or null.</summary>
     internal SnapshotChecker? SnapshotChecker { get; init; }
@@ -140,7 +145,8 @@ internal sealed class CompactionJob
         _targetFileSizeIsUpperBound = compaction.Options.TargetFileSizeIsUpperBound;
         // CompactionJob::ProcessKeyValueCompaction: enable the output hash if paranoid_file_checks is on or if
         // verify_output_flags includes kVerifyIteration, so that VerifyOutputFiles() can compare it.
-        _enableOutputHash = compaction.Options.ParanoidFileChecks || (compaction.Options.VerifyOutputFlags & VerifyOutputFlags.Iteration) != 0;
+        _verifyOutputFlags = EffectiveVerifyOutputFlags(compaction.Options);
+        _enableOutputHash = (_verifyOutputFlags & VerifyOutputFlags.Iteration) != 0;
         _preserveSeqnoAfter = _earliestSnapshot;
     }
 
@@ -965,7 +971,7 @@ internal sealed class CompactionJob
     {
         if (OutputDirectory is not null) return;
         if (group.Outputs.Count > 0) TestHooks.Invoke("CompactionJob::VerifyOutputFiles:Start");
-        VerifyOutputFlags flags = EffectiveVerifyOutputFlags(_c.Options);
+        VerifyOutputFlags flags = _verifyOutputFlags;
         bool shouldVerify = (flags & VerifyOutputFlags.EnableForLocalCompaction) != 0;
         for (int i = 0; i < group.Outputs.Count; i++)
         {
@@ -1453,6 +1459,14 @@ internal sealed class CompactionJob
         // FinishCompactionOutputFile: LogAndNotifyTableFileCreationFinished with the builder's table properties
         // (outputs.UpdateTableProperties()), once the file is closed and before the subcompaction completes.
         _db.NotifyOnTableFileCreated(_cfd, JobId, outputPath, meta.FileSize, TableFileCreationReason.Compaction, null, builder.Properties);
+        // FinishCompactionOutputFile: "Report new file to SstFileManagerImpl" and, once the tracked files reach the limit,
+        // fail the compaction with SpaceLimit("Max allowed space was reached") - before anything is installed, so the
+        // outputs are discarded and the inputs stay (the limit used to be checked only after the install).
+        if (OutputDirectory is null && meta.PathId == 0 && _db.Options.SstFileManager is { } sfm)
+        {
+            sfm.OnAddFile(outputPath, meta.FileSize);
+            if (sfm.IsMaxAllowedSpaceReached) throw RocksDbException.SpaceLimit("Max allowed space was reached");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------

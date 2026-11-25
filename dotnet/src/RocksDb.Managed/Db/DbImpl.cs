@@ -1248,6 +1248,7 @@ internal sealed partial class DbImpl : IAsyncDisposable
             }
             CancelBackgroundCompactions();
             await WaitForBackgroundWorkAsync(synchronous).ConfigureAwait(false);
+            lock (_mutex) ReleaseAllCompactionRoom();
             // logs_.clear() (ClearWriter): closed WALs not synced yet are closed without a sync, like the current one.
             // Under the WAL I/O lock: a FlushWAL called while LockWAL is held may be using them outside the write thread.
             // CloseHelper: a failure of LogWriterNumber::ClearWriter (the WAL's WriteBuffer) is logged and the first one is

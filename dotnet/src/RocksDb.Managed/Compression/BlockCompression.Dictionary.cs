@@ -23,6 +23,24 @@ public static unsafe partial class BlockCompression
 {
     [ThreadStatic] private static nint t_zstdDictCctx;
     [ThreadStatic] private static nint t_zstdDictDctx;
+    [ThreadStatic] private static ZstdThreadContexts? t_zstdDictOwner;
+
+    /// <summary>
+    /// Owns the calling thread's native dictionary contexts: reachable only from the thread's static slot, so its
+    /// finalizer frees them once the thread is gone (a retired thread-pool thread used to leak both; upstream's
+    /// compression context cache is per core and freed at exit).
+    /// </summary>
+    private sealed class ZstdThreadContexts
+    {
+        public nint Cctx;
+        public nint Dctx;
+
+        ~ZstdThreadContexts()
+        {
+            if (Cctx != 0) Methods.ZSTD_freeCCtx((ZSTD_CCtx_s*)Cctx);
+            if (Dctx != 0) Methods.ZSTD_freeDCtx((ZSTD_DCtx_s*)Dctx);
+        }
+    }
 
     /// <summary>
     /// Like <see cref="TryCompress(CompressionType, ReadOnlySpan{byte}, int, int, int, IBufferWriter{byte})"/> using
@@ -52,6 +70,7 @@ public static unsafe partial class BlockCompression
         {
             cctx = Methods.ZSTD_createCCtx();
             t_zstdDictCctx = (nint)cctx;
+            (t_zstdDictOwner ??= new ZstdThreadContexts()).Cctx = (nint)cctx;
         }
         Methods.ZSTD_CCtx_reset(cctx, ZSTD_ResetDirective.ZSTD_reset_session_and_parameters);
         Methods.ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter.ZSTD_c_compressionLevel, zlevel);
@@ -146,6 +165,7 @@ public static unsafe partial class BlockCompression
         {
             dctx = Methods.ZSTD_createDCtx();
             t_zstdDictDctx = (nint)dctx;
+            (t_zstdDictOwner ??= new ZstdThreadContexts()).Dctx = (nint)dctx;
         }
         ZSTD_DDict_s* ddict = dictionary.GetZstdDDict();
         nuint got;

@@ -35,9 +35,9 @@ public sealed class GrpcSharedSecretTlsTests
     [TestMethod]
     public void OnlyACertificateMadeWithTheSecretIsTrusted()
     {
-        using var a = new SharedSecretTls(Secret(1));
-        using var sameSecret = new SharedSecretTls(Secret(1));
-        using var otherSecret = new SharedSecretTls(Secret(2));
+        using var a = new SharedSecretTls(Secret(1), ReplicationCaller.Node("a"));
+        using var sameSecret = new SharedSecretTls(Secret(1), ReplicationCaller.Node("b"));
+        using var otherSecret = new SharedSecretTls(Secret(2), ReplicationCaller.Node("b"));
 
         Assert.IsTrue(a.IsTrustedPeer(a.Certificate));
         Assert.IsTrue(a.IsTrustedPeer(sameSecret.Certificate), "another process with the same secret");
@@ -49,11 +49,11 @@ public sealed class GrpcSharedSecretTlsTests
         Assert.IsFalse(a.IsTrustedPeer(plain), "a certificate without the proof");
 
         // The proof of a trusted certificate copied into a certificate with another key: it covers the public key.
-        X509Extension proof = sameSecret.Certificate.Extensions[SharedSecretTls.ProofExtensionOid]!;
+        X509Extension proof = sameSecret.Certificate.Extensions[SharedSecretTls.NodeProofExtensionOid]!;
         using X509Certificate2 copied = SelfSigned(_ => new X509Extension(proof.Oid!, proof.RawData, critical: false));
         Assert.IsFalse(a.IsTrustedPeer(copied), "a copied proof on another key");
 
-        using X509Certificate2 garbage = SelfSigned(_ => new X509Extension(SharedSecretTls.ProofExtensionOid, [1, 2, 3], critical: false));
+        using X509Certificate2 garbage = SelfSigned(_ => new X509Extension(SharedSecretTls.NodeProofExtensionOid, [1, 2, 3], critical: false));
         Assert.IsFalse(a.IsTrustedPeer(garbage), "a malformed proof");
 
         // The public certificate alone (what an observer of a handshake sees) passes the check; the handshake itself
@@ -78,7 +78,8 @@ public sealed class GrpcSharedSecretTlsTests
         Assert.IsTrue(https.ClientCertificateValidation!(sameSecret.Certificate, null, System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors));
         Assert.IsFalse(https.ClientCertificateValidation!(otherSecret.Certificate, null, System.Net.Security.SslPolicyErrors.None), "a client with another secret");
 
-        ArgumentException tooShort = Assert.ThrowsExactly<ArgumentException>(() => new SharedSecretTls(new byte[SharedSecretTls.MinSecretBytes - 1]));
+        ArgumentException tooShort = Assert.ThrowsExactly<ArgumentException>(
+            () => new SharedSecretTls(new byte[SharedSecretTls.MinSecretBytes - 1], ReplicationCaller.Node("a")));
         Assert.AreEqual("secret", tooShort.ParamName);
     }
 
@@ -87,18 +88,18 @@ public sealed class GrpcSharedSecretTlsTests
     {
         using var dir = new TempDir("grpc-tls-repl");
         // Declared first, disposed last: after the server and the channel.
-        using var primaryTls = new SharedSecretTls(Secret(7));
-        using var replicaTls = new SharedSecretTls(Secret(7));
+        using var primaryTls = new SharedSecretTls(Secret(7), ReplicationCaller.Node("primary"));
+        using var replicaTls = new SharedSecretTls(Secret(7), ReplicationCaller.Node("replica-0"));
         DbOptions o = DbOpts(null);
         o.WalTtlSeconds = 600;
         await using RocksDatabase source = await RocksDatabase.OpenAsync(dir.Sub("primary"), o);
         await WriteWorkloadAsync(source, 0, 500, 0);
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), new AdaptiveCommitDelayController(1)) { MaxChunkBytes = 16 * 1024 };
         await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, System.Net.IPAddress.Loopback, 0,
-            new GrpcNodeServerOptions { Tls = primaryTls }, CancellationToken.None);
+            new GrpcNodeServerOptions { Security = GrpcSecurity.SharedSecret(primaryTls), ReplicaNodeIds = ["replica-0"] }, CancellationToken.None);
         StringAssert.StartsWith(server.Endpoint, "https://");
 
-        using var client = new GrpcReplicationClient(server.Endpoint, TimeSpan.FromSeconds(10), replicaTls.CreateChannelOptions());
+        using var client = new GrpcReplicationClient(server.Endpoint, TimeSpan.FromSeconds(10), GrpcSecurity.SharedSecret(replicaTls));
         SnapshotRestoreResult r = await ReplicaFollower.SyncInitialStateAsync(client, LocalFileSystem.Instance, dir.Sub("replica"), [], CancellationToken.None);
         Assert.IsTrue(r.TransferredFiles > 0);
         await using RocksDatabase replica = await RocksDatabase.OpenAsync(dir.Sub("replica"), DbOpts(null));
@@ -131,12 +132,12 @@ public sealed class GrpcSharedSecretTlsTests
     public async Task SwitchoverPairOverTlsWithTheSharedSecret()
     {
         using var dir = new TempDir("grpc-tls-pair");
-        using var tlsA = new SharedSecretTls(Secret(9));
-        using var tlsB = new SharedSecretTls(Secret(9));
-        using var tlsClient = new SharedSecretTls(Secret(9));
+        using var tlsA = new SharedSecretTls(Secret(9), ReplicationCaller.Node("A"));
+        using var tlsB = new SharedSecretTls(Secret(9), ReplicationCaller.Node("B"));
+        using var tlsClient = new SharedSecretTls(Secret(9), ReplicationCaller.Client("writer"));
         int portA = GrpcNodeServer.FindFreePort(), portB = GrpcNodeServer.FindFreePort();
-        var toB = new GrpcPairClient("B", "https://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), tlsA.CreateChannelOptions());
-        var toA = new GrpcPairClient("A", "https://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), tlsB.CreateChannelOptions());
+        var toB = new GrpcPairClient("B", "https://127.0.0.1:" + portB, TimeSpan.FromSeconds(2), GrpcSecurity.SharedSecret(tlsA));
+        var toA = new GrpcPairClient("A", "https://127.0.0.1:" + portA, TimeSpan.FromSeconds(2), GrpcSecurity.SharedSecret(tlsB));
         PairNodeHost Host(string id, IPairNodeClient peer) => new(new PairNodeHostOptions
         {
             NodeId = id,
@@ -149,13 +150,13 @@ public sealed class GrpcSharedSecretTlsTests
         await using PairNodeHost a = Host("A", toB);
         await using PairNodeHost b = Host("B", toA);
         await using GrpcNodeServer serverA = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(a, System.Net.IPAddress.Loopback, portA,
-            new GrpcNodeServerOptions { Tls = tlsA }, CancellationToken.None);
+            new GrpcNodeServerOptions { Security = GrpcSecurity.SharedSecret(tlsA) }, CancellationToken.None);
         await using GrpcNodeServer serverB = await GrpcNodeServer.StartAsync<PairService, PairNodeHost>(b, System.Net.IPAddress.Loopback, portB,
-            new GrpcNodeServerOptions { Tls = tlsB }, CancellationToken.None);
+            new GrpcNodeServerOptions { Security = GrpcSecurity.SharedSecret(tlsB) }, CancellationToken.None);
         await a.StartAsync(CancellationToken.None);
         await b.StartAsync(CancellationToken.None);
 
-        using (var writer = new GrpcPairClient("client", serverA.Endpoint, TimeSpan.FromSeconds(5), tlsClient.CreateChannelOptions()))
+        using (var writer = new GrpcPairClient("A", serverA.Endpoint, TimeSpan.FromSeconds(5), GrpcSecurity.SharedSecret(tlsClient)))
         {
             Assert.IsTrue((await writer.WriteAsync("k", "v", CancellationToken.None)).Applied);
             Assert.IsTrue((await writer.WriteAsync("big", new string('x', 1024 * 1024), CancellationToken.None)).Applied, "an upload in pieces");
@@ -171,20 +172,23 @@ public sealed class GrpcSharedSecretTlsTests
     public async Task CallersWithoutTheSecretAreRefused()
     {
         using var dir = new TempDir("grpc-tls-refuse");
-        using var serverTls = new SharedSecretTls(Secret(3));
-        using var goodTls = new SharedSecretTls(Secret(3));
-        using var wrongTls = new SharedSecretTls(Secret(4));
+        using var serverTls = new SharedSecretTls(Secret(3), ReplicationCaller.Node("primary"));
+        using var goodTls = new SharedSecretTls(Secret(3), ReplicationCaller.Node("replica-0"));
+        using var wrongTls = new SharedSecretTls(Secret(4), ReplicationCaller.Node("replica-0"));
         await using RocksDatabase source = await RocksDatabase.OpenAsync(dir.Sub("primary"), DbOpts(null));
         var primary = new ReplicationPrimary(source, dir.Sub("checkpoints"), new AdaptiveCommitDelayController(1));
         await using GrpcNodeServer server = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(primary, System.Net.IPAddress.Loopback, 0,
-            new GrpcNodeServerOptions { Tls = serverTls }, CancellationToken.None);
+            new GrpcNodeServerOptions { Security = GrpcSecurity.SharedSecret(serverTls), ReplicaNodeIds = ["replica-0"] }, CancellationToken.None);
 
         async Task<Grpc.Core.StatusCode?> ProbeAsync(string endpoint, GrpcChannelOptions options)
         {
-            using var client = new GrpcReplicationClient(endpoint, TimeSpan.FromSeconds(5), options);
+            // The raw service client: the probes below bring their own (deliberately wrong) handlers.
+            using GrpcChannel channel = GrpcChannel.ForAddress(endpoint, GrpcTransportDefaults.Apply(options));
+            IReplicationService client = global::MagicOnion.Client.MagicOnionClient.Create<IReplicationService>(channel)
+                .WithOptions(new Grpc.Core.CallOptions(deadline: DateTime.UtcNow + TimeSpan.FromSeconds(5)));
             try
             {
-                await client.ReportProgressAsync(0, 0, CancellationToken.None);
+                await client.ReportLastSyncSequenceNumber(0, 0);
                 return null;
             }
             catch (Grpc.Core.RpcException e)
@@ -210,7 +214,7 @@ public sealed class GrpcSharedSecretTlsTests
         // A client that accepts any server and presents a certificate made with another secret: the server refuses it.
         // This isolates the server's check from the client's.
         var wrongCertificate = new System.Net.Http.SocketsHttpHandler();
-        wrongTls.ConfigureClient(wrongCertificate);
+        wrongTls.ConfigureClient(wrongCertificate, null);
         wrongCertificate.SslOptions.RemoteCertificateValidationCallback = static (_, _, _, _) => true;
         AssertRefused(await ProbeAsync(server.Endpoint, new GrpcChannelOptions { HttpHandler = wrongCertificate, DisposeHttpClient = true }));
 
@@ -229,7 +233,8 @@ public sealed class GrpcSharedSecretTlsTests
         await using RocksDatabase other = await RocksDatabase.OpenAsync(dir.Sub("other"), DbOpts(null));
         var otherPrimary = new ReplicationPrimary(other, dir.Sub("other-checkpoints"), new AdaptiveCommitDelayController(1));
         await using GrpcNodeServer impostor = await GrpcNodeServer.StartAsync<ReplicationService, ReplicationPrimary>(otherPrimary, System.Net.IPAddress.Loopback, 0,
-            new GrpcNodeServerOptions { Tls = wrongTls }, CancellationToken.None);
+            new GrpcNodeServerOptions { Security = GrpcSecurity.SharedSecret(new SharedSecretTls(Secret(4), ReplicationCaller.Node("primary"))), ReplicaNodeIds = ["replica-0"] },
+            CancellationToken.None);
         AssertRefused(await ProbeAsync(impostor.Endpoint, goodTls.CreateChannelOptions()));
     }
 }

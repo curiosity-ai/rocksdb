@@ -152,6 +152,13 @@ public enum SnapshotChunkKind
 public readonly struct SnapshotChunk
 {
     private SnapshotChunk(SnapshotChunkKind kind, ulong sequenceNumber, IReadOnlyList<string>? keepFiles, string? fileName, long fileSize, long offset,
+        ReadOnlyMemory<byte> content, string? logDescription)
+        : this(kind, sequenceNumber, keepFiles, fileName, fileSize, offset, content)
+    {
+        LogDescription = logDescription;
+    }
+
+    private SnapshotChunk(SnapshotChunkKind kind, ulong sequenceNumber, IReadOnlyList<string>? keepFiles, string? fileName, long fileSize, long offset,
         ReadOnlyMemory<byte> content)
     {
         Kind = kind;
@@ -163,8 +170,11 @@ public readonly struct SnapshotChunk
         Content = content;
     }
 
-    public static SnapshotChunk Plan(ulong sequenceNumber, IReadOnlyList<string> keepFiles) =>
-        new(SnapshotChunkKind.Plan, sequenceNumber, keepFiles, null, 0, 0, default);
+    public static SnapshotChunk Plan(ulong sequenceNumber, IReadOnlyList<string> keepFiles) => Plan(sequenceNumber, keepFiles, -1);
+
+    /// <summary>A plan that also announces <see cref="TransferBytes"/> (-1: unknown).</summary>
+    public static SnapshotChunk Plan(ulong sequenceNumber, IReadOnlyList<string> keepFiles, long transferBytes) =>
+        new(SnapshotChunkKind.Plan, sequenceNumber, keepFiles, null, transferBytes < 0 ? -1 : transferBytes, 0, default);
 
     public static SnapshotChunk FileData(string fileName, long fileSize, long offset, ReadOnlyMemory<byte> content) =>
         new(SnapshotChunkKind.FileData, 0, null, fileName, fileSize, offset, content);
@@ -179,6 +189,27 @@ public readonly struct SnapshotChunk
 
     /// <summary>Plan only: the consumer's verified files that are reused and not transferred.</summary>
     public IReadOnlyList<string> KeepFiles { get; }
+
+    /// <summary>
+    /// Plan only: the total size of the files the stream will transfer, or -1 when the source did not say. The receiver
+    /// compares it with its free disk space to decide whether it can restore next to its current copy
+    /// (<see cref="SnapshotRestoreMode.Auto"/>). Travels in <see cref="FileSize"/>.
+    /// </summary>
+    public long TransferBytes => Kind == SnapshotChunkKind.Plan ? FileSize : 0;
+
+    /// <summary>
+    /// Plan only, optional: the source's description of the log the snapshot holds - the term map of a Raft leader, the
+    /// epoch map of a pair primary, the lineage of a plain primary - captured with the checkpoint. The receiver persists
+    /// it before the restored directory becomes an openable database (<see cref="SnapshotReceiver.OnLogDescription"/>),
+    /// so the files and their description always come from the same moment of the same source. Null from a source that
+    /// sends none; the hosts and <see cref="Hosting.ReplicaFollower"/> refuse such a snapshot
+    /// (<see cref="SnapshotReceiver.RequireLogDescription"/>).
+    /// </summary>
+    public string? LogDescription { get; }
+
+    /// <summary>A copy of a plan with <see cref="LogDescription"/> set (other kinds are returned unchanged).</summary>
+    public SnapshotChunk WithLogDescription(string? logDescription) =>
+        Kind != SnapshotChunkKind.Plan ? this : new(Kind, SequenceNumber, KeepFiles, FileName, FileSize, Offset, Content, logDescription);
 
     public string? FileName { get; }
     public long FileSize { get; }
@@ -303,8 +334,16 @@ public sealed class ReplicationSession : IDisposable
     {
         ArgumentNullException.ThrowIfNull(consumerInventory);
         ArgumentOutOfRangeException.ThrowIfLessThan(chunkSize, 1);
-        ReplicationDeltaPlan plan = ReplicationDelta.Compute(GetManifest(), consumerInventory);
-        yield return SnapshotChunk.Plan(SequenceNumber, plan.FilesToReuse);
+        List<ReplicationFileInfo> manifest = GetManifest();
+        ReplicationDeltaPlan plan = ReplicationDelta.Compute(manifest, consumerInventory);
+        // The receiver sizes its restore by this (SnapshotRestoreMode.Auto).
+        long transferBytes = 0;
+        var toTransfer = new HashSet<string>(plan.FilesToTransfer, StringComparer.Ordinal);
+        foreach (ReplicationFileInfo f in manifest)
+        {
+            if (f.FileName is not null && toTransfer.Contains(f.FileName)) transferBytes += f.Size;
+        }
+        yield return SnapshotChunk.Plan(SequenceNumber, plan.FilesToReuse, transferBytes);
         int transferred = 0;
         byte[] buffer = RocksArrayPool<byte>.Shared.Rent(chunkSize);
         try
