@@ -71,6 +71,18 @@ public sealed class ManifestLogWriter : IManifestRecordWriter, IDisposable, IAsy
         return new ManifestLogWriter(fs.CreateWritable(path, truncate: true));
     }
 
+    /// <summary>
+    /// Creates (truncating) the MANIFEST file at <paramref name="path"/>, reserving space in blocks of
+    /// <paramref name="preallocationBlockSize"/> bytes as it grows (VersionSet::CreateManifestWriter and DBImpl::NewDB:
+    /// SetPreallocationBlockSize(manifest_preallocation_size)); 0 reserves nothing.
+    /// </summary>
+    internal static ManifestLogWriter Create(IFileSystem fs, string path, long preallocationBlockSize)
+    {
+        ArgumentNullException.ThrowIfNull(fs);
+        if (preallocationBlockSize <= 0) return Create(fs, path);
+        return new ManifestLogWriter(fs.CreateWritable(path, truncate: true, new WritableFileOptions { PreallocationBlockSize = preallocationBlockSize }));
+    }
+
     /// <summary>The underlying log writer (e.g. for its file size).</summary>
     public LogWriter Log => _log;
 

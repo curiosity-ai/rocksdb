@@ -376,7 +376,16 @@ internal sealed partial class DbImpl
         ulong newLogNumber = Versions.NewFileNumber();
         // Like upstream (a TODO there), the first WAL of an open records no predecessor, even when recovered WALs are kept
         // (avoid_flush_during_recovery).
-        _log = CreateWal(newLogNumber, predecessor: null, recycleLogNumber: 0);
+        // DB::Open: GetWalPreallocateBlockSize(max_write_buffer_size), the largest write_buffer_size of the opened column
+        // families.
+        long preallocateBlockSize;
+        lock (_mutex)
+        {
+            ulong maxWriteBufferSize = 0;
+            foreach (ColumnFamilyData cfd in Versions.ColumnFamilies) maxWriteBufferSize = Math.Max(maxWriteBufferSize, cfd.Options.WriteBufferSize);
+            preallocateBlockSize = GetWalPreallocateBlockSize(maxWriteBufferSize);
+        }
+        _log = CreateWal(newLogNumber, predecessor: null, recycleLogNumber: 0, preallocateBlockSize);
         _logEmpty = true;
         lock (_mutex)
         {
@@ -760,7 +769,7 @@ internal sealed partial class DbImpl
         string manifest = FileNames.DescriptorFileName(DbName, manifestNumber);
         try
         {
-            using (ManifestLogWriter log = ManifestLogWriter.Create(ManifestFileSystem, manifest))
+            using (ManifestLogWriter log = ManifestLogWriter.Create(ManifestFileSystem, manifest, ManifestPreallocationBlockSize))
             {
                 var writer = new ManifestWriter(log);
                 await writer.AddEditAsync(edit, 0, sync: true, synchronous, ct).ConfigureAwait(false);

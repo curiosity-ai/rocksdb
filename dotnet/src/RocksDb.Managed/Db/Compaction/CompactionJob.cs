@@ -1294,6 +1294,11 @@ internal sealed class CompactionJob
         };
         // Compaction outputs (of every subcompaction and of the proximal level) are charged to the DB's rate limiter at IO_LOW.
         WritableFileOptions fileOptions = _db.TableFileWriteOptions(IoPriority.Low);
+        // OpenCompactionOutputFile: writable_file->SetPreallocationBlockSize(compaction->OutputFilePreallocationSize()).
+        if (_db.Options.AllowFallocate)
+        {
+            fileOptions = fileOptions.WithPreallocationBlockSize((long)Math.Min(_c.OutputFilePreallocationSize(), long.MaxValue));
+        }
         // OpenCompactionOutputFile: "Fire events." NotifyTableFileCreationStarted before the file is created.
         _db.NotifyOnTableFileCreationStarted(_cfd, JobId, _out.Path, TableFileCreationReason.Compaction);
         try
