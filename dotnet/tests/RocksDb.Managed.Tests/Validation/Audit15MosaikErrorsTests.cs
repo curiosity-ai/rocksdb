@@ -275,6 +275,55 @@ public sealed class Audit15MosaikErrorsTests
         Assert.AreEqual(0, escaped.Count, string.Join("\n", escaped));
     }
 
+    /// <summary>
+    /// io_posix.cc IOError(): ENOENT is PathNotFound, ENOTDIR (a component of the path is a regular file) a plain IOError
+    /// "Not a directory". .NET throws DirectoryNotFoundException for both on Unix, and the port reported ENOTDIR as
+    /// PathNotFound, on which Mosaik's SafeRocksDb.TryRecoverException fails fast where the default build rethrows
+    /// (Audit15MosaikErrorsCompatTests.JournalFolderReplacedByAFileGetsTheSameMosaikReactionsAsNative).
+    /// </summary>
+    [TestMethod]
+    public void NotADirectoryIsAPlainIOErrorAndAMissingDirectoryIsPathNotFound()
+    {
+        if (OperatingSystem.IsWindows()) Assert.Inconclusive("ENOTDIR is a POSIX errno (Windows reports ERROR_PATH_NOT_FOUND for both)");
+        string dir = Path.Combine(Path.GetTempPath(), "a15-enotdir-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string file = Path.Combine(dir, "journal");
+            File.WriteAllBytes(file, [1]);
+            string missing = Path.Combine(dir, "missing");
+            Action[] underFile =
+            [
+                () => LocalFileSystem.Instance.CreateWritable(Path.Combine(file, "000006.log"), truncate: true, WritableFileOptions.Default).Dispose(),
+                () => LocalFileSystem.Instance.OpenRandomAccess(Path.Combine(file, "000007.sst")).Dispose(),
+                () => LocalFileSystem.Instance.CreateDirectoryIfMissing(Path.Combine(file, "archive")),
+                () => LocalFileSystem.Instance.DeleteFile(Path.Combine(file, "000006.log")),
+            ];
+            foreach (Action a in underFile)
+            {
+                RocksDbException e = Assert.ThrowsExactly<RocksDbException>(a);
+                Assert.AreEqual(StatusCode.IOError, e.Code, e.Message);
+                Assert.AreEqual(StatusSubCode.None, e.SubCode, e.Message);
+                StringAssert.Contains(e.Message, "Not a directory");
+            }
+            Action[] underMissing =
+            [
+                () => LocalFileSystem.Instance.CreateWritable(Path.Combine(missing, "000006.log"), truncate: true, WritableFileOptions.Default).Dispose(),
+                () => LocalFileSystem.Instance.OpenRandomAccess(Path.Combine(missing, "000007.sst")).Dispose(),
+                () => LocalFileSystem.Instance.OpenRandomAccess(Path.Combine(dir, "000008.sst")).Dispose(),
+            ];
+            foreach (Action a in underMissing)
+            {
+                RocksDbException e = Assert.ThrowsExactly<RocksDbException>(a);
+                Assert.AreEqual(StatusSubCode.PathNotFound, e.SubCode, e.Message);
+            }
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
     /// <summary>The blocks a file has allocated (stat %b, 512-byte units), or -1 when stat is not available.</summary>
     private static long AllocatedBlocks(string path)
     {

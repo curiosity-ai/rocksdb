@@ -208,7 +208,17 @@ public class RocksDbException : Exception
         if (e is RocksDbException r) return r;
         if (e is AggregateException { InnerExceptions.Count: 1 } a) return FromIOException(context, path, a.InnerExceptions[0]);
         string detail = e.Message;
-        if (e is FileNotFoundException or DirectoryNotFoundException) return PathNotFound(Join(context, path, detail), e);
+        if (e is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // On Unix .NET reports ENOTDIR (a component of the path is a file) as DirectoryNotFoundException too, with no
+            // errno to tell it from ENOENT; io_posix.cc IOError() makes only ENOENT a PathNotFound, ENOTDIR stays a plain
+            // IOError (errnoStr: "Not a directory"). Told apart by the path (failure path only).
+            if (e is DirectoryNotFoundException && !OperatingSystem.IsWindows() && path is not null && HasFileAncestor(path))
+            {
+                return IOError(Join(context, path, "Not a directory"), e);
+            }
+            return PathNotFound(Join(context, path, detail), e);
+        }
         if (e is IOException io)
         {
             int h = io.HResult;
@@ -222,6 +232,17 @@ public class RocksDbException : Exception
             }
         }
         return IOError(Join(context, path, detail), e);
+    }
+
+    /// <summary>Whether the closest existing ancestor of <paramref name="path"/> is not a directory (open(2) then fails with ENOTDIR).</summary>
+    private static bool HasFileAncestor(string path)
+    {
+        for (string? p = Path.GetDirectoryName(path); !string.IsNullOrEmpty(p); p = Path.GetDirectoryName(p))
+        {
+            if (Directory.Exists(p)) return false;
+            if (File.Exists(p)) return true;
+        }
+        return false;
     }
 
     /// <summary>

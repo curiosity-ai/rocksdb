@@ -687,6 +687,34 @@ public sealed class Audit15MosaikErrorsCompatTests
     }
 
     /// <summary>
+    /// The journal folder is replaced by a regular file while the DB runs (a volume mounted over it, a misconfigured
+    /// deployment): creating the next WAL fails with ENOTDIR, which io_posix.cc IOError() leaves a plain IOError ("Not a
+    /// directory"), so Mosaik rethrows; only ENOENT is PathNotFound, on which Mosaik fails fast. .NET reports ENOTDIR as
+    /// DirectoryNotFoundException, which the port took for ENOENT.
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000)]
+    public void JournalFolderReplacedByAFileGetsTheSameMosaikReactionsAsNative()
+    {
+        List<Step> Run(Opener open)
+        {
+            using var dir = new TempDir("a15-notdir");
+            string db = Path.Combine(dir.Path, "db"), wal = Path.Combine(dir.Path, "journal");
+            using IMosaikDb d = open(db, wal, lowMemoryMode: true);
+            var log = new Log(d);
+            Assert.IsNull(d.Put("nodes", U("a"), U("v-a")));
+            Directory.Delete(wal, recursive: true);
+            File.WriteAllBytes(wal, [1, 2, 3]);
+            log.Write("flush that switches the WAL", d.Flush("nodes"));
+            log.Write("put after the failed switch", d.Put("nodes", U("k4"), U("v")));
+            log.FlushThread("flush thread", d.FlushDefault());
+            log.Close("close");
+            return log.Steps;
+        }
+        AssertSameReactions(Run(s_managed), Run(s_native));
+    }
+
+    /// <summary>
     /// The database folder is removed while the DB runs: the next flush cannot create its table file (ENOENT ->
     /// PathNotFound, kFlush: a fatal background error), writes then fail with it, and the close cannot verify the
     /// MANIFEST (VersionSet::Close writes a new one, which fails): native's rocksdb_close drops that status, the managed
