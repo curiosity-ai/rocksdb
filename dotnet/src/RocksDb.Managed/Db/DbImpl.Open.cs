@@ -79,6 +79,10 @@ internal sealed partial class DbImpl
     /// <summary>recovered_seq of DBImpl::Open: the next sequence after a point-in-time recovery found corruption, else MaxValue.</summary>
     private ulong _recoveredSeq = ulong.MaxValue;
 
+    // RecoverLogFiles (MaybeFlushFinalMemtableOrRestoreActiveLogFiles) without 2PC: max_wal_number + 1 once the replayed
+    // WALs' data is in table files or there was none, the min_log_number_to_keep the open records; 0 = none.
+    private ulong _recoveryMinLogNumberToKeep;
+
     /// <summary>
     /// DBImpl::Open after a point-in-time recovery that found a corrupted WAL: an empty batch with the expected next
     /// sequence is written to the new WAL and synced. The corrupted WAL may be kept (2PC keeps WALs down to the persisted
@@ -417,6 +421,24 @@ internal sealed partial class DbImpl
             if (!_noWalsFoundAtOpen && cfd.Mem.IsEmpty && cfd.Imm.Count == 0) edit.LogNumber = Math.Max(cfd.LogNumber, newLogNumber);
             await Versions.LogAndApplyAsync(cfd, edit, synchronous, ct).ConfigureAwait(false);
             wroteRecoveryEdit = true;
+        }
+        // RecoverLogFiles: the wal_deletion edit of the default column family (min_log_number_to_keep without 2PC and, with
+        // track_and_verify_wals_in_manifest, the replayed WALs as deleted), written only when it advances them
+        // (optimize_manifest_for_recovery).
+        ulong recoveryMinLog = _recoveryMinLogNumberToKeep;
+        if (recoveryMinLog != 0)
+        {
+            var walDeletion = new VersionEdit { PrevLogNumber = Versions.PrevLogNumber };
+            lock (_mutex)
+            {
+                if (recoveryMinLog > Versions.MinLogNumberToKeep) walDeletion.MinLogNumberToKeep = recoveryMinLog;
+                if (Options.TrackAndVerifyWalsInManifest && recoveryMinLog > Versions.MinWalNumberToKeep) walDeletion.WalDeletionBefore = recoveryMinLog;
+            }
+            if (walDeletion.MinLogNumberToKeep is not null || walDeletion.IsWalDeletion)
+            {
+                await Versions.LogAndApplyAsync(Versions.GetColumnFamily(0)!, walDeletion, synchronous, ct).ConfigureAwait(false);
+                wroteRecoveryEdit = true;
+            }
         }
         if (!wroteRecoveryEdit)
         {
@@ -898,6 +920,8 @@ internal sealed partial class DbImpl
         if (wals.Count == 0)
         {
             LogRecoveryFinishedEvent(recoveryJobId, null);
+            // Every WAL is below the column families' log numbers: no data seen (data_seen false).
+            if (!Options.Allow2Pc) _recoveryMinLogNumberToKeep = allWals[^1] + 1;
             return edits;
         }
         ReplayProgress progress;
@@ -941,6 +965,16 @@ internal sealed partial class DbImpl
                 await FlushRecoveredMemTableAsync(cfd, edits, lastSequence, synchronous, ct).ConfigureAwait(false);
                 flushed = true;
             }
+        }
+        // "if (flushed || !data_seen)": without 2PC, flushing the recovered memtables (or finding none to keep) advances
+        // min_log_number_to_keep past the largest WAL of the directory (wal_deletion.SetMinLogNumberToKeep(max_wal_number
+        // + 1)), so the replayed WALs are obsolete at the end of the open. Not with avoid_flush_during_recovery keeping
+        // data in a memtable.
+        if (!Options.Allow2Pc)
+        {
+            bool dataKept = false;
+            foreach (ColumnFamilyData cfd in GetColumnFamilies()) dataKept |= !cfd.Mem.IsEmpty;
+            if (flushed || !dataKept) _recoveryMinLogNumberToKeep = allWals[^1] + 1;
         }
         lock (_mutex)
         {
