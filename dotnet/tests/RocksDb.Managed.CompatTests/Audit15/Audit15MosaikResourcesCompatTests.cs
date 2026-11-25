@@ -87,6 +87,17 @@ public sealed class Audit15MosaikResourcesCompatTests
         return long.Parse(stats.AsSpan(c, e - c), CultureInfo.InvariantCulture);
     }
 
+    /// <summary>SUM of a histogram in Statistics::ToString text.</summary>
+    private static long HistogramSum(string stats, string name)
+    {
+        int at = stats.IndexOf(name + " ", StringComparison.Ordinal);
+        Assert.IsTrue(at >= 0, name);
+        int c = stats.IndexOf("SUM : ", at, StringComparison.Ordinal) + "SUM : ".Length;
+        int e = c;
+        while (e < stats.Length && char.IsAsciiDigit(stats[e])) e++;
+        return long.Parse(stats.AsSpan(c, e - c), CultureInfo.InvariantCulture);
+    }
+
     /// <summary>COUNT of a ticker in Statistics::ToString text.</summary>
     private static long TickerCount(string stats, string name)
     {
@@ -263,6 +274,126 @@ public sealed class Audit15MosaikResourcesCompatTests
         {
             ArenaSlabPool.Trim();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // 4. Normal branch: max_subcompactions = max(2, processors / 4) on CompactRange(null, null)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Mosaik compacts whole families with CompactRange(null, null) (ClearDeprecatedChangeLog, the maintenance paths).
+    /// With max_subcompactions 2 (processors / 4, at least 2) a manual compaction out of L0 is split
+    /// (Compaction::ShouldFormSubcompactions) into subcompactions of at least MaxFileSizeForLevel (64 MiB) each
+    /// (CompactionJob::GenSubcompactionBoundaries): about 150 MiB of L0 forms two on both engines, with the same
+    /// output files.
+    /// </summary>
+    [TestMethod]
+    public void WholeFamilyCompactRangeFormsTheSameSubcompactionsAsNative()
+    {
+        using var p = new Pair("a15-subcompact", lowMemoryMode: false, processorCount: 8, cacheBytes: 32L << 20, writeBufferBytes: 1L << 30);
+        var r = new Random(15);
+        var v = new byte[2000];
+        long written = 0;
+        for (ulong id = 0; written < (150L << 20); id++)
+        {
+            r.NextBytes(v); // incompressible: the table files are as large as the data on both engines
+            byte[] k = Key(id * 2654435761UL % 1_000_003UL, 4);
+            p.Put("nodes", k, v);
+            written += k.Length + v.Length;
+        }
+        p.WaitForBackgroundWork();
+        string Shape(Func<int, string> filesAtLevel)
+        {
+            var parts = new string[7];
+            for (int l = 0; l < 7; l++) parts[l] = filesAtLevel(l);
+            return string.Join(",", parts);
+        }
+        RocksDbSharp.ColumnFamilyHandle ncf = p.Native.GetColumnFamily("nodes");
+        string nBefore = Shape(l => p.Native.GetProperty("rocksdb.num-files-at-level" + l.ToString(CultureInfo.InvariantCulture), ncf));
+        string mBefore = Shape(l => p.MCf["nodes"].GetProperty("rocksdb.num-files-at-level" + l.ToString(CultureInfo.InvariantCulture))!);
+        p.MCf["nodes"].CompactRange(null, null);
+        p.Native.CompactRange((byte[]?)null, null, ncf);
+        p.WaitForBackgroundWork();
+        string nAfter = Shape(l => p.Native.GetProperty("rocksdb.num-files-at-level" + l.ToString(CultureInfo.InvariantCulture), ncf));
+        string mAfter = Shape(l => p.MCf["nodes"].GetProperty("rocksdb.num-files-at-level" + l.ToString(CultureInfo.InvariantCulture))!);
+        string ns = p.NativeProfile.DbOptions.GetStatisticsString();
+        HistogramData mh = p.ManagedProfile.DbOptions.Statistics!.GetHistogramData(Histogram.NumSubcompactionsScheduled);
+        long nCount = HistogramCount(ns, "rocksdb.num.subcompactions.scheduled");
+        string ctx = "before native " + nBefore + " managed " + mBefore + "; after native " + nAfter + " managed " + mAfter
+            + "; subcompaction histogram native count " + nCount + " sum " + HistogramSum(ns, "rocksdb.num.subcompactions.scheduled")
+            + ", managed count " + mh.Count + " sum " + mh.Sum;
+        TestContext.WriteLine(ctx);
+        Assert.AreEqual(nBefore, mBefore, ctx);
+        Assert.AreEqual(nAfter, mAfter, ctx);
+        Assert.AreEqual(nCount, (long)mh.Count, ctx);
+        Assert.AreEqual(HistogramSum(ns, "rocksdb.num.subcompactions.scheduled"), (long)mh.Sum, ctx);
+        Assert.IsTrue(mh.Sum >= 2 * mh.Count && mh.Count > 0, ctx);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // 5. The WAL archive with Mosaik's 100-year WAL_ttl_seconds
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// WalManager::PurgeObsoleteWALFiles deletes an archived WAL when now_seconds - file_m_time exceeds WAL_ttl_seconds,
+    /// and skips a file whose modification time is ahead of the clock (a clock stepped back) instead of letting the
+    /// unsigned difference wrap. With Mosaik's 100-year ttl both engines keep every archived WAL at the first purge after
+    /// an open, the one stamped in the future too (Mosaik's own CleanOldWalArchive decides when they go).
+    /// </summary>
+    [TestMethod]
+    public void ArchivedWalStampedInTheFutureIsKeptLikeNative()
+    {
+        using var dir = new TempDir("a15-archive");
+        string mwal = Path.Combine(dir.Path, "mwal"), nwal = Path.Combine(dir.Path, "nwal");
+        for (int engine = 0; engine < 2; engine++)
+        {
+            bool managed = engine == 0;
+            string wal = managed ? mwal : nwal, db = Path.Combine(dir.Path, managed ? "m" : "n");
+            for (int round = 0; round < 2; round++)
+            {
+                // Each open writes, flushes and closes: the WAL of the round is archived.
+                if (managed)
+                {
+                    var mp = new MosaikProfile(wal, false, 8, cacheBytes: 8L << 20, writeBufferBytes: 256L << 20);
+                    using RocksDatabase m = mp.Open(db);
+                    m.GetColumnFamily("nodes").Put(Key((ulong)round, 2), Value((ulong)round, 100));
+                    m.GetColumnFamily("nodes").Flush();
+                }
+                else
+                {
+                    var np = new NativeMosaikProfile(wal, false, 8, cacheBytes: 8L << 20, writeBufferBytes: 256L << 20);
+                    using RocksDbSharp.RocksDb n = np.Open(db);
+                    RocksDbSharp.ColumnFamilyHandle cf = n.GetColumnFamily("nodes");
+                    n.Put(Key((ulong)round, 2), Value((ulong)round, 100), cf);
+                    N.rocksdb_flush_cf(n.Handle, new RocksDbSharp.FlushOptions().SetWaitForFlush(true).Handle, cf.Handle, out IntPtr err);
+                    Assert.AreEqual(IntPtr.Zero, err);
+                }
+            }
+        }
+        string[] mArchived = Directory.GetFiles(Path.Combine(mwal, "archive"), "*.log");
+        string[] nArchived = Directory.GetFiles(Path.Combine(nwal, "archive"), "*.log");
+        Assert.IsTrue(mArchived.Length >= 2 && nArchived.Length >= 2, "managed " + mArchived.Length + ", native " + nArchived.Length);
+        Array.Sort(mArchived, StringComparer.Ordinal);
+        Array.Sort(nArchived, StringComparer.Ordinal);
+        File.SetLastWriteTimeUtc(mArchived[0], DateTime.UtcNow.AddDays(1));
+        File.SetLastWriteTimeUtc(nArchived[0], DateTime.UtcNow.AddDays(1));
+        // The first purge after the open (here: after a flush that archives the open's WAL) checks the archive.
+        using (RocksDatabase m = new MosaikProfile(mwal, false, 8, cacheBytes: 8L << 20, writeBufferBytes: 256L << 20).Open(Path.Combine(dir.Path, "m")))
+        {
+            m.GetColumnFamily("nodes").Put(Key(9, 2), Value(9, 100));
+            m.GetColumnFamily("nodes").Flush();
+        }
+        using (RocksDbSharp.RocksDb n = new NativeMosaikProfile(nwal, false, 8, cacheBytes: 8L << 20, writeBufferBytes: 256L << 20).Open(Path.Combine(dir.Path, "n")))
+        {
+            RocksDbSharp.ColumnFamilyHandle cf = n.GetColumnFamily("nodes");
+            n.Put(Key(9, 2), Value(9, 100), cf);
+            N.rocksdb_flush_cf(n.Handle, new RocksDbSharp.FlushOptions().SetWaitForFlush(true).Handle, cf.Handle, out IntPtr err);
+            Assert.AreEqual(IntPtr.Zero, err);
+        }
+        Assert.IsTrue(File.Exists(mArchived[0]), "managed deleted the archived WAL stamped in the future");
+        Assert.IsTrue(File.Exists(mArchived[1]));
+        Assert.IsTrue(File.Exists(nArchived[0]), "native deleted the archived WAL stamped in the future");
+        Assert.IsTrue(File.Exists(nArchived[1]));
     }
 
     // ---------------------------------------------------------------------------------------------------------------
