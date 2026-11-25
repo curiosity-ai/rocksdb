@@ -1097,16 +1097,19 @@ internal sealed partial class DbImpl : IAsyncDisposable
 
     /// <summary>
     /// The WAL number below which WAL files may be deleted or recycled (FindObsoleteFiles: job_context->log_number =
-    /// MinLogNumberToKeep() = versions_->min_log_number_to_keep()). In 2PC mode that is the value persisted in the
-    /// MANIFEST, which recovery starts from (SetupLogFilesRecovery): a WAL released since the last flush by a commit of its
-    /// prepared section stays until a flush records the new minimum. Deleting it earlier made the next open report it
-    /// missing with track_and_verify_wals ("Missing WAL of log number N"). Otherwise the live minimum
-    /// (MinLogNumberWithUnflushedData). REQUIRES: mutex.
+    /// MinLogNumberToKeep() = versions_->min_log_number_to_keep()): the value the last flush commit recorded in the
+    /// MANIFEST (PrecomputeMinLogNumberToKeepNon2PC / 2PC), which recovery starts from (SetupLogFilesRecovery). A WAL
+    /// whose last holder let go without a commit stays until a flush records the new minimum: in 2PC mode a commit of its
+    /// prepared section (deleting it earlier made the next open report it missing with track_and_verify_wals, "Missing
+    /// WAL of log number N"); in any mode an idle column family whose log number a WAL switch advanced in memory
+    /// (SwitchMemtable). Freeing those at once released the oldest WAL earlier than upstream, so that with a small
+    /// max_total_wal_size over many column families every SwitchWAL round of all of them followed the previous one
+    /// sooner (audit #15). Capped by the live minimum as a safety net. REQUIRES: mutex.
     /// </summary>
     private ulong MinLogNumberToKeepForDeletion()
     {
         ulong live = MinLogNumberToKeepLive();
-        return Options.Allow2Pc ? Math.Min(live, Versions.MinLogNumberToKeep) : live;
+        return Math.Min(live, Versions.MinLogNumberToKeep);
     }
 
     /// <summary>
