@@ -2791,3 +2791,173 @@ Test note: `Audit8AsyncWritePathTests.FailedInsertOfMixedGroupFailsEveryWriterOn
 was timing sensitive (in pipelined mode the held writer's memtable group may or may not include the writers behind
 it; the insert failure is the status of that whole group): it failed in 2 of 25 runs. The test now accepts both
 groupings (40 of 40 runs pass).
+
+## Audit #15: the database as Mosaik drives it, after audits #7-#14 (2026-11-25)
+
+Scope: every database call of Mosaik's `ROCKSDB_MANAGED` build (`Mosaik/Graph/src/Graph/Storage/`, the
+`RocksDbManagedCompat` shim, `Mosaik/Server/src/TemporaryMemoryCapture.cs`; replication excluded) traced again through
+the engine as audits #7-#14 left it. Mosaik's database code has not changed since audit #6; the engine has (141 files,
++7265 lines since merge e749664). Four slices: the error contract Mosaik's handlers depend on, Mosaik's concurrent mix
+run at once, memory / resources / scheduling at Mosaik's sizes, and every Mosaik entry point through the changed code.
+The earlier Mosaik passes (2026-11-09, `tests/RocksDb.Managed.CompatTests/Api/Mosaik*CompatTests.cs`, and audit #6)
+still pass at HEAD (55 of 55).
+
+Test infrastructure: `tests/Shared/MosaikProfile.cs` (linked into the unit and compat tests) and
+`tests/RocksDb.Managed.CompatTests/Infrastructure/NativeMosaikProfile.cs` reproduce Mosaik's options on each engine,
+call for call (`DBOptionsExt`, `RocksDbBase` table and family options, `RocksDbStorage`'s family map, the change
+tracker with its ulong comparator), in both resource branches; machine-derived values (processor count, cache and
+write buffer sizes) are parameters. `Audit15MosaikProfileCompatTests` cross-opens them. Tests:
+`Validation/Audit15Mosaik{Errors,Flows,Resources,Soak}Tests.cs` and `CompatTests/Audit15/`.
+
+No wrong read result was found.
+
+### Fixed (each test fails without the fix unless noted)
+
+| # | Finding | C++ reference | Effect on Mosaik before the fix | Test |
+|---|---|---|---|---|
+| 1 | No file was preallocated: the file layer could reserve blocks, but nothing set a block size for WALs, MANIFESTs or compaction outputs | db_impl_open.cc CreateWAL + db_impl_write.cc GetWalPreallocateBlockSize (write_buffer_size + 10%, capped by max_total_wal_size, db_write_buffer_size, the write buffer manager); version_set.cc / NewDB (manifest_preallocation_size); compaction.cc OutputFilePreallocationSize; io_posix.cc PrepareWrite / Close | on a full disk native keeps writing into the reserved WAL block (1 MiB low-resource, 64-70 MiB normal) and a flush can use the space the closed WAL gives back; managed failed Put and Flush with NoSpace at once, so SafeRocksDb's Put / Write entered their NoSpace retry loop where native went on | `Audit15MosaikErrorsCompatTests.WalPreallocationKeepsWritesGoingOnAFullDiskLikeNative`, `FlushOnAFullDiskUsesTheReleasedWalPreallocationLikeNative`; `Audit15MosaikErrorsTests.FilesArePreallocatedLikeUpstream`; `ClosingAPreallocatedFileReleasesTheUnusedBlocks` (passes without the fix on ext4, where ftruncate already frees the blocks) |
+| 2 | ENOTDIR (a component of the path is a regular file) was PathNotFound: .NET raises DirectoryNotFoundException for both ENOENT and ENOTDIR | io_posix.cc IOError: only ENOENT is PathNotFound, ENOTDIR is a plain IOError ("Not a directory") | a journal folder replaced by a file made managed Mosaik `Environment.FailFast` (SafeRocksDb.TryRecoverException); native rethrows | `NotADirectoryIsAPlainIOErrorAndAMissingDirectoryIsPathNotFound`, `JournalFolderReplacedByAFileGetsTheSameMosaikReactionsAsNative` |
+| 3 | Without 2PC, WALs were freed below the live minimum log number of the column families instead of the minimum the last flush commit recorded | db_impl_files.cc FindObsoleteFiles: job_context->log_number = MinLogNumberToKeep() = versions_->min_log_number_to_keep() | a WAL switch advances an idle family's log number in memory, so the oldest WAL was released before any commit recorded it and the next SwitchWAL round of all families started sooner. Low-resource (max_total_wal_size 1 MiB, 31 families), 100 MiB from one writer: 1277-1860 flush jobs against native's 121-204, MANIFEST 103,765 B against 14,197 B; after the fix 187-293 against 86-189, 17-28 KB against 10-14 KB (the rest is timing dependent, see "Still open") | `Audit15MosaikResourcesTests.WalsAreFreedOnlyBelowTheRecordedMinLogNumberToKeep` |
+| 4 | SwitchWAL did not mark an oldest WAL that no column family needed (introduced by audit #14) | db_impl_write.cc SwitchWAL: `alive_wal_files_.begin()->getting_flushed = true` outside 2PC, whatever there is to switch | while a replica is registered (RocksDbBase.RegisterReplica disables file deletions) obsolete WALs stay alive, and every write over max_total_wal_size allocated a list and scanned the families again: with 200 obsolete WALs alive, 94-98 B and 1.63-1.76 us per Put before, 52 B and 1.43-1.49 us after | `Audit15MosaikFlowsCompatTests.SwitchWalWithFileDeletionsDisabledMarksTheOldestWalOnceLikeNative`; `Audit15MosaikFlowsTests.SwitchWalMarksAnObsoleteOldestWalOnce` (written after the fix) |
+| 5 | `rocksdb.current-super-version-number` came from one counter for the DB, and DB open also counted the installs made while recovering | column_family.cc InstallSuperVersion: `++super_version_number_` per column family; DB::Open installs once per column family | after open Mosaik's 31 families reported 3..32 (native 1 each), and 2 or more after every reopen; RocksDbBase.UpdateStats sums the property | `Audit15MosaikFlowsCompatTests.WalLifecycleOfIdleFamiliesMatchesNative`, `Audit15MosaikFlowsTests.SuperVersionNumberIsPerColumnFamily` |
+
+Behaviour changes: with `allow_fallocate` (the default) WALs, MANIFESTs and compaction outputs reserve space in
+blocks (fallocate KEEP_SIZE, Linux only) and release what is left at close (ftruncate, then FALLOC_FL_PUNCH_HOLE
+without upstream's fstat pre-check; the result is the same). Without 2PC a WAL is deleted once the flush commit that
+releases it is recorded, not as soon as no column family needs it in memory, as upstream. The preallocation tests on
+a real full disk mount a size-limited tmpfs and need root; without it they report Inconclusive (the `/dev/full` trick
+of OutOfSpaceTests does not work there: native's fdatasync on the device fails with EINVAL and replaces the NoSpace
+error).
+
+### Known deviations recorded by this audit
+
+- An archived WAL deleted while a checkpoint or backup lists the WALs fails nothing in the port: a checkpoint lists
+  the live WALs only and a vanished archived WAL is skipped. Native fails with "IO error: No such file or directory:
+  while stat a file for size" (wal_manager.cc GetSortedWalsOfType retries only live WALs; db_filesnapshot.cc
+  GetSortedWalFilesImpl lists the archive): 511-1192 failed native checkpoints beside 267-295 successful ones with
+  about 200 archived files churned, none managed. Mosaik's `CleanOldWalArchive` deletes archived WALs this way
+  (`Audit15MosaikSoakCompatTests.CheckpointsWhileArchivedWalsAreDeletedBehindTheEngine`,
+  `Audit15MosaikResourcesTests.ArchivedWalsDeletedBehindTheEngineFailNothing`).
+- A failed `sync_file_range` (bytes_per_sync / wal_bytes_per_sync) is ignored: range syncs are best effort. Upstream
+  PosixWritableFile::RangeSync returns an IOError and fails the write. `strict_bytes_per_sync` is parsed and persisted
+  but not applied (the range sync never waits for earlier writeback). Mosaik sets bytes_per_sync and wal_bytes_per_sync
+  (1 MiB), not the strict mode.
+- Message text: managed messages add .NET's text after the errno text ("...: No space left on device : '<path>'"), and
+  Incomplete reads "Incomplete: " where native says "Result incomplete: ". Mosaik's managed build matches codes; the
+  one substring it matches ("No space left", the flush thread) is present.
+- Unchanged and recorded again because Mosaik meets them: `Dispose` reports the close error (`DB::Close`, audit #7)
+  where rocksdb-sharp's Dispose (`rocksdb_close`, the destructor) drops it; on a full disk the managed close throws
+  NoSpace (the WAL buffer cannot be written), and after the database folder vanished it throws PathNotFound. Iterators
+  throw on an I/O error or corruption where rocksdb-sharp's turn invalid and Mosaik's `while (it.Valid())` loops end
+  silently: kept, a silently partial scan is the worse failure.
+
+### Mosaik-side findings (reported, not changed in Mosaik)
+
+Unless noted, these behave the same on both engines.
+
+- The `content` family's `SetArenaBlockSize(128 MiB)` (RocksDbStorage.cs:172) with the 1.28 MiB memtable bloom of the
+  point-lookup families: the bloom is allocated in the arena, so every content memtable takes its whole 128 MiB block
+  when it is created. Measured at open: 141,002,656 B (native) and 140,992,496 B (managed) charged to the write buffer
+  manager. Mosaik sizes the manager at available memory / 20, clamped to 64 MiB..4 GiB (RocksDbBase.cs:686), and the
+  manager flushes over 7/8 of its size, so in normal mode below about 3 GB available every write that finds a
+  non-empty memtable flushes one: 39 one-key flushes for 40 writes at the 64 MiB floor, 19 for 20 with a 100 MiB
+  manager; in the soak at the floor, writes were stopped in 221 of 850 property polls and one node writer reached
+  7,019 writes against 137,047 with a 512 MiB manager. The content memtable is cut at about 96 MiB, and two are
+  charged during its flush. The default arena block (1 MiB here) avoids all of it.
+- The flush thread (RocksDbBase.FlushRocksDBMemory) catches only messages containing "No space left": any other
+  background error (verified: journal or database folder removed or replaced by a file, a vanished table file, a
+  damaged block met by compaction) comes back from the next Flush and escapes the dedicated thread, which ends the
+  process within about 5 s. UpdateMemoryUsage runs outside any try (it never threw in the fault sweep).
+- That flush (`db.Flush`, every 5 s and at stop) flushes the default column family only (rocksdb_flush and
+  RocksDatabase.Flush alike), which Mosaik never writes: it does nothing.
+- SafeRocksDb.Dispose / RocksDbBase.Dispose (SafeRocksDb.cs:236, RocksDbBase.cs:1433, catches SEHException only) let
+  a managed close error escape, and GraphStorage.Close stops half way. Most likely on a shutdown on a full disk.
+- The managed build's iterator loops fail where native ones end early: the tracker cleanup in SafeRocksDb.Open (the
+  open fails), EnumerateChangesFromPrimary (catches only NullReferenceException; the flush thread dies on a replica),
+  the graph-load threads in RocksDbStorage (the process dies at start). With native, the graph load leaves a partial
+  graph instead.
+- The native build ignores read errors in RocksDBExt.rocksdb_get_long_from_cf / _ulong_ (the error pointer is not
+  checked, null becomes 0), so a failed read restarts the persisted version counters at 0; the managed build throws.
+- `RocksDbManagedCompat.DeserializeFromStream` and `SafeIterator.Deserialize` pin an empty value, get a null pointer,
+  and `UnmanagedMemoryStream` throws ArgumentNullException (managed build only; rocksdb-sharp passes an empty stream).
+  Reached by `Get<T>(key, Func<Stream, T>)` (RocksDbStorage.cs:2327) and the iterator's `Key<T>` / `Value<T>`.
+- TrackChangesHandler (RocksDbBase.cs:435-460) increments the version and then puts the graphsettings version key
+  without a lock, so a slower caller can store an older version last: readers saw the stored key below an
+  acknowledged one 17 to 57 times per 60 s soak run. A stop right after such an inversion would make
+  InitializePrimaryVersion resume below the highest issued version (unconfirmed end to end).
+- MigrateDatabases opens every listed family with default options (RocksDbStorage.cs:561), so an old database holding
+  the change tracker family (ulong comparator) fails with InvalidArgument at every start (caught and logged).
+- DBOptionsExt sets MaxFileOpeningThreads to 2 in the low-resource branch and then to max(ProcessorCount, 16), which
+  also ignores ROCKSDB_PARALLELISM. RocksDbBase.UpdateStats adds the default family's value of the database-wide
+  properties `num-snapshots`, `actual-delayed-write-rate` and `is-write-stopped` to each family's, so they are reported
+  about 30 times over (metric gauges only). `DumpMallocStats = true` has no effect in the managed engine. In normal
+  mode the info LOG may take 640 MiB per database (64 MiB x 10 files).
+- ArenaSlabPool (kept by decision in audit #6) holds the freed 128 MiB content slab: idle after a 300 MiB burst and a
+  full GC, 285 MiB RSS managed against 136 MiB native, 189 MiB after `ArenaSlabPool.Trim()`. Mosaik's
+  `OnContainerMemoryPressure` could call it before its compacting GC.
+
+### Verified
+
+- Error contract, side by side with native: out of space on a WAL append (both branches), a flush output, a
+  compaction output and at close; Put / Write / Delete fail with NoSpace (managed SubCode, native message prefix)
+  while stopped and during auto recovery, the flush thread's Flush returns the background error (contains "No space
+  left"), and the SstFileManager resumes writes on both once space is freed. A removed journal folder (at a WAL
+  switch), a removed database folder (at a flush) and a vanished table file (at reopen) are PathNotFound on both; a
+  damaged block is Corruption on Get and an unrecoverable compaction on both. All 37 property names Mosaik reads, plus
+  unknown, empty and level-99 names, on the DB and on four families: the same null / number / text, none throw.
+  Backup and checkpoint on a full disk (NoSpace), of a stopped DB (its background error), restore from an empty folder
+  or a missing id (NotFound), restore with a separate journal folder. A transient error injected at each of the 519
+  file operations of a Mosaik-shaped workload and at close (527 runs): only RocksDbException left Mosaik's calls.
+- Concurrent mix (`Audit15MosaikSoakTests`, `Audit15MosaikSoakCompatTests`; about 21 threads): Mosaik's write shapes,
+  its flush thread with the stats properties, MemoryUtil, the WAL archive cleanup behind the engine and file deletions
+  toggled, manual compactions (exclusive and not), readers in Mosaik's iterator shapes, checkpoints and backups. Reads
+  are checked against acknowledged and invoked writes, batches whole under a snapshot, the reopened database against
+  the model, checkpoints and verified backups as one point in time and byte for byte on native. Power loss on the
+  fault-injecting file system with kSkipAnyCorruptedRecords: no phantoms, batches whole across families, writes
+  covered by a completed flush or full compaction survive. 160 short runs with fresh seeds and 60 s runs of every
+  configuration passed; `SoakChecksReportInjectedDefects` shows the checks catch torn batches and values, stale values
+  and unknown keys.
+- Resources: write buffer manager reservation per arena block and release with the memtable, ShouldFlushNow, the
+  inline and shard blocks, the oldest-memtable choice skipping pending flushes; the content memtable cut at 64,378
+  entries on both engines with cur-size-active-mem-table 134,223,856 (native) and 134,219,776 (managed); `CreateLru`
+  defaults (shard bits, strict_capacity_limit false, high-priority pool 0.5, low 0, full metadata charge); usage and
+  pinned usage through SetCapacity shrink and restore under reads (data block charge 4054 B native, 4097 B managed;
+  pinned usage within 8%, not the 1.39x of audit #6), evicted blocks released; GetBGJobLimits in both of Mosaik's
+  branches (observed maximum concurrent flushes equal the limits); CompactRange(null, null) with max_subcompactions 2
+  forms the same subcompactions and outputs as native; the 100-year WAL ttl (600 s purge period, no overflow, a
+  future-stamped archived WAL kept as on main); SwitchWAL rounds flush every family once per MiB of WAL in the
+  low-resource branch on both engines (empty ones included); the bytes_per_sync rule, skip_stats_update_on_db_open,
+  delete_obsolete_files_period, LOG rolling and trimming. Threads: native 7 -> 17 after open, managed 7 -> 15 at open
+  (4 of them .NET pool workers) and 16 after a burst.
+- Entry points: Open with create_missing_column_families (default family added), OpenReadOnly with an empty list and
+  ListColumnFamilies (MigrateDatabases), single writes and batches with null WriteOptions, the TryGet shapes of the
+  shim (callback, fixed buffer returning the full length with a partial copy, -1 when missing), UTF-8 strings,
+  iterators with bounds, PrefixSameAsStart, readahead and SeekForPrev, held across DeleteFilesInRange, the default
+  family Flush, CompactRange (defaults; exclusive=false, target -1), DeleteRange, DeleteFilesInRange(include_end),
+  BackupEngine, CreateCheckpoint with deletions disabled, Disable/EnableFileDeletions, GetProperty, MemoryUtil.
+- Performance on Mosaik's hot paths, e749664 against HEAD (Release, alternating processes, medians of 9-11 warm
+  rounds on a shared 4-core machine): point Get 1.10-1.23 / 1.03-1.19 us, single Put 1.26-1.35 / 1.23-1.37 us, a
+  10-op batch over 5 families 8.2-10.8 / 8.3-9.9 us, content Get 2.31-2.66 / 2.19-2.71 us, a 20-entry bounded prefix
+  scan 2.14-2.21 / 2.13-2.26 us: no change beyond noise.
+
+### Still open
+
+- Low-resource flush counts are still 1.5-2x native's after fix 3, timing dependent: native's recorded
+  min_log_number_to_keep stayed at one WAL through all 31 flush commits of a round (about 750 ms, 87 MiB written);
+  not explained from the C++.
+- A checkpoint's WAL minimum is the live one (DbImpl.Checkpoint.cs) where upstream uses MinLogNumberToKeep()
+  (db_filesnapshot.cc); it matters only with flush_memtable, where the checkpoint's own flush commits first.
+- With file deletions disabled each write still scans the alive WALs for the oldest (audit #6): about 1.5 us per Put
+  with 300 alive WALs, 2.1-2.7 us with 1000; a fix needs a maintained minimum.
+- ArenaSlabPool trimming under memory pressure (numbers above): a design decision.
+- The first stats_dump runs one period after open (upstream: at open, staggered); the flush_started event's
+  memory_usage is ApproximateMemoryUsageFast (2048 for an empty memtable, native 728) and the "Flushing memtable"
+  info line names the current WAL.
+- A null `byte[]` assigned to `ReadOptions.IterateLowerBound` / `IterateUpperBound` converts to an empty, non-null
+  bound (an empty upper bound excludes every key); Mosaik's shim maps null itself.
+- Unconfirmed: .NET may surface EFBIG / ECANCELED as ArgumentOutOfRangeException / OperationCanceledException past
+  the writable-file paths that catch IOException; an ENOTDIR on a rename's target is still PathNotFound (classified by
+  the source path); native keeps more table readers open in the low-resource branch (its sharded table cache rounds
+  each shard up to one reader).
+- Not measured: the cost of syncing the closed WAL inside the memtable switch (a deliberate deviation) at Mosaik's
+  switch rates; power loss on a real disk; SwitchWAL has no 2PC prepared-log handling (Mosaik does not use 2PC).
