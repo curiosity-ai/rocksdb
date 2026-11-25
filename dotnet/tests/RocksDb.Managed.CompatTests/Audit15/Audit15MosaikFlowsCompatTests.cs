@@ -58,6 +58,7 @@ public sealed class Audit15MosaikFlowsCompatTests
         {
             _db = profile.Open(path);
             _cf = MosaikProfile.Handles(_db);
+            _cf["default"] = _db.DefaultColumnFamily;
         }
 
         public RocksDatabase Db => _db;
@@ -110,6 +111,7 @@ public sealed class Audit15MosaikFlowsCompatTests
         {
             _db = profile.Open(path);
             foreach (MosaikProfile.Family f in MosaikProfile.Families) _cf[f.Name] = _db.GetColumnFamily(f.Name);
+            _cf["default"] = _db.GetDefaultColumnFamily();
         }
 
         public RocksDbSharp.RocksDb Db => _db;
@@ -225,7 +227,7 @@ public sealed class Audit15MosaikFlowsCompatTests
                         .Append(" L1 ").Append(db.Property(f, "rocksdb.num-files-at-level1"))
                         .Append(" imm ").Append(db.Property(f, "rocksdb.num-immutable-mem-table"));
                 }
-                sb.Append(", sv");
+                sb.Append(", sv default ").Append(db.Property("default", "rocksdb.current-super-version-number")).Append(',');
                 foreach (MosaikProfile.Family f in MosaikProfile.Families) sb.Append(' ').Append(db.Property(f.Name, "rocksdb.current-super-version-number"));
                 trace.Add(sb.ToString());
             }
@@ -239,6 +241,13 @@ public sealed class Audit15MosaikFlowsCompatTests
             ["CURRENT"] = CountFiles(checkpointDir, "CURRENT"),
         };
         return (trace, checkpoint);
+    }
+
+    private static string SuperVersionNumbers(IMosaikDb db)
+    {
+        var sb = new StringBuilder("default ").Append(db.Property("default", "rocksdb.current-super-version-number"));
+        foreach (MosaikProfile.Family f in MosaikProfile.Families) sb.Append(' ').Append(db.Property(f.Name, "rocksdb.current-super-version-number"));
+        return sb.ToString();
     }
 
     private static void AssertNodes(IMosaikDb db, int nodes, string what)
@@ -277,8 +286,18 @@ public sealed class Audit15MosaikFlowsCompatTests
         CollectionAssert.AreEquivalent(native.Checkpoint.ToList(), managed.Checkpoint.ToList(), "checkpoint files");
 
         // Reopen (recovery from the separate journal), and each engine opens the other's checkpoint (WALs inside it).
-        using (var n = new NativeMosaikDb(np, ndb)) AssertNodes(n, Steps, "native reopened");
-        using (var m = new ManagedMosaikDb(mp, mdb)) AssertNodes(m, Steps, "managed reopened");
+        string nativeReopened, managedReopened;
+        using (var n = new NativeMosaikDb(np, ndb))
+        {
+            nativeReopened = SuperVersionNumbers(n);
+            AssertNodes(n, Steps, "native reopened");
+        }
+        using (var m = new ManagedMosaikDb(mp, mdb))
+        {
+            managedReopened = SuperVersionNumbers(m);
+            AssertNodes(m, Steps, "managed reopened");
+        }
+        Assert.AreEqual(nativeReopened, managedReopened, "super version numbers after a reopen");
         using (var n = new NativeMosaikDb(new NativeMosaikProfile(mcp, true, 2, 8L << 20, 32L << 20), mcp)) AssertNodes(n, CheckpointAt + 1, "managed checkpoint on native");
         using (var m = new ManagedMosaikDb(new MosaikProfile(ncp, true, 2, cacheBytes: 8L << 20, writeBufferBytes: 32L << 20), ncp)) AssertNodes(m, CheckpointAt + 1, "native checkpoint on managed");
     }
@@ -344,7 +363,7 @@ public sealed class Audit15MosaikFlowsCompatTests
     private static readonly (int Offset, int Length)[] s_slices = [(0, 32), (5, 27), (0, 0)];
 
     // A setting key and value with characters outside ASCII (2-, 3- and 4-byte UTF-8 sequences).
-    private const string SettingKey = "größe-ключ-\U0001F511", SettingValue = "été – 漢字";
+    private const string SettingKey = "gr\u00F6\u00DFe-\u043A\u043B\u044E\u0447-\U0001F511", SettingValue = "\u00E9t\u00E9 \u2013 \u6F22\u5B57";
 
     /// <summary>
     /// LuceneGetFilePage's Get(key, keyLength, buffer, offset, length) (RocksDbIndexStorage.cs:286) returns the full value
@@ -809,6 +828,11 @@ public sealed class Audit15MosaikFlowsCompatTests
         }
         RocksDbSharp.DbOptions options = new NativeMosaikProfile(oldJournal, lowMemoryMode: false, processorCount: 8, cacheBytes: 16L << 20, writeBufferBytes: 64L << 20)
             .DbOptions.SetCreateIfMissing(false);
+        // Mosaik's native build adds every listed name, "default" included, to a fresh ColumnFamilies (RocksDbStorage.cs:563),
+        // which already holds "default": rocksdb-sharp opens that list too.
+        var verbatim = new RocksDbSharp.ColumnFamilies();
+        foreach (string name in names) verbatim.Add(name, new RocksDbSharp.ColumnFamilyOptions());
+        using (RocksDbSharp.RocksDb.Open(options, oldDb, verbatim)) { }
         using (RocksDbSharp.RocksDb old = RocksDbSharp.RocksDb.Open(options, oldDb, cfs))
         {
             var threads = new List<Thread>();

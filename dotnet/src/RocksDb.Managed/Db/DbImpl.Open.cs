@@ -431,6 +431,9 @@ internal sealed partial class DbImpl
             {
                 // InstallSuperVersionForConfigChange
                 EnsureSeqnoToTimeMapping(cfd.Options);
+                // DB::Open installs each column family's first super version here (super_version_number_ 1): the ones the
+                // port installed while recovering (the recovered column families, WAL-replay flushes) are not counted.
+                cfd.SuperVersionNumber = 0;
                 InstallSuperVersion(cfd);
             }
             _pendingOutputs.Clear();
