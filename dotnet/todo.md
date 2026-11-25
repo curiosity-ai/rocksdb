@@ -527,7 +527,7 @@ Still open from this round:
 - [x] Mosaik's database calls traced again through the engine as audits #7-#14 left it (error contract, concurrent mix, resources at Mosaik's sizes, entry points through the changed code); earlier Mosaik tests still pass; no wrong read result; hot paths unchanged against e749664
 - [x] `MosaikProfile` / `NativeMosaikProfile`: Mosaik's exact options on each engine, both resource branches (tests/Shared, CompatTests/Infrastructure)
 - [x] WALs, MANIFESTs and compaction outputs preallocated like upstream (full disk: writes go on into the reserved WAL block like native); ENOTDIR is a plain IOError, not PathNotFound
-- [x] WALs freed only below the recorded min_log_number_to_keep (low-resource Mosaik: 8-10x native's flush jobs before); SwitchWAL marks an obsolete oldest WAL; per-family super version numbers
+- [x] WALs freed only below the recorded min_log_number_to_keep (low-resource Mosaik: 8-10x native's flush jobs before), recorded by recovery too; SwitchWAL marks an obsolete oldest WAL; per-family super version numbers
 - [x] Mosaik soak: Mosaik's whole concurrent mix with model checks, power loss, native cross-checks (`Audit15MosaikSoak*`, `AUDIT15_SOAK_SECONDS` / `AUDIT15_SOAK_SEED`)
 - [ ] Low-resource flush counts 1.5-2x native's (timing dependent, unexplained); checkpoint WAL minimum is the live one; alive-WAL scan per write with deletions disabled
 - [ ] ArenaSlabPool trimming under memory pressure (a held 128 MiB content slab: 285 MiB idle RSS against native's 136 MiB)
