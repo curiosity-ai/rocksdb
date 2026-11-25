@@ -505,7 +505,8 @@ internal sealed partial class DbImpl
                 }
                 ulong seq = Util.Coding.DecodeFixed64(record);
                 uint count = Util.Coding.DecodeFixed32(record[8..]);
-                var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq };
+                // The catch-up reads records it may have applied on an earlier pass: an existing key+seq is skipped
+                var inserter = new MemTableInserter(this, walNumber, ignoreMissingColumnFamilies: true) { Sequence = seq, IgnoreDuplicateKeySeq = true };
                 inserter.Run(record);
                 applied = true;
                 _flushScheduler.Clear();

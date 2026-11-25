@@ -15,9 +15,9 @@ public sealed class Audit15MosaikSoakCompatTests
 {
     /// <summary>
     /// Both resource branches; the normal one with Mosaik's write buffer manager floor (64 MiB, a host with less than
-    /// 1.3 GiB available), where the write buffer manager is over its limit from the start (see
-    /// <see cref="ContentArenaChargesTheWriteBufferManagerAsNativeDoes"/>), so flushes and write stops never let up. The unit
-    /// test runs the normal branch with a larger write buffer manager.
+    /// 1.3 GiB available). With the content arena block Mosaik used before curiosity-ai/mosaik#2776 that manager was over
+    /// its limit from the start (see <see cref="ContentArenaChargesTheWriteBufferManagerAsNativeDoes"/>); with the engine's
+    /// default block it is not. The unit test runs the normal branch with a larger write buffer manager.
     /// </summary>
     [TestMethod]
     [DataRow(true, 2)]
@@ -65,7 +65,8 @@ public sealed class Audit15MosaikSoakCompatTests
     }
 
     /// <summary>
-    /// Mosaik's normal branch gives "content" a 128 MiB arena block (RocksDbStorage's family map). The first allocation of a
+    /// Mosaik's normal branch gave "content" a 128 MiB arena block before curiosity-ai/mosaik#2776 (RocksDbStorage's family
+    /// map; it now uses the engine's default). The first allocation of a
     /// new memtable takes a whole block, and the point-lookup families' memtable blooms (0.02 x 64 MiB each) are
     /// allocated with the memtable, so a database charges about 141 MB to the write buffer manager before it holds any
     /// data, and every new "content" memtable another 128 MiB. Both engines charge the same: with Mosaik's write buffer
@@ -80,7 +81,8 @@ public sealed class Audit15MosaikSoakCompatTests
         string managedImm, nativeImm;
         using (var dir = new TempDir("a15-wbm-m"))
         {
-            var p = new MosaikProfile(Path.Combine(dir.Path, "wal"), lowMemoryMode: false, processorCount: 8, cacheBytes: 64L << 20);
+            var p = new MosaikProfile(Path.Combine(dir.Path, "wal"), lowMemoryMode: false, processorCount: 8, cacheBytes: 64L << 20,
+                contentArenaBlockSize: MosaikProfile.ContentArenaBlockSizeBefore2776(lowMemoryMode: false));
             using RocksDatabase db = p.Open(Path.Combine(dir.Path, "db"));
             long open = p.WriteBufferManager.MemoryUsage;
             db.GetColumnFamily("content").Put([1, 2, 3], value);
@@ -91,7 +93,8 @@ public sealed class Audit15MosaikSoakCompatTests
         }
         using (var dir = new TempDir("a15-wbm-n"))
         {
-            var p = new NativeMosaikProfile(Path.Combine(dir.Path, "wal"), lowMemoryMode: false, processorCount: 8, cacheBytes: 64L << 20);
+            var p = new NativeMosaikProfile(Path.Combine(dir.Path, "wal"), lowMemoryMode: false, processorCount: 8, cacheBytes: 64L << 20,
+                contentArenaBlockSize: MosaikProfile.ContentArenaBlockSizeBefore2776(lowMemoryMode: false));
             using RocksDbSharp.RocksDb db = p.Open(Path.Combine(dir.Path, "db"));
             RocksDbSharp.Native n = RocksDbSharp.Native.Instance;
             long open = (long)(ulong)n.rocksdb_write_buffer_manager_memory_usage(p.WriteBufferManager);

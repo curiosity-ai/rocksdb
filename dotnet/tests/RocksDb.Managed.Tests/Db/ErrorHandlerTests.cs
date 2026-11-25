@@ -264,6 +264,35 @@ public sealed class ErrorHandlerTests
         Assert.AreEqual("v-a", GetString(db, "a"));
     }
 
+    /// <summary>
+    /// A live write whose memtable insert finds its key+seq already there (MemTable::Add's TryAgain), without seq_per_batch:
+    /// upstream's WriteBatch::Iterate retries the entry, the second TryAgain is Corruption ("two consecutive TryAgain"), and
+    /// MemTableInsertStatusCheck makes it a background error (kMemTable). The port used to drop the entry and acknowledge the
+    /// write, leaving it in the WAL and out of the memtable (a read then returned what the memtable held instead).
+    /// </summary>
+    [TestMethod]
+    public void LiveInsertOfAnExistingKeySeqFailsWithCorruptionLikeUpstream()
+    {
+        (_, DbOptions options, ErrorListener listener) = Setup();
+        using RocksDatabase db = RocksDatabase.Open(DbPath, options);
+        Put(db, "a");
+
+        // The entry the next write will carry, already in the memtable
+        DbImpl impl = db.DefaultColumnFamily.Db;
+        Assert.IsTrue(impl.GetColumnFamilyData("default").Mem.Add(impl.Versions.LastSequence + 1, EntryType.Value, B("b"), B("planted")));
+
+        RocksDbException ex = Assert.ThrowsExactly<RocksDbException>(() => Put(db, "b"));
+        Assert.AreEqual(StatusCode.Corruption, ex.Code);
+        StringAssert.Contains(ex.Message, "two consecutive TryAgain");
+        Assert.AreEqual(StatusCode.Corruption, db.BackgroundError?.Code);
+        Assert.IsTrue(listener.Errors.TryPeek(out BackgroundErrorEventArgs? error));
+        Assert.AreEqual(BackgroundErrorReason.MemTable, error!.Reason);
+
+        // Writes stop; what was acknowledged before is still read
+        Assert.ThrowsExactly<RocksDbException>(() => Put(db, "c"));
+        Assert.AreEqual("v-a", GetString(db, "a"));
+    }
+
     [TestMethod]
     public void DataLossErrorIsUnrecoverable()
     {

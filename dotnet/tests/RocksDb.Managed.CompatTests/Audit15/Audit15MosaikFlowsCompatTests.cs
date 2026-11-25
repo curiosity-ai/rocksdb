@@ -636,7 +636,8 @@ public sealed class Audit15MosaikFlowsCompatTests
 
     /// <summary>
     /// The shared write buffer manager of the changelog test: above what the normal-resource profile's empty memtables
-    /// charge (the content family's 128 MiB arena block, see <see cref="EmptyMemtablesChargeTheWriteBufferManagerLikeNative"/>),
+    /// charge (up to the content family's 128 MiB arena block of Mosaik before curiosity-ai/mosaik#2776, see
+    /// <see cref="EmptyMemtablesChargeTheWriteBufferManagerLikeNative"/>),
     /// so that only the program's own flushes and compactions run and both engines run the same program.
     /// </summary>
     private const long ChangeLogWriteBufferBytes = 1L << 30;
@@ -882,8 +883,8 @@ public sealed class Audit15MosaikFlowsCompatTests
     /// Right after open, before any write, every memtable of Mosaik's families is charged to the shared write buffer
     /// manager (memory/arena.cc: the 2 KiB inline block; db/memtable.cc: the memtable bloom of the point-lookup families,
     /// memtable_prefix_bloom_size_ratio 0.02 of the 64 MiB write buffer, allocated from the arena at creation, which for
-    /// "content" takes a whole arena block: 128 MiB in the normal-resource branch, 1 MiB in low-memory mode). Both
-    /// engines charge the same. Against a manager below about 1/0.875 of that charge (Mosaik's floor is 64 MiB in the
+    /// "content" takes a whole arena block: 128 MiB in the normal-resource branch, 1 MiB in low-memory mode, as Mosaik set
+    /// it before curiosity-ai/mosaik#2776 - now it uses the engine's default). Both engines charge the same. Against a manager below about 1/0.875 of that charge (Mosaik's floor is 64 MiB in the
     /// normal branch) every write leader asks for a flush; the measured flush storm is in the test output.
     /// </summary>
     [TestMethod]
@@ -894,9 +895,10 @@ public sealed class Audit15MosaikFlowsCompatTests
     {
         using var dir = new TempDir("a15-wbm");
         long nativeOpen, managedOpen;
-        var np = new NativeMosaikProfile(Path.Combine(dir.Path, "nj"), lowMemoryMode, processorCount, 16L << 20, 1L << 30);
+        ulong arena = MosaikProfile.ContentArenaBlockSizeBefore2776(lowMemoryMode);
+        var np = new NativeMosaikProfile(Path.Combine(dir.Path, "nj"), lowMemoryMode, processorCount, 16L << 20, 1L << 30, contentArenaBlockSize: arena);
         using (RocksDbSharp.RocksDb n = np.Open(Path.Combine(dir.Path, "n"))) nativeOpen = (long)(ulong)N.rocksdb_write_buffer_manager_memory_usage(np.WriteBufferManager);
-        var mp = new MosaikProfile(Path.Combine(dir.Path, "mj"), lowMemoryMode, processorCount, cacheBytes: 16L << 20, writeBufferBytes: 1L << 30);
+        var mp = new MosaikProfile(Path.Combine(dir.Path, "mj"), lowMemoryMode, processorCount, cacheBytes: 16L << 20, writeBufferBytes: 1L << 30, contentArenaBlockSize: arena);
         using (RocksDatabase m = mp.Open(Path.Combine(dir.Path, "m"))) managedOpen = mp.WriteBufferManager.MemoryUsage;
         Console.WriteLine("write buffer manager charge after open (" + (lowMemoryMode ? "low-memory" : "normal") + "): native " + nativeOpen + ", managed " + managedOpen);
         // Native rounds each allocation up to malloc_usable_size (docs/validation.md, audit #6); a few KiB at most here.
@@ -909,8 +911,8 @@ public sealed class Audit15MosaikFlowsCompatTests
         // before it: 40 writes to one family, 39 flushes of one key each.
         if (!lowMemoryMode)
         {
-            var np64 = new NativeMosaikProfile(Path.Combine(dir.Path, "nj64"), false, processorCount, 16L << 20, 64L << 20);
-            var mp64 = new MosaikProfile(Path.Combine(dir.Path, "mj64"), false, processorCount, cacheBytes: 16L << 20, writeBufferBytes: 64L << 20);
+            var np64 = new NativeMosaikProfile(Path.Combine(dir.Path, "nj64"), false, processorCount, 16L << 20, 64L << 20, contentArenaBlockSize: arena);
+            var mp64 = new MosaikProfile(Path.Combine(dir.Path, "mj64"), false, processorCount, cacheBytes: 16L << 20, writeBufferBytes: 64L << 20, contentArenaBlockSize: arena);
             string nativeShape, managedShape;
             using (var n = new NativeMosaikDb(np64, Path.Combine(dir.Path, "n64")))
             {
