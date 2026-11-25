@@ -2763,20 +2763,29 @@ while the node is a replica). `ReplicationPrimary` writes `<db>/replication/line
 its checkpoint root when constructed. New replication API and one new RPC (`IReplicationService.CheckReplicaLog`);
 see `src/RocksDb.Managed.Replication/README.md`.
 
+### Second follow-up (2026-11-25; no deployments yet, so no backward compatibility was kept)
+
+| Area | Change | Test |
+|---|---|---|
+| WAL | A lock taken with `LockWalAsync` marks the asynchronous flow that took it (and flows it starts while holding it); a waiting flush from that flow fails with Aborted "Likely deadlock" like a flush from the thread of a synchronous lock | `Audit14ReviewTests.FlushFromTheFlowHoldingAnAsyncWalLockFailsInsteadOfWaitingForever` |
+| Transactions | WritePrepared / WriteUnprepared rollback reads at the max snapshot (GetMaxSnapshot); a commit without prepare that fails its commit timestamp check clears the transaction and leaves it in AwaitingCommit (as upstream); a WriteUnprepared rollback from Started forgets the WAL of its unprepared batches (deviation: upstream keeps log_number_ and can release the old WAL twice) | `WriteUnpreparedRollbackForgetsTheWalOfItsUnpreparedBatches`, `TransactionTimestampTests.CommitRequiresCommitTimestamp` (updated); the max-snapshot read has none |
+| Replication | Lineage is mandatory: a replica with data and no lineage must resync; the sequence-only attach, the "Unimplemented" fallback and the separate term-map fetch after a snapshot are removed; a snapshot without the log description is refused before anything is deleted | `Audit15ReplicationDataPathTests` |
+| Replication | No dependence on the failure marker: `Resume()` is refused on a replica / follower database (new engine hook `EventListener.OnManualRecoveryRequested`); a failed marker write stops following and is reported as `FollowerFault` | yes |
+| Replication | Resync by restore-then-swap: the snapshot is restored next to the database (`<db>.resync-new`), swapped in once CURRENT is in place, and the old copy deleted afterwards, so the node keeps a promotable copy while the source may still die. `ResyncRestoreMode` = Auto (default) / AlwaysSwap / AlwaysDeleteFirst; Auto swaps only when `IFileSystem.GetFreeSpace` reports the announced transfer size plus `ResyncFreeSpaceMarginBytes` (64 MiB), and deletes first when there is less room, the free space is unknown or the source announced no size. An interrupted swap is completed or discarded at host start | mode x free-space matrix, crash points, pair and cluster resync |
+| Replication | Per-node identities: a certificate states an identity (Node / Operator / Client + name) bound to its key by an HMAC from the shared secret and verified in the TLS handshake; node-to-node calls are accepted only from configured peers and only under the caller's own name; operators may hand off; clients may read status and write. An optional second secret makes its holders clients only. Running without authentication is an explicit opt-in (`GrpcSecurity.InsecureNoAuthentication`) | `Audit15NodeIdentityTests` |
+
 ### Still open
 
-- Per-node identities behind the replication shared secret, and "a resync destroys the old copy before the new one
-  arrived": both need a product decision.
-- Lineage: a replica with no lineage file is accepted on sequence numbers alone and then adopts the primary's map; if
-  the disk that failed a replica's WAL write also fails the marker write and the process restarts, only the recovery
-  veto protects it.
-- With an asynchronous stalled leader and no synchronous writer yet, `UnlockWal`'s wait depends on a thread-pool thread;
-  a lock taken with `LockWalAsync` has no owner thread, so a flush awaited by its holder waits for the unlock instead of
-  failing with Aborted.
-- Transactions, minor (recorded by the review, not changed): rollback reads use the published sequence instead of the
-  max snapshot (differs only for lock-free keys with two write queues); failed pre-write checks of a commit without
-  prepare leave the transaction usable; a WriteUnprepared rollback from STARTED does not reset its log number
-  (inherited from upstream).
+- Identities: with a single shared secret any holder can mint any identity (protection against misconfiguration, not
+  against a lying holder; the client secret narrows that); no separate operator secret, no secret rotation; a client
+  holding only the client secret cannot verify that a server holds the nodes' secret.
+- Restore-then-swap: the cluster soak runs with `AlwaysDeleteFirst` because its fault-injecting file system tracks files
+  by name and cannot follow a replaced directory (swap is covered by unit tests on a memory file system and on disk);
+  a `WalDir` outside the database directory is not handled by the swap; free space is checked once, at the plan; plain
+  `ReplicaFollower.SyncInitialStateAsync` still deletes first.
+- `FollowerFault` is not in the gRPC status DTOs (in-process only); the unused `GetRaftTermsAsync` / `GetEpochsAsync`
+  RPCs remain (the soak tool uses the former).
+- A WriteUnprepared rollback from Started that fails keeps its locks (upstream releases them): kept, the safer choice.
 
 Test note: `Audit8AsyncWritePathTests.FailedInsertOfMixedGroupFailsEveryWriterOnce (Pipelined, "async,async,sync", 2)`
 was timing sensitive (in pipelined mode the held writer's memtable group may or may not include the writers behind

@@ -178,7 +178,6 @@ public sealed class Audit15NodeIdentityTests
 
         // The member `a`, as itself: accepted (whatever the Raft answer is).
         var asItself = new InMemoryClusterClient(h.Network, a, target);
-        Assert.IsNotNull(await asItself.GetTermsAsync(CancellationToken.None));
         await asItself.ReportProgressAsync(a, 0, term, CancellationToken.None);
 
         // The member `a` acting as the member `b`.
@@ -197,7 +196,6 @@ public sealed class Audit15NodeIdentityTests
         foreach (ReplicationCaller outsider in new[] { ReplicationCaller.Node("n9"), ReplicationCaller.Client("app"), ReplicationCaller.Operator("ops") })
         {
             var c = new InMemoryClusterClient(h.Network, a, target) { Caller = outsider };
-            await Assert.ThrowsExactlyAsync<ReplicationUnauthorizedException>(() => c.GetTermsAsync(CancellationToken.None), outsider.ToString());
             await Assert.ThrowsExactlyAsync<ReplicationUnauthorizedException>(
                 () => c.RequestVoteAsync(new RequestVotePayload(term + 10, outsider.Name, ulong.MaxValue, term + 10), CancellationToken.None), outsider.ToString());
             await Assert.ThrowsExactlyAsync<ReplicationUnauthorizedException>(() => c.ReportProgressAsync(outsider.Name, 0, term, CancellationToken.None),
